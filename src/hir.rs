@@ -1,16 +1,23 @@
 //! Name resolution: AST -> HIR.
 //!
 //! Every name is resolved here, so later passes never deal with scopes.
-//! Lookup order is function body (locals, most recent first), then
-//! arguments, then global definitions; failing all three is a
+//! Lookup order is variables (the function's parameters and locals, the
+//! innermost scope first), then global definitions; failing both is a
 //! `SymbolNotFoundError`. Overloads are grouped by name; picking a specific
 //! overload by argument types is left to type checking.
 //!
+//! Variables: a function's parameters are its first variables (ids 0, 1,
+//! ...), followed by its locals. `x = value` gives a value to the variable
+//! `x` if one is visible, and otherwise creates it. Each `loop` body is a
+//! scope of its own: its loop variable and the variables it creates exist
+//! only inside it, while `total = total + i` in the body updates the
+//! `total` from outside.
+//!
 //! What is HIR? A "high-level IR": the same tree shape as the AST, but every
-//! name has been replaced by what it refers to. `x` becomes `Param(0)` or
-//! `Local(3)`, and a call names a function group. Strings are replaced by
-//! numbers because comparing numbers is cheaper and unambiguous: two
-//! different locals can both be called `x` (shadowing) yet get different
+//! name has been replaced by what it refers to. `x` becomes `Local(3)`, and a
+//! call names a function group. Strings are replaced by numbers because
+//! comparing numbers is cheaper and unambiguous: two different variables can
+//! both be called `x` (one in a loop body, one outside it) yet get different
 //! ids, so later stages cannot confuse them.
 //!
 //! Why resolve names before type checking? Scoping rules (shadowing, which
@@ -45,13 +52,31 @@ pub struct Func {
     /// Declared return type, if annotated.
     pub ret: Option<Ty>,
     pub body: Vec<HStmt>,
+    /// Name of every variable, by id: the parameters first, then the locals.
     pub local_names: Vec<String>,
 }
 
 #[derive(Debug)]
 pub enum HStmt {
-    Let { local: LocalId, value: HExpr },
+    /// Give the variable `local` a value (its first one, or a new one).
+    Let {
+        local: LocalId,
+        value: HExpr,
+    },
     Expr(HExpr),
+    Loop {
+        var: LocalId,
+        /// Where the loop variable is named, for error messages.
+        var_span: Span,
+        start: HExpr,
+        end: HExpr,
+        body: Vec<HStmt>,
+        /// Variables from outside the loop that the body gives new values:
+        /// their values carry over from one iteration to the next.
+        carried: Vec<LocalId>,
+        /// Variables that exist only inside the body (including `var`).
+        inner: Vec<LocalId>,
+    },
 }
 
 #[derive(Debug)]
@@ -66,7 +91,6 @@ pub enum HExprKind {
     Float(f64),
     Str(String),
     Bool(bool),
-    Param(usize),
     Local(LocalId),
     /// Call of a global function group; the overload is chosen by type checking.
     Call {
@@ -140,6 +164,36 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
         .map(|(k, v)| (k, v.into_iter().map(|i| ids[i]).collect()))
         .collect();
 
+    // Calls try definitions from top to bottom (see `typeck`), so a
+    // definition is never used when an earlier one with as many parameters
+    // accepts everything it does, like `head _` before `head a :: numeric`.
+    let mut names: Vec<&String> = groups.keys().collect();
+    names.sort_by_key(|n| groups[*n].first().map(|&f| defs[f].name_span.start));
+    for group in names.into_iter().map(|n| &groups[n]) {
+        for (k, &later) in group.iter().enumerate() {
+            let (later_def, later_tys) = (defs[later], param_types(defs[later]));
+            let covering = group[..k].iter().find(|&&earlier| {
+                defs[earlier].params.len() == later_def.params.len()
+                    && later_tys
+                        .iter()
+                        .zip(param_types(defs[earlier]))
+                        .all(|(l, e)| l.is_subset(e))
+            });
+            if let Some(&earlier) = covering {
+                warnings.push(
+                    Diagnostic::warning(
+                        later_def.name_span,
+                        format!(
+                            "this definition of `{}` is never used: an earlier one accepts all of its arguments",
+                            later_def.name
+                        ),
+                    )
+                    .with_note(defs[earlier].name_span, "calls always match this one first"),
+                );
+            }
+        }
+    }
+
     // Which argument counts each name accepts. A call with a count no
     // overload takes is an error that can be reported now, before types
     // are known.
@@ -157,19 +211,17 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
     // Pass 2: resolve every name inside every body.
     let mut funcs = Vec::new();
     for def in &defs {
+        // The parameters are the first variables.
+        let params: Vec<String> = def.params.iter().map(|p| p.name.clone()).collect();
         let mut r = Resolver {
-            def,
             arities: &arities,
-            locals: Vec::new(),
-            local_names: Vec::new(),
+            locals: params.iter().cloned().zip(0..).collect(),
+            local_names: params,
+            assigned: Vec::new(),
+            errors: Vec::new(),
         };
-        let mut body = Vec::new();
-        for stmt in &def.body.stmts {
-            match r.stmt(stmt) {
-                Ok(s) => body.push(s),
-                Err(e) => errors.push(e),
-            }
-        }
+        let body = r.stmts(&def.body.stmts);
+        errors.append(&mut r.errors);
         funcs.push(Func {
             name: def.name.clone(),
             name_span: def.name_span,
@@ -237,46 +289,101 @@ fn param_types(def: &ast::Def) -> Vec<Ty> {
 
 /// Resolves the names in one function body.
 struct Resolver<'a> {
-    def: &'a ast::Def,
     arities: &'a HashMap<&'a str, Vec<usize>>,
-    /// Visible locals, innermost (most recent) last. This stack is the
-    /// "symbol table" of the classic textbook: searching it from the end
-    /// finds the most recent binding first, which is exactly what shadowing
-    /// means (`x = x * 2` makes a new `x` that hides the old one).
+    /// Visible variables, innermost last. This stack is the "symbol table"
+    /// of the classic textbook: a loop body pushes its variables and pops
+    /// them when it ends, so they are not visible after the loop.
     locals: Vec<(String, LocalId)>,
-    /// Name of each local by id. Every `x = ...` gets a fresh id even if the
-    /// name repeats, so the generated IR can give each one its own storage.
+    /// Name of each variable by id.
     local_names: Vec<String>,
+    /// Every variable given a value so far, in order; a loop looks at the
+    /// part written while resolving its body.
+    assigned: Vec<LocalId>,
+    errors: Vec<Diagnostic>,
 }
 
 impl<'a> Resolver<'a> {
+    fn stmts(&mut self, stmts: &[Stmt]) -> Vec<HStmt> {
+        let mut out = Vec::new();
+        for stmt in stmts {
+            match self.stmt(stmt) {
+                Ok(s) => out.push(s),
+                Err(e) => self.errors.push(e),
+            }
+        }
+        out
+    }
+
     fn stmt(&mut self, stmt: &Stmt) -> Result<HStmt, Diagnostic> {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                // The value is resolved before the new binding is visible,
-                // so in `x = x * 2` the right-hand `x` is the *old* x.
+                // The value is resolved first, so in a first binding such as
+                // `x = x * 2` the right-hand `x` cannot be the new variable.
                 let value = self.expr(value)?;
-                let id = self.local_names.len();
-                self.local_names.push(name.clone());
-                self.locals.push((name.clone(), id));
+                let id = match self.lookup_local(name) {
+                    Some(id) => id,
+                    None => self.new_local(name),
+                };
+                self.assigned.push(id);
                 Ok(HStmt::Let { local: id, value })
             }
             Stmt::Expr(e) => Ok(HStmt::Expr(self.expr(e)?)),
+            Stmt::Loop {
+                var,
+                var_span,
+                start,
+                end,
+                body,
+            } => {
+                let start = self.expr(start)?;
+                let end = self.expr(end)?;
+                // Variables created from here on belong to the body.
+                let first_inner = self.local_names.len();
+                let visible = self.locals.len();
+                let assigned = self.assigned.len();
+                let var = self.new_local(var);
+                let body = self.stmts(body);
+                self.locals.truncate(visible);
+                let mut carried: Vec<LocalId> = self.assigned[assigned..]
+                    .iter()
+                    .copied()
+                    .filter(|&id| id < first_inner)
+                    .collect();
+                carried.sort();
+                carried.dedup();
+                Ok(HStmt::Loop {
+                    var,
+                    var_span: *var_span,
+                    start,
+                    end,
+                    body,
+                    carried,
+                    inner: (first_inner..self.local_names.len()).collect(),
+                })
+            }
         }
     }
 
-    /// Look a name up from the innermost scope outward: locals, then
-    /// parameters. Globals are checked by the caller, last. That order is
-    /// the "name shadow" rule from the readme.
-    fn lookup_value(&self, name: &str) -> Option<HExprKind> {
-        if let Some((_, id)) = self.locals.iter().rev().find(|(n, _)| n == name) {
-            return Some(HExprKind::Local(*id));
-        }
-        self.def
-            .params
+    fn new_local(&mut self, name: &str) -> LocalId {
+        let id = self.local_names.len();
+        self.local_names.push(name.to_string());
+        self.locals.push((name.to_string(), id));
+        id
+    }
+
+    /// Look a variable up from the innermost scope outward. Globals are
+    /// checked by the caller, last. That order is the "name shadow" rule
+    /// from the readme.
+    fn lookup_local(&self, name: &str) -> Option<LocalId> {
+        self.locals
             .iter()
-            .position(|p| p.name == name)
-            .map(HExprKind::Param)
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+    }
+
+    fn lookup_value(&self, name: &str) -> Option<HExprKind> {
+        self.lookup_local(name).map(HExprKind::Local)
     }
 
     fn check_callable(&self, name: &str, nargs: usize, span: Span) -> Result<(), Diagnostic> {

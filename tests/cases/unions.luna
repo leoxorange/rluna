@@ -1,7 +1,7 @@
 pick x = check x:
-1 -> "one";
-2 -> 2.5;
-else -> x
+    1 -> "one";
+    2 -> 2.5;
+    else -> x
 
 half n :: numeric -> numeric = n / 2
 
@@ -26,5 +26,12 @@ main =
     echo (-0.5)
     echo (1 / 3)
     check true:
-    true -> echo "yes";
-    false -> echo "no"
+        true -> echo "yes";
+        false -> echo "no"
+    # a check nested in an arm, and one inside parentheses
+    loop a in [1, 3]:
+        echo (check a:
+            1 -> check 2:
+                2 -> "a is 1, and 2 is 2";
+                else -> "unreachable";
+            else -> "a is not 1")

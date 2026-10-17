@@ -96,13 +96,23 @@ pub struct Block {
 
 #[derive(Debug, Clone)]
 pub enum Stmt {
-    /// A local binding inside a function body: `name = value`.
+    /// A binding inside a function body: `name = value`. It gives a new
+    /// variable its value, or a new value to a variable that exists already.
     Let {
         name: String,
         span: Span,
         value: Expr,
     },
     Expr(Expr),
+    /// `loop var in [start, end]:` followed by the indented body. `var`
+    /// takes the values start, start + 1, ..., end - 1.
+    Loop {
+        var: String,
+        var_span: Span,
+        start: Expr,
+        end: Expr,
+        body: Vec<Stmt>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,21 +216,41 @@ pub fn dump(program: &Program) -> String {
             }
         }
         out.push('\n');
-        for stmt in &def.body.stmts {
-            out.push_str("  ");
-            match stmt {
-                Stmt::Let { name, value, .. } => {
-                    write!(out, "(let {name} ").unwrap();
-                    dump_expr(&mut out, value, 2);
-                    out.push(')');
-                }
-                Stmt::Expr(e) => dump_expr(&mut out, e, 2),
-            }
-            out.push('\n');
-        }
+        dump_stmts(&mut out, &def.body.stmts, 2);
         out.push_str(")\n");
     }
     out
+}
+
+fn dump_stmts(out: &mut String, stmts: &[Stmt], indent: usize) {
+    for stmt in stmts {
+        out.push_str(&" ".repeat(indent));
+        match stmt {
+            Stmt::Let { name, value, .. } => {
+                write!(out, "(let {name} ").unwrap();
+                dump_expr(out, value, indent);
+                out.push(')');
+            }
+            Stmt::Expr(e) => dump_expr(out, e, indent),
+            Stmt::Loop {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
+                write!(out, "(loop {var} ").unwrap();
+                dump_expr(out, start, indent);
+                out.push(' ');
+                dump_expr(out, end, indent);
+                out.push('\n');
+                dump_stmts(out, body, indent + 2);
+                out.push_str(&" ".repeat(indent));
+                out.push(')');
+            }
+        }
+        out.push('\n');
+    }
 }
 
 fn dump_expr(out: &mut String, e: &Expr, indent: usize) {

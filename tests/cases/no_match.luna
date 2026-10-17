@@ -1,0 +1,14 @@
+# A call matched at run time for which no definition accepts the value.
+only a :: int -> string = "int"
+only a :: float -> string = "float"
+
+pick n = check n:
+    1 -> "one";
+    2 -> 2.5;
+    else -> n
+
+main =
+    echo (only (pick 7))
+    echo (only (pick 2))
+    echo (only (pick 1))
+    echo "not reached"

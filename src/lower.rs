@@ -146,20 +146,22 @@ fn emit_drop(b: &mut FunctionBuilder, v: Value, ty: Ty) {
     b.call(free, vec![v], None);
 }
 
-/// Which parameters and locals currently own a value that must be dropped.
+/// Which variables currently own a value that must be dropped.
 #[derive(Clone)]
 struct Owned {
-    params: Vec<bool>,
     locals: Vec<bool>,
 }
 
 impl Owned {
     /// Owners that still own their value on *both* paths.
     fn meet(&self, other: &Owned) -> Owned {
-        let and = |a: &[bool], b: &[bool]| a.iter().zip(b).map(|(x, y)| *x && *y).collect();
         Owned {
-            params: and(&self.params, &other.params),
-            locals: and(&self.locals, &other.locals),
+            locals: self
+                .locals
+                .iter()
+                .zip(&other.locals)
+                .map(|(x, y)| *x && *y)
+                .collect(),
         }
     }
 }
@@ -169,11 +171,14 @@ struct FnLower<'a> {
     f: &'a TFunc,
     strings: &'a mut Strings,
     b: FunctionBuilder,
-    /// The LIR value holding each Luna local. In SSA form (see `lir`) a
-    /// local is just a name for the value computed by its `x = ...`, so no
-    /// memory is needed. Shadowing `x = x * 2` simply maps the new local id
-    /// to the new value.
+    /// The LIR value each variable holds at the current point. In SSA form
+    /// (see `lir`) a variable is just a name for the value last given to it,
+    /// so no memory is needed: `x = x * 2` makes `x` name the new value. Only
+    /// a loop needs more: a variable updated in its body becomes a parameter
+    /// of the loop's header block.
     locals: Vec<Option<Value>>,
+    /// The type of each variable's current value.
+    local_tys: Vec<Ty>,
     /// Owners whose value has not been moved yet at the current point.
     owned: Owned,
 }
@@ -184,17 +189,24 @@ impl<'a> FnLower<'a> {
         let ret = if f.discard { None } else { ret_repr(f.ret) };
         let mut b = FunctionBuilder::new(f.symbol.clone(), &params, ret);
         b.func.comment = Some(f.signature());
+        // The parameters are the first variables. Arguments are moved into
+        // the call, so the function owns them.
+        let n = f.local_tys.len();
+        let mut locals: Vec<Option<Value>> =
+            (0..f.params.len()).map(|i| Some(b.param(i))).collect();
+        locals.resize(n, None);
+        let mut local_tys = f.params.clone();
+        local_tys.resize(n, Ty::NEVER);
+        let mut owned: Vec<bool> = f.params.iter().map(|t| t.needs_drop()).collect();
+        owned.resize(n, false);
         FnLower {
             tir,
             f,
             strings,
             b,
-            locals: vec![None; f.local_tys.len()],
-            // Arguments are moved into the call: the function owns them.
-            owned: Owned {
-                params: f.params.iter().map(|t| t.needs_drop()).collect(),
-                locals: vec![false; f.local_tys.len()],
-            },
+            locals,
+            local_tys,
+            owned: Owned { locals: owned },
         }
     }
 
@@ -202,23 +214,13 @@ impl<'a> FnLower<'a> {
         let returns = !self.f.discard && ret_repr(self.f.ret).is_some();
         let mut result = None;
         for (i, stmt) in self.f.body.iter().enumerate() {
+            // The last statement's value is the result and moves to the
+            // caller; the values of other statements are discarded.
             match stmt {
-                TStmt::Let { local, value } => {
-                    let v = self.expr(value, Use::Move);
-                    self.locals[*local] = Some(v);
-                    self.owned.locals[*local] = value.ty.needs_drop();
+                TStmt::Expr(e) if returns && i + 1 == self.f.body.len() => {
+                    result = Some((self.expr(e, Use::Move), e.ty));
                 }
-                // The last statement's value is the result and moves to the
-                // caller; the values of other statements are discarded.
-                TStmt::Expr(e) => {
-                    let v = self.expr(e, Use::Move);
-                    if returns && i + 1 == self.f.body.len() {
-                        result = Some((v, e.ty));
-                    } else {
-                        // Moved here (even a bare `x` line), so drop it.
-                        emit_drop(&mut self.b, v, e.ty);
-                    }
-                }
+                _ => self.stmt(stmt),
             }
         }
         let result = result.map(|(v, ty)| self.convert(v, ty, self.f.ret));
@@ -228,13 +230,147 @@ impl<'a> FnLower<'a> {
         self.b.finish()
     }
 
+    fn stmt(&mut self, stmt: &TStmt) {
+        match stmt {
+            TStmt::Let { local, value } => {
+                let v = self.expr(value, Use::Move);
+                // A new value replaces the old one, which is dropped now:
+                // in `s = s + "!"` the old `s` was only read, so it is
+                // still owned until this point.
+                if self.owned.locals[*local] {
+                    let old = self.locals[*local].expect("owned variable has a value");
+                    emit_drop(&mut self.b, old, self.local_tys[*local]);
+                }
+                self.locals[*local] = Some(v);
+                self.local_tys[*local] = value.ty;
+                self.owned.locals[*local] = value.ty.needs_drop();
+            }
+            TStmt::Expr(e) => {
+                let v = self.expr(e, Use::Move);
+                // Moved here (even a bare `x` line) and discarded: drop it.
+                emit_drop(&mut self.b, v, e.ty);
+            }
+            TStmt::Loop {
+                var,
+                start,
+                end,
+                body,
+                carried,
+                inner,
+            } => self.loop_stmt(*var, start, end, body, carried, inner),
+        }
+    }
+
+    /// `loop var in [start, end]:` becomes
+    ///
+    /// ```text
+    ///   entry:            from = start, to = end
+    ///                     jmp loop(from, carried values...)
+    ///   loop(i, ...):     br i < to, loop_body, loop_end
+    ///   loop_body:        var = i; the body
+    ///                     drop the body's own variables
+    ///                     jmp loop(i + 1, carried values...)
+    ///   loop_end:         the carried variables hold the loop's parameters
+    /// ```
+    ///
+    /// The variables the body updates (`carried`) are passed around the loop
+    /// as block parameters: SSA's way of saying "this value differs from
+    /// one iteration to the next". `typeck` gave each of them one type for
+    /// the whole loop, so values are converted (boxed) to it when entering
+    /// the loop and at the end of every iteration.
+    fn loop_stmt(
+        &mut self,
+        var: usize,
+        start: &TExpr,
+        end: &TExpr,
+        body: &[TStmt],
+        carried: &[(usize, Ty)],
+        inner: &[usize],
+    ) {
+        let from = self.expr(start, Use::Borrow);
+        let to = self.expr(end, Use::Borrow);
+        let mut args = vec![from];
+        for &(l, ty) in carried {
+            args.push(self.carry(l, ty));
+        }
+        let header = self.b.new_block("loop");
+        let counter = self.b.block_param(header, Type::I64);
+        let params: Vec<Value> = carried
+            .iter()
+            .map(|&(_, ty)| self.b.block_param(header, repr(ty)))
+            .collect();
+        let body_block = self.b.new_block("loop_body");
+        let exit = self.b.new_block("loop_end");
+        self.b.jmp(header, args);
+
+        self.b.switch_to(header);
+        let more = self.b.icmp(ICond::Slt, counter, to);
+        self.b.br(more, body_block, vec![], exit, vec![]);
+        let at_header = self.owned.clone();
+        for (&(l, _), &p) in carried.iter().zip(&params) {
+            self.locals[l] = Some(p);
+        }
+
+        self.b.switch_to(body_block);
+        self.locals[var] = Some(counter);
+        self.local_tys[var] = Ty::INT;
+        for stmt in body {
+            self.stmt(stmt);
+        }
+        // The body's own variables end with the iteration.
+        for &l in inner {
+            if self.owned.locals[l] {
+                let v = self.locals[l].expect("owned variable has a value");
+                emit_drop(&mut self.b, v, self.local_tys[l]);
+                self.owned.locals[l] = false;
+            }
+        }
+        let one = self.b.iconst(1);
+        let next = self.b.ibin(IBinOp::Add, counter, one);
+        let mut args = vec![next];
+        for &(l, ty) in carried {
+            args.push(self.carry(l, ty));
+        }
+        self.b.jmp(header, args);
+
+        // After the loop: the ownership checker made sure every outside
+        // variable is owned exactly as it was before the loop.
+        self.b.switch_to(exit);
+        for (&(l, ty), &p) in carried.iter().zip(&params) {
+            self.locals[l] = Some(p);
+            self.local_tys[l] = ty;
+        }
+        self.owned = at_header;
+    }
+
+    /// The value of variable `l` converted to its type across a loop, `ty`.
+    /// A converted (boxed) value is owned by the variable, as the old one
+    /// was. A variable without a value (moved) passes a placeholder.
+    fn carry(&mut self, l: usize, ty: Ty) -> Value {
+        let v = self.locals[l].expect("carried variable has a value");
+        let from = self.local_tys[l];
+        if from == ty {
+            return v;
+        }
+        let has_value = self.owned.locals[l] || !from.needs_drop();
+        self.local_tys[l] = ty;
+        self.owned.locals[l] = has_value && ty.needs_drop();
+        if has_value {
+            self.convert(v, from, ty)
+        } else {
+            self.dummy(ty)
+        }
+    }
+
     // -- ownership and drops --------------------------------------------------
     //
     // Every heap value has exactly one owner, as checked by `ownership`:
     //
-    // - a parameter or local owns its value until the value is moved away
-    //   (`y = x`, `f x`, returned, or the result of a `check` arm); whatever
-    //   is still owned when the function ends is dropped;
+    // - a variable owns its value until the value is moved away (`y = x`,
+    //   `f x`, returned, or the result of a `check` arm) or replaced by a
+    //   new value (`x = ...`, which drops the old one); whatever is still
+    //   owned when the function ends is dropped, and a loop body's own
+    //   variables are dropped at the end of each iteration;
     // - a *temporary* (a fresh value from a call, an operator or a `check`)
     //   that is only read, as in `echo (a + b)`, is dropped right after
     //   that read;
@@ -248,10 +384,7 @@ impl<'a> FnLower<'a> {
     /// borrowed from a parameter or local (whose owner drops it later) or is
     /// a string literal (which is immortal anyway).
     fn drop_temp(&mut self, e: &TExpr, v: Value) {
-        if !matches!(
-            e.kind,
-            TExprKind::Param(_) | TExprKind::Local(_) | TExprKind::Str(_)
-        ) {
+        if !matches!(e.kind, TExprKind::Local(_) | TExprKind::Str(_)) {
             emit_drop(&mut self.b, v, e.ty);
         }
     }
@@ -259,16 +392,10 @@ impl<'a> FnLower<'a> {
     /// Drop the values of the owners in `owned`, except those also in
     /// `keep`.
     fn drop_owned(&mut self, owned: &Owned, keep: Option<&Owned>) {
-        for (i, &own) in owned.params.iter().enumerate() {
-            if own && !keep.is_some_and(|k| k.params[i]) {
-                let v = self.b.param(i);
-                emit_drop(&mut self.b, v, self.f.params[i]);
-            }
-        }
         for (l, &own) in owned.locals.iter().enumerate() {
             if own && !keep.is_some_and(|k| k.locals[l]) {
-                let v = self.locals[l].expect("owned local has a value");
-                emit_drop(&mut self.b, v, self.f.local_tys[l]);
+                let v = self.locals[l].expect("owned variable has a value");
+                emit_drop(&mut self.b, v, self.local_tys[l]);
             }
         }
     }
@@ -302,12 +429,6 @@ impl<'a> FnLower<'a> {
             TExprKind::Float(v) => self.b.fconst(*v),
             TExprKind::Str(s) => self.string_const(s),
             TExprKind::Bool(v) => self.b.iconst(*v as i64),
-            TExprKind::Param(i) => {
-                if moved {
-                    self.owned.params[*i] = false;
-                }
-                self.b.param(*i)
-            }
             TExprKind::Local(l) => {
                 if moved {
                     self.owned.locals[*l] = false;
@@ -326,6 +447,75 @@ impl<'a> FnLower<'a> {
                     Some(v) => v,
                     None => self.dummy(e.ty),
                 }
+            }
+            // A call decided at run time:
+            //
+            //   test case 1 --yes--> convert args, call 1 --+
+            //       |no                                    |
+            //   test case 2 --yes--> convert args, call 2 --+--> dispatch_end(result)
+            //       |no                                    |
+            //   rt.no_match (only if the cases may all fail)
+            //
+            // A test checks the tags of the boxed arguments whose type is
+            // not known well enough at compile time.
+            TExprKind::Dispatch {
+                name,
+                args,
+                cases,
+                exhaustive,
+            } => {
+                let vals: Vec<Value> = args.iter().map(|a| self.expr(a, Use::Move)).collect();
+                let merge = self.b.new_block("dispatch_end");
+                let result = self.b.block_param(merge, repr(e.ty));
+                for case in cases {
+                    let mut cond = None;
+                    for ((test, &v), a) in case.tests.iter().zip(&vals).zip(args) {
+                        if let Some(t) = test {
+                            debug_assert!(a.ty.is_union(), "only boxed values are tested");
+                            let tag = self.b.load(MemTy::I64, v, 0);
+                            let hit = self.tag_in(tag, *t);
+                            cond = Some(match cond {
+                                Some(c) => self.b.ibin(IBinOp::And, c, hit),
+                                None => hit,
+                            });
+                        }
+                    }
+                    let take = self.b.new_block("case");
+                    let next = self.b.new_block("next_case");
+                    match cond {
+                        Some(c) => self.b.br(c, take, vec![], next, vec![]),
+                        None => self.b.jmp(take, vec![]),
+                    }
+                    self.b.switch_to(take);
+                    let converted: Vec<Value> = vals
+                        .iter()
+                        .zip(args)
+                        .zip(&case.params)
+                        .map(|((&v, a), &to)| self.convert(v, a.ty, to))
+                        .collect();
+                    let callee = &self.tir.funcs[case.inst];
+                    let ret = if callee.discard {
+                        None
+                    } else {
+                        ret_repr(callee.ret)
+                    };
+                    let callee_ret = if callee.discard { Ty::VOID } else { callee.ret };
+                    let r = match self.b.call(&callee.symbol, converted, ret) {
+                        Some(v) => self.convert(v, callee_ret, e.ty),
+                        None => self.dummy(e.ty),
+                    };
+                    self.b.jmp(merge, vec![r]);
+                    self.b.switch_to(next);
+                }
+                if *exhaustive {
+                    self.b.unreachable();
+                } else {
+                    let msg = self.string_const(name);
+                    self.b.call("rt.no_match", vec![msg], None);
+                    self.b.unreachable();
+                }
+                self.b.switch_to(merge);
+                result
             }
             TExprKind::Diverge(args) => {
                 for a in args {
@@ -503,6 +693,18 @@ impl<'a> FnLower<'a> {
         self.b.load(mt, boxed, 8)
     }
 
+    /// 1 if the kind with `tag` is in `ty`, else 0. The test reuses the
+    /// bit-set encoding of `Ty`: the kind with tag t is bit t-1.
+    fn tag_in(&mut self, tag: Value, ty: Ty) -> Value {
+        let one = self.b.iconst(1);
+        let shift = self.b.ibin(IBinOp::Sub, tag, one);
+        let bit = self.b.ibin(IBinOp::Shl, one, shift);
+        let mask = self.b.iconst(ty.mask());
+        let hit = self.b.ibin(IBinOp::And, bit, mask);
+        let zero = self.b.iconst(0);
+        self.b.icmp(ICond::Ne, hit, zero)
+    }
+
     /// Calls the runtime's type error if `tag` is not in `allowed`.
     ///
     /// The test reuses the bit-set encoding of `Ty`: kind with tag t is bit
@@ -512,11 +714,7 @@ impl<'a> FnLower<'a> {
     fn check_tag(&mut self, tag: Value, allowed: Ty) {
         let ok = self.b.new_block("tag_ok");
         let bad = self.b.new_block("tag_bad");
-        let one = self.b.iconst(1);
-        let shift = self.b.ibin(IBinOp::Sub, tag, one);
-        let bit = self.b.ibin(IBinOp::Shl, one, shift);
-        let mask = self.b.iconst(allowed.mask());
-        let hit = self.b.ibin(IBinOp::And, bit, mask);
+        let hit = self.tag_in(tag, allowed);
         self.b.br(hit, ok, vec![], bad, vec![]);
         self.b.switch_to(bad);
         let expected = self.string_const(&allowed.to_string());

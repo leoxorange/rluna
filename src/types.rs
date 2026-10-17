@@ -107,6 +107,11 @@ impl Ty {
         Ty(self.0 & other.0)
     }
 
+    /// The kinds of `self` that are not in `other`.
+    pub fn without(self, other: Ty) -> Ty {
+        Ty(self.0 & !other.0)
+    }
+
     /// Every kind in `self` is also in `other`: no bit of `self` is outside
     /// `other`.
     pub fn is_subset(self, other: Ty) -> bool {

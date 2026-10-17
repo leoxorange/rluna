@@ -6,7 +6,10 @@
 //!   (or end of file); the body's last statement is its result.
 //! - Inside a body, an *indented* line of the form `name = expr` is a local
 //!   binding. Every other line is an expression statement.
-//! - `check e:` arms are separated by `;` and may span lines.
+//! - `check e:` and `loop x in [a, b]:` are followed by their body on the
+//!   next lines, indented further than the line they start on: the arms of
+//!   a `check` (one per line, separated by `;`), the statements of a loop.
+//!   These are the only places where the amount of indentation matters.
 //!
 //! Expression precedence, loosest to tightest:
 //!   check  <  comparison  <  + -  <  * /  <  unary -  <  application  <  atoms
@@ -227,17 +230,7 @@ impl Parser {
     }
 
     fn body(&mut self) -> PResult<Block> {
-        let mut stmts = Vec::new();
-        self.skip_newlines();
-        while self.peek() != &TokenKind::Eof && !self.at_def_start() {
-            stmts.push(self.stmt()?);
-            if self.peek() != &TokenKind::Eof {
-                if self.peek() != &TokenKind::Newline {
-                    return Err(self.unexpected("end of line"));
-                }
-                self.skip_newlines();
-            }
-        }
+        let stmts = self.stmts(None)?;
         if stmts.is_empty() {
             return Err(Diagnostic::error(
                 ErrorKind::SyntaxError,
@@ -248,10 +241,39 @@ impl Parser {
         Ok(Block { stmts })
     }
 
-    /// A statement is either a local binding `name = expr` or an expression.
-    /// Two tokens of lookahead decide it: `x = ...` is a binding, while
-    /// `x + 1` or `f x` is an expression.
+    /// Statements, one per line, up to the next definition or the end of the
+    /// file. With `deeper_than`, only lines whose first token is indented
+    /// further than that column: the body of a `loop`.
+    fn stmts(&mut self, deeper_than: Option<usize>) -> PResult<Vec<Stmt>> {
+        let mut stmts = Vec::new();
+        loop {
+            self.skip_newlines();
+            let tok = &self.toks[self.pos];
+            if tok.kind == TokenKind::Eof
+                || self.at_def_start()
+                || deeper_than.is_some_and(|col| tok.col <= col)
+            {
+                return Ok(stmts);
+            }
+            let stmt = self.stmt()?;
+            // A loop ends where its body ends, at the start of a line;
+            // every other statement must end with its line.
+            if !matches!(stmt, Stmt::Loop { .. })
+                && !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof)
+            {
+                return Err(self.unexpected("end of line"));
+            }
+            stmts.push(stmt);
+        }
+    }
+
+    /// A statement is a binding `name = expr`, a `loop`, or an expression.
+    /// Two tokens of lookahead decide between the first and the last: `x = ...`
+    /// is a binding, while `x + 1` or `f x` is an expression.
     fn stmt(&mut self) -> PResult<Stmt> {
+        if self.peek() == &TokenKind::Loop {
+            return self.loop_stmt();
+        }
         if let (TokenKind::Ident(name), TokenKind::Assign) = (self.peek().clone(), self.peek_at(1))
         {
             let span = self.bump().span;
@@ -260,6 +282,48 @@ impl Parser {
             return Ok(Stmt::Let { name, span, value });
         }
         Ok(Stmt::Expr(self.expr()?))
+    }
+
+    /// `loop x in [start, end]:` and the indented lines below it.
+    fn loop_stmt(&mut self) -> PResult<Stmt> {
+        let loop_tok = self.bump();
+        let TokenKind::Ident(var) = self.peek().clone() else {
+            return Err(self.unexpected("the loop variable's name"));
+        };
+        let var_span = self.bump().span;
+        self.expect(&TokenKind::In, "`in`")?;
+        self.expect(&TokenKind::LBracket, "`[` (a range such as `[0, 5]`)")?;
+        let start = self.comparison()?;
+        self.expect(
+            &TokenKind::Comma,
+            "`,` between the start and the end of the range",
+        )?;
+        let end = self.comparison()?;
+        self.expect(&TokenKind::RBracket, "`]`")?;
+        self.expect(&TokenKind::Colon, "`:` after the range")?;
+        let header = loop_tok.span.to(self.prev_span());
+        if self.peek() != &TokenKind::Newline {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                self.span(),
+                "the loop body goes on the following lines, indented further than `loop`",
+            ));
+        }
+        let body = self.stmts(Some(loop_tok.col))?;
+        if body.is_empty() {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                header,
+                "this loop has no body: indent the lines below it further than `loop`",
+            ));
+        }
+        Ok(Stmt::Loop {
+            var,
+            var_span,
+            start,
+            end,
+            body,
+        })
     }
 
     fn expr(&mut self) -> PResult<Expr> {
@@ -273,24 +337,65 @@ impl Parser {
     /// are parsed with `comparison`, not `expr`, so that a nested `check`
     /// cannot start in the middle of them. Arm bodies use the full `expr`,
     /// so an arm can itself contain a `check`.
+    /// The indentation of the line that token `idx` is on: the column of
+    /// the line's first token.
+    fn line_indent(&self, idx: usize) -> usize {
+        let mut k = idx;
+        while k > 0 && !self.toks[k].line_first {
+            k -= 1;
+        }
+        self.toks[k].col
+    }
+
     fn check(&mut self) -> PResult<Expr> {
+        let indent = self.line_indent(self.pos);
         let start = self.bump().span;
         let scrutinee = self.comparison()?;
         self.expect(&TokenKind::Colon, "`:` after the checked expression")?;
+        let header = start.to(self.prev_span());
         let mut arms = Vec::new();
         let mut else_arm = None;
+        // The column of the first arm: every arm is lined up with it.
+        let mut arm_col = None;
         loop {
             self.skip_newlines();
+            // Every arm starts its own line, indented further than the line
+            // with `check`, like the body of a loop.
+            let tok = &self.toks[self.pos];
+            if !tok.line_first || tok.col <= indent || tok.kind == TokenKind::Eof {
+                let (span, msg) = if arm_col.is_none() {
+                    (
+                        header,
+                        "the arms of a `check` go on the following lines, each on its own line, indented further than the line with `check`",
+                    )
+                } else {
+                    (
+                        tok.span,
+                        "expected another arm of the `check` after `;`, on its own line, indented further than the line with `check`",
+                    )
+                };
+                return Err(Diagnostic::error(ErrorKind::SyntaxError, span, msg));
+            }
+            let col = *arm_col.get_or_insert(tok.col);
             if self.peek() == &TokenKind::Else {
                 self.bump();
                 self.expect(&TokenKind::Arrow, "`->`")?;
                 else_arm = Some(Box::new(self.expr()?));
+                // A `;` after `else` may separate the arms of an enclosing
+                // `check`; it is an error only if another arm of this one
+                // follows.
                 if self.peek() == &TokenKind::Semi {
-                    return Err(Diagnostic::error(
-                        ErrorKind::SyntaxError,
-                        self.span(),
-                        "the `else` branch must be the last branch of a `check`",
-                    ));
+                    let mut k = self.pos + 1;
+                    while self.toks[k].kind == TokenKind::Newline {
+                        k += 1;
+                    }
+                    if self.toks[k].line_first && self.toks[k].col == col {
+                        return Err(Diagnostic::error(
+                            ErrorKind::SyntaxError,
+                            self.span(),
+                            "the `else` branch must be the last branch of a `check`",
+                        ));
+                    }
                 }
                 break;
             }
@@ -555,7 +660,7 @@ mod tests {
     #[test]
     fn readme_examples_parse() {
         let p = parse_src(
-            "b = 10\nsum a b = a + b\nsummon a = check a:\n1 -> summon (sum a 9);\n10 -> echo \"summon successfully\";\nelse -> echo \"summon failed\"\n\nmain =\n  summon 1\n  summon 2\n",
+            "b = 10\nsum a b = a + b\nsummon a = check a:\n    1 -> summon (sum a 9);\n    10 -> echo \"summon successfully\";\n    else -> echo \"summon failed\"\n\nmain =\n  summon 1\n  summon 2\n",
         );
         let names: Vec<&str> = p.defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["b", "sum", "summon", "main"]);

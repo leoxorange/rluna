@@ -4,8 +4,8 @@ id a = a
 show s = echo s
 twice x = x + x
 label n = check n:
-1 -> "one";
-else -> "many"
+    1 -> "one";
+    else -> "many"
 
 main =
     # ints, floats and booleans are copied, so `n` stays usable

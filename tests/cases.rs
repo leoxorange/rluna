@@ -133,14 +133,61 @@ fn compile_errors() {
         ),
         ("main = echo missing", "SymbolNotFoundError"),
         ("foo = 1", "no `main` function"),
-        ("main = check 3:\n1 -> echo \"a\"", "needs an `else` branch"),
+        (
+            "main = check 3:\n    1 -> echo \"a\"",
+            "needs an `else` branch",
+        ),
         (
             "main = echo (\"a\" - 1)",
             "operator `-` cannot be applied to string and int",
         ),
         ("f a = a\nmain = echo f 1", "`echo` takes one argument"),
         (
-            "f n = check n:\n1 -> echo \"a\";\nelse -> 5\nmain = echo (f 1)",
+            "f n = check n:\n1 -> 1;\nelse -> 2\nmain = echo (f 1)",
+            "the arms of a `check` go on the following lines",
+        ),
+        (
+            "f n = check n: 1 -> 1; else -> 2\nmain = echo (f 1)",
+            "the arms of a `check` go on the following lines",
+        ),
+        (
+            "f n = check n:\n    1 -> 1; else -> 2\nmain = echo (f 1)",
+            "expected another arm of the `check` after `;`",
+        ),
+        (
+            "f n = check n:\n    else -> 1;\n    1 -> 2\nmain = echo (f 1)",
+            "the `else` branch must be the last branch",
+        ),
+        (
+            "main =\n    s = \"x\"\n    loop i in [0, 3]:\n        y = s\n    echo 1",
+            "`s` is moved in this loop",
+        ),
+        (
+            "main =\n    s = \"x\"\n    y = s\n    loop i in [0, 3]:\n        s = \"new\"\n    echo 1",
+            "`s` gets a value in this loop, but it was moved before the loop",
+        ),
+        (
+            "main =\n    loop i in [0, 2]:\n        inner = i\n    echo inner",
+            "cannot find symbol `inner`",
+        ),
+        (
+            "main =\n    loop i in [0, 2]:\n    echo 1",
+            "this loop has no body",
+        ),
+        (
+            "main =\n    loop i in [0, 2.5]:\n        echo i",
+            "the end of a loop range must be an int",
+        ),
+        (
+            "main =\n    loop x in [0, 5]:\n        x = \"s\"",
+            "`x` is the variable of a loop and must stay an int, but this is string",
+        ),
+        (
+            "main =\n    loop x in [0, 2]:\n        loop y in [0, 2]:\n            x = 2.5",
+            "`x` is the variable of a loop and must stay an int, but this is float",
+        ),
+        (
+            "f n = check n:\n    1 -> echo \"a\";\n    else -> 5\nmain = echo (f 1)",
             "void cannot be mixed with other types",
         ),
         (
@@ -296,7 +343,7 @@ entry:
 /// from the executable. A global with a side effect stays a function.
 #[test]
 fn constant_globals_are_folded() {
-    let src = "count n = check n:\n0 -> 0;\nelse -> 1 + count (n - 1)
+    let src = "count n = check n:\n    0 -> 0;\n    else -> 1 + count (n - 1)
 foo = \"he\" + \"llo\"
 counted = count 50
 banner = echo \"hi\"
@@ -324,4 +371,21 @@ main =
         );
     }
     assert!(functions.contains(&"banner:"), "{functions:?}");
+}
+
+/// A definition that an earlier one always matches first is reported.
+#[test]
+fn unreachable_definition_warning() {
+    let src = "head _ = echo \"nothing left\"\nhead a :: numeric -> void = echo \"winning\"\nmain = head 1";
+    let file = SourceFile::new("head.luna", src);
+    let artifacts = driver::compile(Input::Luna(&file), &Options::default())
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    assert!(
+        artifacts
+            .warnings
+            .iter()
+            .any(|w| w.contains("this definition of `head` is never used")),
+        "{:?}",
+        artifacts.warnings
+    );
 }

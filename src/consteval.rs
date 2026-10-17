@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use crate::ast::BinOp;
-use crate::typeck::{InstId, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result};
+use crate::typeck::{InstId, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result, for_each_expr_mut};
 use crate::types::{Kind, Ty};
 
 /// How much work evaluating one global may take, in evaluated expressions.
@@ -93,11 +93,7 @@ pub fn fold_globals(tir: &mut Tir) {
     // Without a thread nothing is folded; the program is still correct.
     .unwrap_or_default();
     for f in &mut tir.funcs {
-        for stmt in &mut f.body {
-            match stmt {
-                TStmt::Let { value, .. } | TStmt::Expr(value) => substitute(value, &consts),
-            }
-        }
+        for_each_expr_mut(&mut f.body, &mut |e| substitute(e, &consts));
     }
 }
 
@@ -156,11 +152,10 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
         | TExprKind::Float(_)
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
-        | TExprKind::Param(_)
         | TExprKind::Local(_) => {}
-        TExprKind::Call { args, .. } | TExprKind::Diverge(args) => {
-            args.iter_mut().for_each(|a| substitute(a, consts))
-        }
+        TExprKind::Call { args, .. }
+        | TExprKind::Dispatch { args, .. }
+        | TExprKind::Diverge(args) => args.iter_mut().for_each(|a| substitute(a, consts)),
         TExprKind::Binary { lhs, rhs, .. } => {
             substitute(lhs, consts);
             substitute(rhs, consts);
@@ -189,9 +184,8 @@ struct Interp<'a> {
     depth: usize,
 }
 
-/// The parameters and locals of one call being evaluated.
+/// The variables (parameters first) of one call being evaluated.
 struct Frame {
-    params: Vec<Const>,
     locals: Vec<Option<Const>>,
 }
 
@@ -202,23 +196,47 @@ impl Interp<'_> {
         }
         self.depth += 1;
         let f: &TFunc = &self.tir.funcs[inst];
-        let mut frame = Frame {
-            params: args,
-            locals: vec![None; f.local_tys.len()],
-        };
-        let mut result = Const::Void;
-        for stmt in &f.body {
-            match stmt {
-                TStmt::Let { local, value } => {
-                    let v = self.expr(value, &mut frame)?;
-                    frame.locals[*local] = Some(v);
-                    result = Const::Void;
-                }
-                TStmt::Expr(e) => result = self.expr(e, &mut frame)?,
-            }
-        }
+        let mut locals: Vec<Option<Const>> = args.into_iter().map(Some).collect();
+        locals.resize(f.local_tys.len(), None);
+        let mut frame = Frame { locals };
+        let result = self.stmts(&f.body, &mut frame)?;
         self.depth -= 1;
         Ok(if f.discard { Const::Void } else { result })
+    }
+
+    /// Run statements; the value of the last one if it is an expression.
+    fn stmts(&mut self, stmts: &[TStmt], frame: &mut Frame) -> Eval<Const> {
+        let mut result = Const::Void;
+        for stmt in stmts {
+            result = Const::Void;
+            match stmt {
+                TStmt::Let { local, value } => {
+                    let v = self.expr(value, frame)?;
+                    frame.locals[*local] = Some(v);
+                }
+                TStmt::Expr(e) => result = self.expr(e, frame)?,
+                TStmt::Loop {
+                    var,
+                    start,
+                    end,
+                    body,
+                    ..
+                } => {
+                    let (Const::Int(from), Const::Int(to)) =
+                        (self.expr(start, frame)?, self.expr(end, frame)?)
+                    else {
+                        unreachable!("loop bounds are ints")
+                    };
+                    for i in from..to {
+                        // Every iteration costs fuel, even an empty body.
+                        self.fuel = self.fuel.checked_sub(1).ok_or(NotConstant)?;
+                        frame.locals[*var] = Some(Const::Int(i));
+                        self.stmts(body, frame)?;
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn expr(&mut self, e: &TExpr, frame: &mut Frame) -> Eval<Const> {
@@ -228,7 +246,6 @@ impl Interp<'_> {
             TExprKind::Float(v) => Const::Float(*v),
             TExprKind::Str(s) => Const::Str(s.clone()),
             TExprKind::Bool(b) => Const::Bool(*b),
-            TExprKind::Param(i) => frame.params[*i].clone(),
             TExprKind::Local(l) => frame.locals[*l].clone().expect("local is defined"),
             TExprKind::Call { inst, args } => {
                 let args = args
@@ -236,6 +253,23 @@ impl Interp<'_> {
                     .map(|a| self.expr(a, frame))
                     .collect::<Eval<Vec<_>>>()?;
                 self.call(*inst, args)?
+            }
+            TExprKind::Dispatch { args, cases, .. } => {
+                let args = args
+                    .iter()
+                    .map(|a| self.expr(a, frame))
+                    .collect::<Eval<Vec<_>>>()?;
+                let fits = |tests: &[Option<Ty>]| {
+                    tests
+                        .iter()
+                        .zip(&args)
+                        .all(|(t, a)| t.is_none_or(|t| t.contains(a.kind())))
+                };
+                // No definition accepts the values: a runtime error.
+                let Some(case) = cases.iter().find(|c| fits(&c.tests)) else {
+                    return Err(NotConstant);
+                };
+                self.call(case.inst, args)?
             }
             // A side effect: the global must run when the program runs.
             TExprKind::Echo(_) => return Err(NotConstant),

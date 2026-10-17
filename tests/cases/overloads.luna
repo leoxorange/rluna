@@ -4,8 +4,8 @@ describe x :: string -> string = "string"
 describe x y = "two things"
 
 count n = check n:
-0 -> 0;
-else -> 1 + count (n - 1)
+    0 -> 0;
+    else -> 1 + count (n - 1)
 
 main =
     echo (describe 1)

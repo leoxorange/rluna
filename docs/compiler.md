@@ -57,8 +57,22 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
 
 - **Layout.** A top-level definition starts in column 1 with
   `name params... =` or `name params... ::`. Its body runs until the next
-  definition starts. An *indented* `name = expr` line inside a body is a local
+  definition starts. An *indented* `name = expr` line inside a body is a
   binding; any other line is an expression. The last line is the result.
+- **Variables.** Parameters and locals are variables. `x = expr` gives `x`
+  its first value or, if `x` is visible already, a new one (freeing the old
+  value), so variables are mutable. The type can change: after `x = 5` then
+  `x = "s"`, `x` is a string.
+- **Loops.** `loop x in [a, b]:` runs the lines below it that are indented
+  further than `loop` for `x` = a, a + 1, …, b - 1 (none if `b <= a`). The
+  bounds are ints, evaluated once. The loop variable is always an int: it
+  can be given other ints (`x = 40`), but giving it any other type is a
+  `TypeError`, and each iteration still starts with the next value of the
+  range. `x` and the variables first bound in the
+  body exist only inside the body, and are new in every iteration; a
+  variable from outside that the body updates keeps its value across
+  iterations and after the loop. Its type is the union of its types before
+  the loop and at the end of the body (and may not mix in `void`).
 - **Top level** holds only definitions; executable code goes in `main`
   (`main = ...`, no arguments, required).
 - **Application** binds tighter than operators (`sum a 9 + 1` is
@@ -68,7 +82,18 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   type error, and `echo sum a 9` is a syntax error.
 - **`check`** compares the scrutinee with each pattern using `==`, top to
   bottom. `else` is required unless the scrutinee is a `boolean` and both
-  `true` and `false` are covered.
+  `true` and `false` are covered. Like a loop body, the arms go on the
+  following lines, each on its own line, indented further than the line
+  with `check`, separated by `;`:
+
+  ```
+  test _ = check _:
+      1 -> echo "success";
+      else -> test (pred _)
+  ```
+
+  A `check` can be nested in an arm (its arms indented further still) or
+  sit inside parentheses (`echo (check n:` … `)`).
 - **Numbers.** `5` is an `int` (64-bit), `5.0`/`1e3` are `float` (64-bit).
   `int op int` stays `int` for `+ - *`; `/` always produces a `float`
   (`7 / 2` is `3.5`). Mixed `int`/`float` arithmetic gives `float`.
@@ -107,7 +132,15 @@ holds it. The design follows Rust, without references:
 - **Copies.** `int`, `float` and `boolean` values are copied instead of
   moved; `void` is not a value, so there is nothing to own. Strings and
   mixed types (`numeric`, `any`, …) live on the heap and move.
+- **New values.** `x = …` makes `x` usable again after a move, and frees
+  the value `x` still held, if any.
 - **Branches.** After a `check`, a name counts as moved if any arm moved it.
+- **Loops.** A loop body must leave every outside variable as it found it:
+  moving `s` inside the body is an error unless `s` gets a new value before
+  the body ends (otherwise the next iteration would find it empty), and a
+  variable moved before the loop cannot get a value inside it (whether it
+  held one afterwards would depend on how often the loop ran). So the state
+  after a loop never depends on the number of iterations.
 - Arguments are evaluated left to right, so `f x x` moves `x` and then uses
   it: an error for strings, fine for ints.
 
@@ -148,9 +181,22 @@ Annotations are constraints: an argument whose type cannot match is a
 compile-time `TypeError`; one that *might* match (e.g. a value of type
 `int|string` passed to a `numeric` parameter) gets a runtime check.
 
-Overloads are chosen at compile time by arity and by the most specific
-matching parameter types. Runtime dispatch between overloads (when the
-argument's type is only known at runtime) is not implemented yet.
+**Overloads** are tried from top to bottom; the first definition (with the
+right number of parameters) whose parameter types accept the arguments is
+called:
+
+```
+head a :: numeric -> void = echo "winning"
+head _ = echo "nothing left"      # everything that is not numeric
+```
+
+Usually the argument types decide this at compile time. When an argument
+has a mixed type (`int|string`), a definition may accept only some of its
+values, and the program tests the value's kind at run time, trying the
+definitions in the same order (`TExprKind::Dispatch`). If none accepts it,
+the program stops with `TypeError: no definition of `head` accepts these
+arguments`. A definition that an earlier one always matches first gets a
+warning, since it can never run.
 
 ## Value representation
 
@@ -182,8 +228,15 @@ parameters** instead of phi nodes. The text form can be printed
 (`--emit=ir`) and parsed back (`lunac file.lir`), and the runtime library is
 written in it.
 
-For example, `count n = check n: 0 -> 0; else -> 1 + count (n - 1)` called
-with an `int` becomes:
+For example,
+
+```
+count n = check n:
+    0 -> 0;
+    else -> 1 + count (n - 1)
+```
+
+called with an `int` becomes:
 
 ```
 ; count(int) -> int
@@ -306,7 +359,6 @@ assemblers.
 ## Possible next steps
 
 - register allocation and more LIR optimizations (constant folding, inlining)
-- loop syntax, more of the standard library
-- runtime overload dispatch on union-typed arguments
+- more of the standard library
 - a Linux (ELF) target; most of the work is an ELF writer and a
   `runtime/linux.lir` making system calls directly

@@ -6,7 +6,7 @@ luna is a haskell-like language, the key concept of luna is we use as much less 
 
 ## chapter 1. basic syntax
 
-- calculation
+### calculation
 
 ```
 echo (5 > 6) # false
@@ -15,8 +15,7 @@ echo (4 < 10) # true
 foo :: boolean = 5 > 6 # foo is false
 ```
 
-
-- symbol definition
+### symbol definition
 
 ```
 sum = 1
@@ -29,39 +28,51 @@ This is not only for variable definition, this language works like haskell, the 
 
 Using **#** to start a line means a single line comment.
 
-- conditions
+### conditions
 
 process contorl is necessory for any languages, so we have a powerful system for this situation.
 ```
 foo = 5
 pred a = a - 1
 test _ = check _: # _ is a hidden arguement symbol for the function arguements you dont want give it a real name, and it only works in this function
-1 -> echo "success";
-else -> test (pred _)
+    1 -> echo "success";
+    else -> test (pred _)
 
-test foo
+main = test foo
 ```
 check keywords works like match in kotlin or rust. the code above will loop 5 times to reach the success output.
 ```
 check [enumerable types | numeric | string]:
-condition1 -> [expression];
-condition2 -> [expression];
-else -> [expression]
+    condition1 -> [expression];
+    condition2 -> [expression];
+    else -> [expression]
 ```
-the **else** branch always be required if it is checking a numeric, string or we still have some conditions that have not be covered by the branch above.
+the check body must be indented.
+the **else** branch always be required if it is checking a numeric, string or we still have some conditions that have not be covered by the branches above.
 
-- function definition and call
+### loop
+
+recursion is expensive especially for those deep ones, so here's a simple way to repeat something.
+```
+main = 
+    loop x in [0..5]: # [0..5] means 0, 1, 2, 3, 4
+        echo x
+```
+the loop body must be indented.
+
+### function definition and call
 
 ```
 b = 10
 sum a b = a + b
 summon a = check a:
-1 -> summon (sum a 9);
-10 -> echo "summon successfully";
-else -> echo "summon failed"
+    1 -> summon (sum a 9);
+    10 -> echo "summon successfully";
+    else -> echo "summon failed"
 
-summon 1 # will output summon successfully
-summon 2 # will output summon failed
+main = 
+    summon 1 # will output summon successfully
+    summon 2 # will output summon failed
 ```
 Now sum takes two arguements **a** and **b** and returns the a plus b.
 The function body will ends when another definition starts.
@@ -70,7 +81,14 @@ And functions can have multiple definition(override) but needs different amount 
 
 The **main** function will be used as main entrance like other languages, so lack of main function is an error. The example code here is just for showing not the real project code.
 
-- type definition
+And since we have override, here's a new way to play function definition.
+```
+head a :: numeric -> void = echo "winning"
+head _ = echo "nothing left"
+```
+this function has two definitions, so when we use head, head 1 will output winning but other arguments will get nothing left, this can be seen as a mode matchness. the compiler will find from top to bottom to find the correct definition for caller, and head _ catches all the exceptions.
+
+### type definition
   
 we now have these embedded types:
 

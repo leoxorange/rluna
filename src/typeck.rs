@@ -61,9 +61,12 @@ pub struct TFunc {
     /// The function is declared `-> void`: the body's value is discarded.
     pub discard: bool,
     pub body: Vec<TStmt>,
+    /// Type of each variable after its last assignment in the body; the
+    /// parameters come first. (Only the count and the parameters are
+    /// meaningful: a variable's type can change from one assignment to the
+    /// next, so each expression carries its own type.)
     pub local_tys: Vec<Ty>,
-    /// Source names, for error messages.
-    pub param_names: Vec<String>,
+    /// Name of each variable, the parameters first, for error messages.
     pub local_names: Vec<String>,
 }
 
@@ -76,8 +79,58 @@ impl TFunc {
 
 #[derive(Debug)]
 pub enum TStmt {
-    Let { local: usize, value: TExpr },
+    /// Give a variable a value: its first, or a new one.
+    Let {
+        local: usize,
+        value: TExpr,
+    },
     Expr(TExpr),
+    /// `loop var in [start, end]:`. The bounds are ints.
+    Loop {
+        var: usize,
+        start: TExpr,
+        end: TExpr,
+        body: Vec<TStmt>,
+        /// Outside variables the body updates, with their type at the top of
+        /// every iteration (and after the loop): the union of their type
+        /// before the loop and at the end of the body.
+        carried: Vec<(usize, Ty)>,
+        /// Variables that exist only inside the body.
+        inner: Vec<usize>,
+    },
+}
+
+/// Call `f` on every expression of these statements that is not part of a
+/// larger expression, including those inside loop bodies.
+pub fn for_each_expr(stmts: &[TStmt], f: &mut impl FnMut(&TExpr)) {
+    for s in stmts {
+        match s {
+            TStmt::Let { value, .. } | TStmt::Expr(value) => f(value),
+            TStmt::Loop {
+                start, end, body, ..
+            } => {
+                f(start);
+                f(end);
+                for_each_expr(body, f);
+            }
+        }
+    }
+}
+
+/// `for_each_expr` with mutable access.
+pub fn for_each_expr_mut(stmts: &mut [TStmt], f: &mut impl FnMut(&mut TExpr)) {
+    for s in stmts {
+        match s {
+            TStmt::Let { value, .. } | TStmt::Expr(value) => f(value),
+            TStmt::Loop {
+                start, end, body, ..
+            } => {
+                f(start);
+                f(end);
+                for_each_expr_mut(body, f);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -93,11 +146,20 @@ pub enum TExprKind {
     Float(f64),
     Str(String),
     Bool(bool),
-    Param(usize),
+    /// Read a variable (parameters are variables too).
     Local(usize),
     Call {
         inst: InstId,
         args: Vec<TExpr>,
+    },
+    /// A call whose definition is chosen at run time: the first case whose
+    /// tests the arguments pass is called. If none does and the cases are
+    /// not `exhaustive`, the program stops with a type error.
+    Dispatch {
+        name: String,
+        args: Vec<TExpr>,
+        cases: Vec<DispatchCase>,
+        exhaustive: bool,
     },
     /// Evaluate the expressions, at least one of which never returns.
     /// For example, a call whose argument is an infinite recursion: the
@@ -129,6 +191,17 @@ pub enum TExprKind {
     /// result is `int|string`, say), the machine code must box or unbox it.
     /// Making that an explicit node keeps lowering simple.
     Convert(Box<TExpr>),
+}
+
+/// One definition a `Dispatch` may call.
+#[derive(Debug)]
+pub struct DispatchCase {
+    /// For each argument, the type its value must have at run time, or
+    /// `None` when every possible value fits.
+    pub tests: Vec<Option<Ty>>,
+    /// The instance's parameter types: the arguments are converted to them.
+    pub params: Vec<Ty>,
+    pub inst: InstId,
 }
 
 /// Result type of applying an operator to two concrete kinds, if valid.
@@ -236,8 +309,13 @@ struct Checker<'a> {
 }
 
 struct Ctx<'a> {
-    params: &'a [Ty],
+    /// The current type of each variable. It follows the program: after
+    /// `x = 5` it is int, after `x = "a"` string.
     local_tys: Vec<Ty>,
+    names: &'a [String],
+    /// The variables of the loops being checked, innermost last, with where
+    /// each is named.
+    loop_vars: Vec<(usize, Span)>,
 }
 
 fn err(span: Span, msg: impl Into<String>) -> Diagnostic {
@@ -280,48 +358,139 @@ impl<'a> Checker<'a> {
     fn check_instance(&mut self, id: InstId) -> Result<(Vec<TStmt>, Vec<Ty>, Ty), Diagnostic> {
         let hir = self.hir;
         let func = &hir.funcs[self.instances[id].func];
-        let params = self.instances[id].params.clone();
+        let params = &self.instances[id].params;
+        // The parameters are the first variables, typed by this instance.
+        let mut local_tys = params.clone();
+        local_tys.resize(func.local_names.len(), Ty::NEVER);
         let mut cx = Ctx {
-            params: &params,
-            local_tys: vec![Ty::NEVER; func.local_names.len()],
+            local_tys,
+            names: &func.local_names,
+            loop_vars: Vec::new(),
         };
-        let mut body = Vec::new();
+        let mut body = self.stmts(&mut cx, &func.body)?;
+        // The value of the last statement is the result, if it is an
+        // expression (a binding or a loop gives void).
         let mut result = Ty::VOID;
-        for (i, stmt) in func.body.iter().enumerate() {
-            let last = i + 1 == func.body.len();
-            match stmt {
-                HStmt::Let { local, value } => {
-                    let v = self.expr(&mut cx, value)?;
-                    cx.local_tys[*local] = v.ty;
-                    body.push(TStmt::Let {
-                        local: *local,
-                        value: v,
-                    });
-                    if last {
-                        result = Ty::VOID;
-                    }
-                }
-                HStmt::Expr(e) => {
-                    let mut v = self.expr(&mut cx, e)?;
-                    if last {
-                        result = v.ty;
-                        if let Some(declared) = func.ret
-                            && declared != Ty::VOID
-                        {
-                            v = self.narrow(v, declared, || {
-                                format!("`{}` is declared to return {declared}", func.name)
-                            })?;
-                            result = v.ty;
-                        }
-                    }
-                    body.push(TStmt::Expr(v));
-                }
+        if let Some(TStmt::Expr(_)) = body.last() {
+            let Some(TStmt::Expr(mut v)) = body.pop() else {
+                unreachable!()
+            };
+            result = v.ty;
+            if let Some(declared) = func.ret
+                && declared != Ty::VOID
+            {
+                v = self.narrow(v, declared, || {
+                    format!("`{}` is declared to return {declared}", func.name)
+                })?;
+                result = v.ty;
             }
+            body.push(TStmt::Expr(v));
         }
         if func.ret == Some(Ty::VOID) {
             result = Ty::VOID;
         }
         Ok((body, cx.local_tys, result))
+    }
+
+    fn stmts(&mut self, cx: &mut Ctx, stmts: &[HStmt]) -> Result<Vec<TStmt>, Diagnostic> {
+        stmts.iter().map(|s| self.stmt(cx, s)).collect()
+    }
+
+    fn stmt(&mut self, cx: &mut Ctx, stmt: &HStmt) -> Result<TStmt, Diagnostic> {
+        Ok(match stmt {
+            HStmt::Let { local, value } => {
+                let v = self.expr(cx, value)?;
+                // A loop variable may get another int, never another type.
+                if let Some(&(_, declared)) = cx.loop_vars.iter().find(|(l, _)| l == local)
+                    && !v.ty.is_subset(Ty::INT)
+                {
+                    let name = &cx.names[*local];
+                    return Err(err(
+                        v.span,
+                        format!(
+                            "`{name}` is the variable of a loop and must stay an int, but this is {}",
+                            v.ty
+                        ),
+                    )
+                    .with_note(declared, format!("`{name}` is the variable of this loop")));
+                }
+                cx.local_tys[*local] = v.ty;
+                TStmt::Let {
+                    local: *local,
+                    value: v,
+                }
+            }
+            HStmt::Expr(e) => TStmt::Expr(self.expr(cx, e)?),
+            HStmt::Loop {
+                var,
+                var_span,
+                start,
+                end,
+                body,
+                carried,
+                inner,
+            } => {
+                let start = self.expr(cx, start)?;
+                let start = self.narrow(start, Ty::INT, || {
+                    "the start of a loop range must be an int".into()
+                })?;
+                let end = self.expr(cx, end)?;
+                let end = self.narrow(end, Ty::INT, || {
+                    "the end of a loop range must be an int".into()
+                })?;
+                // Another fixpoint, like the one for return types: a
+                // variable the body updates may come back from an iteration
+                // with a type it did not have before (`x = 0` before the
+                // loop, `x = "s"` inside), and the next iteration must
+                // accept both. Check the body with the types at the top of
+                // the loop, widen them by the types at the end, and repeat
+                // until they no longer grow.
+                let mut header: Vec<Ty> = carried.iter().map(|&l| cx.local_tys[l]).collect();
+                loop {
+                    for (&l, &t) in carried.iter().zip(&header) {
+                        cx.local_tys[l] = t;
+                    }
+                    for &l in inner {
+                        cx.local_tys[l] = Ty::NEVER;
+                    }
+                    cx.local_tys[*var] = Ty::INT;
+                    cx.loop_vars.push((*var, *var_span));
+                    let checked = self.stmts(cx, body);
+                    cx.loop_vars.pop();
+                    let checked = checked?;
+                    let widened: Vec<Ty> = carried
+                        .iter()
+                        .zip(&header)
+                        .map(|(&l, &t)| t.union(cx.local_tys[l]))
+                        .collect();
+                    if widened != header {
+                        header = widened;
+                        continue;
+                    }
+                    // Done: after the loop, the variables have these types.
+                    for (&l, &t) in carried.iter().zip(&header) {
+                        if t.is_union() && t.contains(Kind::Void) {
+                            return Err(err(
+                                start.span.to(end.span),
+                                format!(
+                                    "`{}` is {t} across this loop, but void cannot be mixed with other types",
+                                    cx.names[l]
+                                ),
+                            ));
+                        }
+                        cx.local_tys[l] = t;
+                    }
+                    break TStmt::Loop {
+                        var: *var,
+                        start,
+                        end,
+                        body: checked,
+                        carried: carried.iter().copied().zip(header).collect(),
+                        inner: inner.clone(),
+                    };
+                }
+            }
+        })
     }
 
     /// Convert `e` to `e.ty ∩ target`, inserting a runtime check if needed.
@@ -353,7 +522,6 @@ impl<'a> Checker<'a> {
             HExprKind::Float(v) => (TExprKind::Float(*v), Ty::FLOAT),
             HExprKind::Str(s) => (TExprKind::Str(s.clone()), Ty::STR),
             HExprKind::Bool(b) => (TExprKind::Bool(*b), Ty::BOOL),
-            HExprKind::Param(i) => (TExprKind::Param(*i), cx.params[*i]),
             HExprKind::Local(l) => (TExprKind::Local(*l), cx.local_tys[*l]),
             HExprKind::Call { name, args } => return self.call(cx, name, args, span),
             HExprKind::Binary { op, lhs, rhs } => {
@@ -520,99 +688,90 @@ impl<'a> Checker<'a> {
                 span,
             });
         }
-        // Overload resolution, in three steps:
-        //   1. candidates: overloads taking this many arguments;
-        //   2. full matches: every argument type fits the parameter type;
-        //      the most specific one wins, so `describe x :: int` beats an
-        //      unannotated `describe x` (`any`) for an int argument;
-        //   3. otherwise partial matches: arguments that *might* fit. Exactly
-        //      one is needed, because choosing between several would require
-        //      looking at the value at run time.
+        // Overload resolution: definitions are tried from top to bottom, and
+        // the first one whose parameter types accept the arguments is
+        // called. Usually the argument types decide this at compile time.
+        // But a mixed type such as `int|string` is only resolved at run
+        // time: a definition taking `numeric` accepts some of its values and
+        // not others. Then the program tests the value, trying the
+        // definitions in the same order, until one accepts every possible
+        // value (or none is left and the call fails at run time).
         let hir = self.hir;
         let candidates: Vec<FuncId> = hir.groups[name]
             .iter()
             .copied()
             .filter(|&f| hir.funcs[f].params.len() == args.len())
             .collect();
-
-        let full: Vec<FuncId> = candidates
-            .iter()
-            .copied()
-            .filter(|&f| {
-                args.iter()
-                    .zip(&hir.funcs[f].param_tys)
-                    .all(|(a, t)| a.ty.is_subset(*t))
-            })
-            .collect();
-        let chosen = if !full.is_empty() {
-            // Most specific: its parameter types are contained in every other match's.
-            let more_specific = |f: FuncId, g: FuncId| {
-                hir.funcs[f]
-                    .param_tys
-                    .iter()
-                    .zip(&hir.funcs[g].param_tys)
-                    .all(|(a, b)| a.is_subset(*b))
-            };
-            let best: Vec<FuncId> = full
+        // What each argument may still be when a definition is tried: a
+        // definition that tests a single argument leaves the next ones only
+        // the values it rejected.
+        let mut remaining: Vec<Ty> = args.iter().map(|a| a.ty).collect();
+        // (definition, runtime test per argument, argument types it receives)
+        let mut cases: Vec<(FuncId, Vec<Option<Ty>>, Vec<Ty>)> = Vec::new();
+        let mut exhaustive = false;
+        for &f in &candidates {
+            let params = &hir.funcs[f].param_tys;
+            if remaining
                 .iter()
-                .copied()
-                .filter(|&f| full.iter().all(|&g| more_specific(f, g)))
+                .zip(params)
+                .any(|(a, t)| a.intersect(*t).is_never())
+            {
+                continue; // cannot accept these arguments
+            }
+            let tests: Vec<Option<Ty>> = remaining
+                .iter()
+                .zip(params)
+                .map(|(a, t)| (!a.is_subset(*t)).then_some(*t))
                 .collect();
-            if best.len() != 1 {
+            let tested: Vec<usize> = (0..tests.len()).filter(|&j| tests[j].is_some()).collect();
+            let receives = remaining
+                .iter()
+                .zip(params)
+                .map(|(a, t)| a.intersect(*t))
+                .collect();
+            cases.push((f, tests, receives));
+            match tested[..] {
+                [] => {
+                    exhaustive = true;
+                    break;
+                }
+                [j] => remaining[j] = remaining[j].without(params[j]),
+                _ => {}
+            }
+        }
+        let chosen = match cases.len() {
+            0 => {
+                let arg_tys: Vec<String> = args.iter().map(|a| a.ty.to_string()).collect();
+                if candidates.len() == 1 {
+                    let f = &hir.funcs[candidates[0]];
+                    let (i, (a, t)) = args
+                        .iter()
+                        .zip(&f.param_tys)
+                        .enumerate()
+                        .find(|(_, (a, t))| a.ty.intersect(**t).is_never())
+                        .unwrap();
+                    return Err(err(
+                        a.span,
+                        format!(
+                            "argument {} of `{name}` must be {t}, but this is {}",
+                            i + 1,
+                            a.ty
+                        ),
+                    ));
+                }
                 return Err(err(
                     span,
-                    format!("call to `{name}` is ambiguous between several definitions"),
+                    format!(
+                        "no definition of `{name}` accepts arguments of type ({})",
+                        arg_tys.join(", ")
+                    ),
                 ));
             }
-            best[0]
-        } else {
-            let partial: Vec<FuncId> = candidates
-                .iter()
-                .copied()
-                .filter(|&f| {
-                    args.iter()
-                        .zip(&hir.funcs[f].param_tys)
-                        .all(|(a, t)| !a.ty.intersect(*t).is_never())
-                })
-                .collect();
-            match partial.len() {
-                1 => partial[0],
-                0 => {
-                    let arg_tys: Vec<String> = args.iter().map(|a| a.ty.to_string()).collect();
-                    if candidates.len() == 1 {
-                        let f = &hir.funcs[candidates[0]];
-                        let (i, (a, t)) = args
-                            .iter()
-                            .zip(&f.param_tys)
-                            .enumerate()
-                            .find(|(_, (a, t))| a.ty.intersect(**t).is_never())
-                            .unwrap();
-                        return Err(err(
-                            a.span,
-                            format!(
-                                "argument {} of `{name}` must be {t}, but this is {}",
-                                i + 1,
-                                a.ty
-                            ),
-                        ));
-                    }
-                    return Err(err(
-                        span,
-                        format!(
-                            "no definition of `{name}` accepts arguments of type ({})",
-                            arg_tys.join(", ")
-                        ),
-                    ));
-                }
-                _ => {
-                    return Err(err(
-                        span,
-                        format!(
-                            "cannot choose a definition of `{name}` at compile time; runtime overload dispatch is not supported yet"
-                        ),
-                    ));
-                }
-            }
+            // One definition: call it directly. If it accepts only some of
+            // the values, the argument conversion below checks the value at
+            // run time and names the expected type if it does not fit.
+            1 => cases[0].0,
+            _ => return self.dispatch(name, args, cases, exhaustive, span),
         };
 
         // Narrow each argument to what the parameter accepts (a runtime
@@ -637,6 +796,49 @@ impl<'a> Checker<'a> {
         })
     }
 
+    /// A call decided at run time: test the arguments against the
+    /// definitions in `cases`, in order, and call the first that accepts
+    /// them.
+    fn dispatch(
+        &mut self,
+        name: &str,
+        args: Vec<TExpr>,
+        cases: Vec<(FuncId, Vec<Option<Ty>>, Vec<Ty>)>,
+        exhaustive: bool,
+        span: Span,
+    ) -> Result<TExpr, Diagnostic> {
+        let mut ty = Ty::NEVER;
+        let mut tcases = Vec::new();
+        // Each instance receives the arguments narrowed to what reaches it.
+        for (f, tests, params) in cases {
+            let inst = self.instantiate(f, params.clone());
+            ty = ty.union(self.instances[inst].ret);
+            tcases.push(DispatchCase {
+                tests,
+                params,
+                inst,
+            });
+        }
+        if ty.is_union() && ty.contains(Kind::Void) {
+            return Err(err(
+                span,
+                format!(
+                    "the definitions of `{name}` that this call may reach give {ty}, but void cannot be mixed with other types"
+                ),
+            ));
+        }
+        Ok(TExpr {
+            kind: TExprKind::Dispatch {
+                name: name.to_string(),
+                args,
+                cases: tcases,
+                exhaustive,
+            },
+            ty,
+            span,
+        })
+    }
+
     /// Keep only instances reachable from the entry and assign symbols.
     ///
     /// Early fixpoint rounds can create instances that the final types no
@@ -651,13 +853,9 @@ impl<'a> Checker<'a> {
         let mut i = 0;
         while i < order.len() {
             let mut callees = Vec::new();
-            for s in &self.instances[order[i]].body {
-                match s {
-                    TStmt::Let { value, .. } | TStmt::Expr(value) => {
-                        collect_calls(value, &mut callees)
-                    }
-                }
-            }
+            for_each_expr(&self.instances[order[i]].body, &mut |e| {
+                collect_calls(e, &mut callees)
+            });
             for c in callees {
                 if let std::collections::hash_map::Entry::Vacant(e) = index.entry(c) {
                     e.insert(order.len());
@@ -686,11 +884,7 @@ impl<'a> Checker<'a> {
                 format!("{}.{}", func.name, n)
             };
             let mut body = std::mem::take(&mut inst.body);
-            for s in &mut body {
-                match s {
-                    TStmt::Let { value, .. } | TStmt::Expr(value) => remap_calls(value, &index),
-                }
-            }
+            for_each_expr_mut(&mut body, &mut |e| remap_calls(e, &index));
             funcs.push(TFunc {
                 name: func.name.clone(),
                 symbol,
@@ -699,7 +893,6 @@ impl<'a> Checker<'a> {
                 discard: func.ret == Some(Ty::VOID),
                 body,
                 local_tys: std::mem::take(&mut inst.local_tys),
-                param_names: func.params.clone(),
                 local_names: func.local_names.clone(),
             });
         }
@@ -713,9 +906,10 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
         | TExprKind::Float(_)
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
-        | TExprKind::Param(_)
         | TExprKind::Local(_) => {}
-        TExprKind::Call { args, .. } | TExprKind::Diverge(args) => args.iter().for_each(f),
+        TExprKind::Call { args, .. }
+        | TExprKind::Dispatch { args, .. }
+        | TExprKind::Diverge(args) => args.iter().for_each(f),
         TExprKind::Binary { lhs, rhs, .. } => {
             f(lhs);
             f(rhs);
@@ -739,8 +933,10 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
 }
 
 fn collect_calls(e: &TExpr, out: &mut Vec<InstId>) {
-    if let TExprKind::Call { inst, .. } = &e.kind {
-        out.push(*inst);
+    match &e.kind {
+        TExprKind::Call { inst, .. } => out.push(*inst),
+        TExprKind::Dispatch { cases, .. } => out.extend(cases.iter().map(|c| c.inst)),
+        _ => {}
     }
     visit_children(e, &mut |c| collect_calls(c, out));
 }
@@ -749,6 +945,12 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
     match &mut e.kind {
         TExprKind::Call { inst, args } => {
             *inst = index[inst];
+            args.iter_mut().for_each(|a| remap_calls(a, index));
+        }
+        TExprKind::Dispatch { args, cases, .. } => {
+            for c in cases {
+                c.inst = index[&c.inst];
+            }
             args.iter_mut().for_each(|a| remap_calls(a, index));
         }
         TExprKind::Diverge(args) => args.iter_mut().for_each(|a| remap_calls(a, index)),

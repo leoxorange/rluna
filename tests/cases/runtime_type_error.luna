@@ -1,7 +1,7 @@
 # A union value that turns out to be a string where a number is required.
 pick x = check x:
-1 -> "one";
-else -> x
+    1 -> "one";
+    else -> x
 
 half n :: numeric -> numeric = n / 2
 

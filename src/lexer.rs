@@ -32,6 +32,8 @@ pub enum TokenKind {
     True,
     False,
     Echo,
+    Loop,
+    In,
     // punctuation
     Assign,     // =
     EqEq,       // ==
@@ -46,6 +48,8 @@ pub enum TokenKind {
     Slash,      // /
     LParen,     // (
     RParen,     // )
+    LBracket,   // [
+    RBracket,   // ]
     ColonColon, // ::
     Colon,      // :
     Arrow,      // ->
@@ -67,6 +71,8 @@ impl TokenKind {
             TokenKind::True => "`true`".into(),
             TokenKind::False => "`false`".into(),
             TokenKind::Echo => "`echo`".into(),
+            TokenKind::Loop => "`loop`".into(),
+            TokenKind::In => "`in`".into(),
             TokenKind::Assign => "`=`".into(),
             TokenKind::EqEq => "`==`".into(),
             TokenKind::NotEq => "`!=`".into(),
@@ -80,6 +86,8 @@ impl TokenKind {
             TokenKind::Slash => "`/`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
+            TokenKind::LBracket => "`[`".into(),
+            TokenKind::RBracket => "`]`".into(),
             TokenKind::ColonColon => "`::`".into(),
             TokenKind::Colon => "`:`".into(),
             TokenKind::Arrow => "`->`".into(),
@@ -101,6 +109,13 @@ pub struct Token {
     /// The lexer is the last stage that sees columns, so it records this
     /// fact for the parser.
     pub at_col0: bool,
+    /// The token is the first one on its line (even inside parentheses,
+    /// where line breaks produce no `Newline` token).
+    pub line_first: bool,
+    /// 0-based column where the token starts. Indentation matters for
+    /// `loop`: its body is the following lines indented further than the
+    /// `loop` keyword.
+    pub col: usize,
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
@@ -110,6 +125,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
         pos: 0,
         paren_depth: 0,
         line_start: true,
+        line_begin: 0,
         out: Vec::new(),
     }
     .run()
@@ -131,6 +147,8 @@ struct Lexer<'a> {
     paren_depth: usize,
     /// No token has been produced on the current line yet.
     line_start: bool,
+    /// Byte offset where the current line begins.
+    line_begin: usize,
     out: Vec<Token>,
 }
 
@@ -147,12 +165,16 @@ impl<'a> Lexer<'a> {
     }
 
     fn push(&mut self, kind: TokenKind, start: usize) {
-        let at_col0 = self.line_start && (start == 0 || self.src[start - 1] == b'\n');
+        let line_first = self.line_start;
+        let at_col0 = line_first && (start == 0 || self.src[start - 1] == b'\n');
         self.line_start = false;
+        let col = self.text[self.line_begin..start].chars().count();
         self.out.push(Token {
             kind,
             span: Span::new(start, self.pos),
             at_col0,
+            line_first,
+            col,
         });
     }
 
@@ -185,9 +207,12 @@ impl<'a> Lexer<'a> {
                             kind: TokenKind::Newline,
                             span: Span::new(start, start + 1),
                             at_col0: false,
+                            line_first: false,
+                            col: start - self.line_begin,
                         });
                     }
                     self.line_start = true;
+                    self.line_begin = self.pos;
                 }
                 b'0'..=b'9' => self.number()?,
                 b'"' => self.string()?,
@@ -205,6 +230,8 @@ impl<'a> Lexer<'a> {
                         "true" => TokenKind::True,
                         "false" => TokenKind::False,
                         "echo" => TokenKind::Echo,
+                        "loop" => TokenKind::Loop,
+                        "in" => TokenKind::In,
                         _ => TokenKind::Ident(word.to_string()),
                     };
                     self.push(kind, start);
@@ -229,6 +256,8 @@ impl<'a> Lexer<'a> {
                         (b'/', _) => (TokenKind::Slash, 1),
                         (b'(', _) => (TokenKind::LParen, 1),
                         (b')', _) => (TokenKind::RParen, 1),
+                        (b'[', _) => (TokenKind::LBracket, 1),
+                        (b']', _) => (TokenKind::RBracket, 1),
                         (b':', _) => (TokenKind::Colon, 1),
                         (b',', _) => (TokenKind::Comma, 1),
                         (b';', _) => (TokenKind::Semi, 1),
@@ -241,9 +270,13 @@ impl<'a> Lexer<'a> {
                             ));
                         }
                     };
+                    // Inside brackets, as inside parentheses, a line break
+                    // does not end the statement.
                     match kind {
-                        TokenKind::LParen => self.paren_depth += 1,
-                        TokenKind::RParen => self.paren_depth = self.paren_depth.saturating_sub(1),
+                        TokenKind::LParen | TokenKind::LBracket => self.paren_depth += 1,
+                        TokenKind::RParen | TokenKind::RBracket => {
+                            self.paren_depth = self.paren_depth.saturating_sub(1)
+                        }
                         _ => {}
                     }
                     self.pos += len;
@@ -266,12 +299,17 @@ impl<'a> Lexer<'a> {
                 kind: TokenKind::Newline,
                 span: Span::new(self.pos, self.pos),
                 at_col0: false,
+                line_first: false,
+                col: 0,
             });
         }
+        // Column 0: `Eof` ends every indented block.
         self.out.push(Token {
             kind: TokenKind::Eof,
             span: Span::new(self.pos, self.pos),
             at_col0: false,
+            line_first: true,
+            col: 0,
         });
         Ok(self.out)
     }

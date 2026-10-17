@@ -54,6 +54,8 @@ data @rt.s_float = { i64 5, bytes "float" }
 data @rt.s_string = { i64 6, bytes "string" }
 data @rt.s_boolean = { i64 7, bytes "boolean" }
 data @rt.s_unknown = { i64 7, bytes "unknown" }
+data @rt.s_no_match = { i64 29, bytes "TypeError: no definition of `" }
+data @rt.s_no_match_end = { i64 25, bytes "` accepts these arguments" }
 
 ; ---------------------------------------------------------------------------
 ; Process exit
@@ -833,6 +835,23 @@ entry:
   %s2 = addr @rt.s_type_found
   call void @rt.err_str(%s2)
   call void @rt.err_tag(%tag)
+  %nl = addr @rt.s_newline
+  call void @rt.err_str(%nl)
+  %one = iconst 1
+  call void @rt.sys_exit(%one)
+  unreachable
+}
+
+; "TypeError: no definition of `<name>` accepts these arguments": a call
+; decided at run time found no definition for the values it was given.
+func @rt.no_match(%name: i64) {
+entry:
+  call void @rt.flush()
+  %s1 = addr @rt.s_no_match
+  call void @rt.err_str(%s1)
+  call void @rt.err_str(%name)
+  %s2 = addr @rt.s_no_match_end
+  call void @rt.err_str(%s2)
   %nl = addr @rt.s_newline
   call void @rt.err_str(%nl)
   %one = iconst 1

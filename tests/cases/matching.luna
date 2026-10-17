@@ -1,0 +1,35 @@
+# Definitions are tried from top to bottom; the first that accepts the
+# arguments is called. Values of mixed types are matched at run time.
+
+head a :: numeric -> void = echo "winning"
+head _ = echo "nothing left"
+
+kind a :: int -> string = "int"
+kind a :: string -> string = "string"
+kind a :: float -> string = "float"
+
+# the general definition comes first, so it wins even for an int
+first x = "general"
+first x :: int -> string = "int"
+
+pick n = check n:
+    1 -> "one";
+    2 -> 2.5;
+    else -> n
+
+main =
+    # decided at compile time
+    head 1
+    head "x"
+    echo (kind 3)
+    echo (first 3)
+    # decided at run time: pick returns int|float|string
+    head (pick 1)
+    head (pick 2)
+    head (pick 3)
+    echo (kind (pick 1))
+    echo (kind (pick 2))
+    echo (kind (pick 3))
+    # inside a loop, with a different value each time
+    loop i in [1, 4]:
+        echo (kind (pick i))

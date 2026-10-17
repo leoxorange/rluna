@@ -2,7 +2,7 @@
 //!
 //! Luna follows Rust's ownership model without references:
 //!
-//! - A local variable or parameter *owns* its value.
+//! - A variable (a parameter or a local) *owns* its value.
 //! - Giving the value somewhere else **moves** it, and the old name becomes
 //!   invalid. A value is given away by binding it (`y = x`), passing it as
 //!   an argument (`f x`), returning it (the function's last expression), or
@@ -26,23 +26,28 @@
 //! `pick a = b = a`, `pick 1` copies an int but `pick "s"` moves a string.
 //! So the check runs on each instance in the TIR.
 //!
+//! - Giving a variable a new value (`x = ...`) makes it usable again after
+//!   a move. If it still owned a value, that old value is freed (see `lower`).
+//!
 //! The check follows the order in which the program runs, tracking which
-//! names have been moved so far. `check` is the only branching construct:
-//! each arm starts from the state before it, and afterwards a name counts as
-//! moved if *any* arm moved it, because the compiler cannot know which arm
-//! will run.
+//! names have been moved so far. In a `check`, each arm starts from the
+//! state before it, and afterwards a name counts as moved if *any* arm moved
+//! it, because the compiler cannot know which arm will run.
+//!
+//! A `loop` body must leave every outside variable as it found it. If the
+//! body moved `s` and did not give it a new value, the next iteration would
+//! use a moved value; if `s` was moved before the loop and the body gives it
+//! one, whether `s` holds a value after the loop would depend on how many
+//! times the loop ran. Both are errors, so the state after a loop is always
+//! the state before it, however often the body runs (even zero times).
 
 use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, ErrorKind, Span};
 use crate::typeck::{TExpr, TExprKind, TFunc, TStmt, Tir};
 
-/// Something that can own a value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Owner {
-    Param(usize),
-    Local(usize),
-}
+/// Something that can own a value: a variable, by id.
+type Owner = usize;
 
 pub fn check(tir: &Tir) -> Result<(), Vec<Diagnostic>> {
     let mut errors: Vec<Diagnostic> = Vec::new();
@@ -88,32 +93,90 @@ struct Checker<'a> {
 
 impl Checker<'_> {
     fn name(&self, owner: Owner) -> &str {
-        match owner {
-            Owner::Param(i) => &self.f.param_names[i],
-            Owner::Local(l) => &self.f.local_names[l],
-        }
+        &self.f.local_names[owner]
     }
 
     fn function(&mut self) {
-        // Every statement's value goes somewhere: into a binding, out of the
+        self.stmts(&self.f.body);
+    }
+
+    fn stmts(&mut self, stmts: &[TStmt]) {
+        // Every statement's value goes somewhere: into a variable, out of the
         // function (the last one), or it is discarded (consumed). All of
         // these move.
-        for stmt in &self.f.body {
+        for stmt in stmts {
             match stmt {
-                TStmt::Let { value, .. } => self.expr(value, Use::Move),
+                TStmt::Let { local, value } => {
+                    self.expr(value, Use::Move);
+                    // The variable holds a value again.
+                    self.moved.remove(local);
+                }
                 TStmt::Expr(e) => self.expr(e, Use::Move),
+                TStmt::Loop {
+                    start,
+                    end,
+                    body,
+                    inner,
+                    ..
+                } => {
+                    self.expr(start, Use::Borrow);
+                    self.expr(end, Use::Borrow);
+                    let range = start.span.to(end.span);
+                    let before = self.moved.clone();
+                    // The body's own variables start fresh every iteration.
+                    for l in inner {
+                        self.moved.remove(l);
+                    }
+                    self.stmts(body);
+                    let outside = |owner: &Owner| !inner.contains(owner);
+                    let mut moved: Vec<(Owner, Span)> = self.moved.clone().into_iter().collect();
+                    moved.sort_by_key(|(o, _)| *o);
+                    for (owner, span) in moved {
+                        if outside(&owner) && !before.contains_key(&owner) {
+                            let name = self.name(owner).to_string();
+                            self.errors.push(Diagnostic::error(
+                                ErrorKind::OwnershipError,
+                                span,
+                                format!(
+                                    "`{name}` is moved in this loop, so the next iteration would find it without a value; give `{name}` a new value before the end of the loop body"
+                                ),
+                            ));
+                        }
+                    }
+                    let mut revived: Vec<(Owner, Span)> = before
+                        .iter()
+                        .filter(|(o, _)| outside(o) && !self.moved.contains_key(o))
+                        .map(|(o, s)| (*o, *s))
+                        .collect();
+                    revived.sort_by_key(|(o, _)| *o);
+                    for (owner, moved_at) in revived {
+                        let name = self.name(owner).to_string();
+                        self.errors.push(
+                            Diagnostic::error(
+                                ErrorKind::OwnershipError,
+                                range,
+                                format!(
+                                    "`{name}` gets a value in this loop, but it was moved before the loop, so after the loop it would hold a value only if the loop ran"
+                                ),
+                            )
+                            .with_note(moved_at, format!("the value of `{name}` was moved here")),
+                        );
+                    }
+                    self.moved = before;
+                }
             }
         }
     }
 
     fn expr(&mut self, e: &TExpr, usage: Use) {
         match &e.kind {
-            TExprKind::Param(i) => self.owner(Owner::Param(*i), e, usage),
-            TExprKind::Local(l) => self.owner(Owner::Local(*l), e, usage),
+            TExprKind::Local(l) => self.owner(*l, e, usage),
             TExprKind::Int(_) | TExprKind::Float(_) | TExprKind::Str(_) | TExprKind::Bool(_) => {}
             // Arguments move into the callee, left to right: in `f x x` the
             // second `x` is already gone.
-            TExprKind::Call { args, .. } | TExprKind::Diverge(args) => {
+            TExprKind::Call { args, .. }
+            | TExprKind::Dispatch { args, .. }
+            | TExprKind::Diverge(args) => {
                 for a in args {
                     self.expr(a, Use::Move);
                 }
