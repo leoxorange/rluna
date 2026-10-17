@@ -1,0 +1,17 @@
+b = 10
+sum a b = a + b
+uses_global a = a + b
+
+area w h =
+    double = w * h
+    double / 2
+
+main =
+    x = 5
+    echo sum x 1
+    x = x * 2
+    echo x
+    echo uses_global 1
+    echo area 3 4
+    greeting = "hi"
+    echo greeting + ", " + "there"

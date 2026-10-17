@@ -1,0 +1,14 @@
+[package]
+name = "rluna"
+version = "0.1.0"
+edition = "2024"
+description = "Compiler for the Luna programming language"
+
+[[bin]]
+name = "lunac"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+debug = false

@@ -1,0 +1,2 @@
+# The smallest Luna program.
+main = echo "hello, luna"
