@@ -18,17 +18,17 @@ discard _ :: any -> void = 5
 flag :: boolean = 5 > 6
 
 main =
-    echo 5 > 6
-    echo 5 == 5
-    echo 4 < 10
+    echo (5 > 6)
+    echo (5 == 5)
+    echo (4 < 10)
     echo flag
-    echo 10 + 8 * 7
+    echo (10 + 8 * 7)
     echo foo
     test 5
     summon 1
     summon 2
-    echo typed_sum 1 2
-    echo typed_sum 1.5 2
-    echo discard "x"
-    echo 7 / 2
-    echo "con" + "cat"
+    echo (typed_sum 1 2)
+    echo (typed_sum 1.5 2)
+    echo (discard "x")
+    echo (7 / 2)
+    echo ("con" + "cat")

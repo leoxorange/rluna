@@ -1,4 +1,16 @@
 //! Abstract syntax tree produced by the parser.
+//!
+//! "Abstract" means the tree keeps the *structure* of the program and drops
+//! the syntax that only served to show it: there are no parenthesis,
+//! newline or `;` nodes, because the nesting of the tree already says what
+//! they said. `(1 + 2) * 3` and `(1+2)*3` produce the same tree.
+//!
+//! The AST is still close to what the user wrote: names are plain strings,
+//! nothing has a type yet, and a `Name` might be a local, a parameter or a
+//! function. Later stages turn it into more precise trees (HIR, then TIR),
+//! each adding what its stage worked out. Keeping one tree type per stage,
+//! instead of filling in optional fields of a single tree, lets the Rust type
+//! system guarantee that, say, the code generator never sees an unresolved name.
 
 use std::fmt::Write;
 
@@ -128,6 +140,8 @@ impl BinOp {
     }
 }
 
+/// Every expression carries its span so that any later error about it
+/// ("cannot add string and int") can underline exactly this expression.
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
@@ -154,6 +168,9 @@ pub enum ExprKind {
         rhs: Box<Expr>,
     },
     Neg(Box<Expr>),
+    /// `echo` is built into the language, not a library function, because
+    /// it accepts a value of *any* type and prints each type differently.
+    /// The compiler picks the right printing routine from the argument's type.
     Echo(Box<Expr>),
     Check {
         scrutinee: Box<Expr>,
@@ -171,6 +188,10 @@ pub struct Arm {
 // ---------------------------------------------------------------------------
 // Pretty printing (`--emit=ast`)
 // ---------------------------------------------------------------------------
+//
+// The tree is printed as Lisp-style S-expressions, `(+ 1 (* 2 3))`, which
+// show the nesting unambiguously. That makes it easy to check how
+// precedence was resolved, and the parser tests use it for exactly that.
 
 pub fn dump(program: &Program) -> String {
     let mut out = String::new();

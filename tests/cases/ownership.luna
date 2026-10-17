@@ -1,0 +1,29 @@
+# Ownership: values that are moved and borrowed correctly.
+
+id a = a
+show s = echo s
+twice x = x + x
+label n = check n:
+1 -> "one";
+else -> "many"
+
+main =
+    # ints, floats and booleans are copied, so `n` stays usable
+    n = 5
+    m = n
+    echo (n + m)
+    echo (twice n)
+    echo n
+    # operators, echo and check only borrow
+    s = "hi"
+    echo (s + s)
+    echo (s == "hi")
+    # binding moves: `s` is gone, `t` owns the string now
+    t = s
+    # an argument moves into the call, and the result moves back out
+    u = id t
+    show u
+    # shadowing: the new `v` takes the old one's value
+    v = label 1
+    v = v + "!"
+    echo v

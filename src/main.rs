@@ -5,17 +5,22 @@ use std::process::ExitCode;
 
 use rluna::diag::SourceFile;
 use rluna::driver::{self, Input};
+use rluna::target::Target;
 
 const USAGE: &str = "\
 Usage: lunac <file.luna | file.lir> [options]
 
 Options:
-  -o <path>         Write the executable to <path> (default: <input>.exe)
+  -o <path>         Write the executable to <path> (default: the input
+                    file name, with `.exe` for Windows)
+  --target=<name>   Compile for another system (default: this one):
+                      macos-arm64   Apple silicon Mac (Mach-O)
+                      windows-x64   64-bit Windows (PE .exe)
   --emit=<kinds>    Also write intermediate files next to the output,
                     comma-separated:
                       ast   parsed syntax tree      (<name>.ast)
                       ir    Luna IR (LIR)           (<name>.lir)
-                      asm   x86-64 listing          (<name>.asm)
+                      asm   machine code listing    (<name>.asm)
   -r, --run         Run the program after compiling it
   -h, --help        Show this help
   -V, --version     Show the compiler version
@@ -24,6 +29,7 @@ Options:
 struct Options {
     input: PathBuf,
     output: Option<PathBuf>,
+    target: Target,
     emit_ast: bool,
     emit_ir: bool,
     emit_asm: bool,
@@ -36,6 +42,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut opts = Options {
         input: PathBuf::new(),
         output: None,
+        target: Target::default(),
         emit_ast: false,
         emit_ir: false,
         emit_asm: false,
@@ -53,6 +60,11 @@ fn parse_args() -> Result<Option<Options>, String> {
             }
             "-o" => opts.output = Some(args.next().ok_or("`-o` needs a path")?.into()),
             "-r" | "--run" => opts.run = true,
+            _ if arg.starts_with("--target=") => {
+                let name = &arg["--target=".len()..];
+                opts.target =
+                    Target::from_name(name).ok_or_else(|| format!("unknown target `{name}`"))?;
+            }
             _ if arg.starts_with("--emit=") => {
                 for kind in arg["--emit=".len()..].split(',') {
                     match kind {
@@ -80,6 +92,11 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    driver::write_executable(path, bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
 fn run() -> Result<ExitCode, String> {
     let Some(opts) = parse_args().map_err(|e| format!("{e}\n\n{USAGE}"))? else {
         return Ok(ExitCode::SUCCESS);
@@ -89,7 +106,17 @@ fn run() -> Result<ExitCode, String> {
     let output = opts
         .output
         .clone()
-        .unwrap_or_else(|| opts.input.with_extension("exe"));
+        .unwrap_or_else(|| opts.input.with_extension(opts.target.exe_extension()));
+    if output == opts.input {
+        return Err(format!(
+            "the executable would overwrite {}; choose another name with -o",
+            opts.input.display()
+        ));
+    }
+    let name = output
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "luna".into());
     let is_lir = opts.input.extension().is_some_and(|e| e == "lir");
 
     let source = SourceFile::new(opts.input.display().to_string(), text);
@@ -98,7 +125,12 @@ fn run() -> Result<ExitCode, String> {
     } else {
         Input::Luna(&source)
     };
-    let artifacts = match driver::compile(input, opts.emit_asm) {
+    let compile_opts = driver::Options {
+        target: opts.target,
+        want_asm: opts.emit_asm,
+        name: &name,
+    };
+    let artifacts = match driver::compile(input, &compile_opts) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{}", e.message.trim_end());
@@ -125,9 +157,15 @@ fn run() -> Result<ExitCode, String> {
     {
         write(&output.with_extension("asm"), asm.as_bytes())?;
     }
-    write(&output, artifacts.exe.as_deref().unwrap_or_default())?;
+    write_executable(&output, artifacts.exe.as_deref().unwrap_or_default())?;
 
     if opts.run {
+        if Target::host() != Some(opts.target) {
+            return Err(format!(
+                "cannot run a {} program on this system",
+                opts.target
+            ));
+        }
         let path = std::path::absolute(&output).map_err(|e| e.to_string())?;
         let status = std::process::Command::new(&path)
             .status()

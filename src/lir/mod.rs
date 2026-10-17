@@ -4,7 +4,31 @@
 //! just `i64` and `f64` (pointers and booleans are `i64`). Control flow uses
 //! basic blocks with *block parameters* instead of phi nodes. It has a
 //! textual form (`.lir` files) that can be printed and parsed back, so the
-//! runtime library is itself written in LIR (`runtime.lir`).
+//! runtime library is itself written in LIR (`runtime/*.lir`).
+//!
+//! Why an IR between the language and the machine? Without one, every
+//! language feature would need code for every CPU. With one, the frontend
+//! (lexer → lower) only has to produce LIR, and each backend (x86-64,
+//! AArch64) only has to understand LIR's ~30 instructions. Adding a CPU
+//! doesn't touch the frontend, and changing the language doesn't touch the
+//! backends. Optimizations written on LIR help every target at once.
+//!
+//! **SSA** (static single assignment): every value (`%5`) is assigned
+//! exactly once and never changes. That makes analysis easy: wherever `%5`
+//! appears, it is the same value, defined in exactly one place. For example,
+//! "is this value used anywhere?" (dead code elimination, `opt.rs`) is a
+//! simple scan.
+//!
+//! **Basic blocks**: straight-line instruction sequences that end in exactly
+//! one *terminator* (jump, branch, return). Control can only enter a block
+//! at its top and leave at its bottom, so within a block, instructions run
+//! in order, always. Loops and `check` arms are built from blocks and jumps.
+//!
+//! **Block parameters**: a value that differs depending on how control
+//! arrived (a loop counter, or the result of a `check`) is a parameter of
+//! the block, and each jump passes an argument for it, like calling a
+//! function. This is how SSA handles "variables that change"; LLVM does the
+//! same with *phi nodes*, which are equivalent but harder to read.
 
 pub mod opt;
 pub mod parse;
@@ -13,6 +37,10 @@ pub mod verify;
 
 use std::fmt;
 
+/// The only two machine types. CPUs have two register files, integer and
+/// floating point, with different instructions and calling-convention
+/// rules, so the backends must know which file a value lives in.
+/// Everything else (booleans, pointers, tags) is an integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     I64,
@@ -28,12 +56,20 @@ impl fmt::Display for Type {
     }
 }
 
+/// An SSA value, `%n` in the text form. Values are numbered per function
+/// and index into `Function::values`, where their type is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Value(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
+/// Integer operations. Division, remainder and comparisons come in signed
+/// and unsigned versions because the same 64 bits mean different numbers:
+/// 0xFFFF...FF is -1 signed but 2^64-1 unsigned. The machine has separate
+/// instructions for each, so the IR must say which one is meant. `shr` is
+/// a logical shift (fills with 0) and `sar` an arithmetic one (copies the
+/// sign bit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IBinOp {
     Add,
@@ -101,6 +137,10 @@ impl MemTy {
     }
 }
 
+/// An instruction. Each does one small thing a CPU can do in one or a few
+/// machine instructions, and operands are always values, never nested
+/// expressions. That is the gap lowering closes: `a + b * c` is a tree,
+/// but `Op::IBin(Add, a, t)` only accepts the already-computed `t`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     Iconst(i64),
@@ -118,6 +158,9 @@ pub enum Op {
     Load(MemTy, Value, i32),
     Store(MemTy, Value, i32, Value),
     /// Address of a fixed-size, 8-byte aligned region in the stack frame.
+    /// Stack memory is free to allocate and is released automatically when
+    /// the function returns: ideal for small scratch buffers such as the
+    /// digits of a number being printed.
     Alloca(u32),
     /// Address of a data symbol or function.
     Addr(String),
@@ -130,6 +173,14 @@ pub struct Inst {
     pub op: Op,
 }
 
+/// How a block ends. Keeping control flow out of the instruction list (and
+/// allowing exactly one terminator per block) is what makes blocks
+/// "straight-line": no jump can leave from the middle of one.
+///
+/// `Unreachable` marks a point that execution can never reach, such as
+/// after a call to `rt.exit`. It produces a trap instruction, so if the
+/// assumption is ever wrong, the program stops instead of running on into
+/// whatever bytes follow.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terminator {
     Jmp(BlockId, Vec<Value>),
@@ -170,8 +221,9 @@ impl Function {
     }
 }
 
-/// An imported function. `name` has the form `dll.Function`, for example
-/// `kernel32.WriteFile` imports `WriteFile` from `kernel32.dll`.
+/// An imported function. `name` has the form `library.Function`, for example
+/// `kernel32.WriteFile` imports `WriteFile` from `kernel32.dll` and
+/// `libSystem.write` imports `write` from `libSystem.dylib`.
 #[derive(Debug, Clone)]
 pub struct Extern {
     pub name: String,
@@ -180,12 +232,12 @@ pub struct Extern {
 }
 
 impl Extern {
-    pub fn dll(&self) -> String {
-        let (dll, _) = self
-            .name
+    /// The library name without its file extension.
+    pub fn library(&self) -> &str {
+        self.name
             .rsplit_once('.')
-            .unwrap_or(("kernel32", &self.name));
-        format!("{dll}.dll")
+            .map(|(lib, _)| lib)
+            .unwrap_or("kernel32")
     }
 
     pub fn import_name(&self) -> &str {
@@ -203,7 +255,10 @@ pub enum DataItem {
     Zero(usize),
 }
 
-/// A writable, 8-byte aligned data object.
+/// A writable, 8-byte aligned data object: global memory that exists for
+/// the whole run, laid out by the compiler and loaded with the program.
+/// String literals and the runtime's globals (heap pointer, output buffer)
+/// live here.
 #[derive(Debug, Clone)]
 pub struct Data {
     pub name: String,
@@ -255,6 +310,12 @@ impl Module {
 // ---------------------------------------------------------------------------
 
 /// Incrementally builds a `Function`.
+///
+/// Lowering works like a cursor: "switch to block X, append instructions".
+/// The builder tracks the current block, hands out fresh value numbers, and
+/// asserts the structural rules (nothing after a terminator, no block
+/// terminated twice), so a lowering bug fails loudly here instead of
+/// producing wrong machine code later.
 pub struct FunctionBuilder {
     pub func: Function,
     current: BlockId,

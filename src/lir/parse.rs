@@ -13,6 +13,19 @@
 //! term     := "jmp" target | "br" %c "," target "," target | "ret" [%v] | "unreachable"
 //! target   := label ["(" %v, ... ")"]
 //! ```
+//!
+//! Why can LIR be read back in? Three reasons:
+//!
+//! 1. The runtime library (`runtime/*.lir`) is written by hand in LIR. Low-level
+//!    code such as a memory allocator or a float printer needs pointers and
+//!    raw memory, which Luna does not have.
+//! 2. `--emit=ir` output can be edited and recompiled, which is handy for
+//!    experimenting with the backends without touching the frontend.
+//! 3. The tests print every program's IR, parse it back and run it again, so
+//!    the printer and parser are checked against each other on real code.
+//!
+//! This is a second, much simpler instance of the lexer + recursive descent
+//! parser design used for Luna itself.
 
 use std::collections::HashMap;
 
@@ -178,6 +191,14 @@ struct Parser {
     pos: usize,
 }
 
+/// Per-function parsing state.
+///
+/// Text names (`%sum`, `loop`) are mapped to numbers as they are seen. A
+/// name can be *used* before it is *defined*: a jump to a block further
+/// down, or a value defined in a block that appears later in the text.
+/// `value`/`block` therefore create an entry on first sight, and `defined`
+/// remembers which ones have really been defined, so that duplicate
+/// definitions are rejected.
 struct FnState {
     values: Vec<ValueInfo>,
     names: HashMap<String, Value>,

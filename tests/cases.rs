@@ -1,15 +1,19 @@
-//! End-to-end tests: compile every `tests/cases/*.luna`, run the executable
-//! and compare its stdout with `<name>.out` (and stderr with `<name>.err`,
-//! in which case the program must exit with code 1).
+//! End-to-end tests: compile every `tests/cases/*.luna` for the host, run
+//! the executable and compare its stdout with `<name>.out` (and stderr with
+//! `<name>.err`, in which case the program must exit with code 1).
 //!
 //! Each program is also compiled a second time from its own emitted `.lir`,
 //! which checks that the IR printer and parser round-trip.
+//!
+//! A case can also be a hand-written `tests/cases/*.lir` program, for
+//! testing the runtime directly; it is compiled once, as written.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use rluna::diag::SourceFile;
-use rluna::driver::{self, Input};
+use rluna::driver::{self, Input, Options};
+use rluna::target::Target;
 
 fn out_dir() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cases");
@@ -18,7 +22,7 @@ fn out_dir() -> PathBuf {
 }
 
 fn run_exe(exe: &[u8], path: &Path) -> (String, String, i32) {
-    std::fs::write(path, exe).unwrap();
+    driver::write_executable(path, exe).unwrap();
     let out = Command::new(path).output().unwrap();
     (
         String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
@@ -29,6 +33,7 @@ fn run_exe(exe: &[u8], path: &Path) -> (String, String, i32) {
 
 fn check_case(luna: &Path) -> Result<(), String> {
     let name = luna.file_stem().unwrap().to_string_lossy().to_string();
+    let is_lir = luna.extension().is_some_and(|e| e == "lir");
     let read = |ext: &str| {
         std::fs::read_to_string(luna.with_extension(ext))
             .ok()
@@ -41,7 +46,17 @@ fn check_case(luna: &Path) -> Result<(), String> {
         luna.display().to_string(),
         std::fs::read_to_string(luna).unwrap(),
     );
-    let artifacts = driver::compile(Input::Luna(&src), true)
+    let opts = Options {
+        want_asm: true,
+        name: &name,
+        ..Options::default()
+    };
+    let input = if is_lir {
+        Input::Lir(&src.text)
+    } else {
+        Input::Luna(&src)
+    };
+    let artifacts = driver::compile(input, &opts)
         .map_err(|e| format!("{name}: compile error:\n{}", e.message))?;
 
     let check = |label: &str, (out, err, code): (String, String, i32)| -> Result<(), String> {
@@ -62,22 +77,23 @@ fn check_case(luna: &Path) -> Result<(), String> {
     };
 
     let dir = out_dir();
+    let exe_path = |stem: String| dir.join(stem).with_extension(opts.target.exe_extension());
     check(
         "luna",
-        run_exe(
-            artifacts.exe.as_ref().unwrap(),
-            &dir.join(format!("{name}.exe")),
-        ),
+        run_exe(artifacts.exe.as_ref().unwrap(), &exe_path(name.clone())),
     )?;
+    if is_lir {
+        return Ok(());
+    }
 
     let ir = artifacts.ir.unwrap();
-    let again = driver::compile(Input::Lir(&ir), false)
+    let again = driver::compile(Input::Lir(&ir), &Options::default())
         .map_err(|e| format!("{name}: emitted IR does not compile:\n{}", e.message))?;
     check(
         "lir",
         run_exe(
             again.exe.as_ref().unwrap(),
-            &dir.join(format!("{name}.lir.exe")),
+            &exe_path(format!("{name}-lir")),
         ),
     )?;
     Ok(())
@@ -85,11 +101,15 @@ fn check_case(luna: &Path) -> Result<(), String> {
 
 #[test]
 fn cases() {
+    if Target::host().is_none() {
+        eprintln!("skipped: no target runs on this system");
+        return;
+    }
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|e| e == "luna"))
+        .filter(|p| p.extension().is_some_and(|e| e == "luna" || e == "lir"))
         .collect();
     files.sort();
     assert!(!files.is_empty());
@@ -115,8 +135,33 @@ fn compile_errors() {
         ("foo = 1", "no `main` function"),
         ("main = check 3:\n1 -> echo \"a\"", "needs an `else` branch"),
         (
-            "main = echo \"a\" - 1",
+            "main = echo (\"a\" - 1)",
             "operator `-` cannot be applied to string and int",
+        ),
+        ("f a = a\nmain = echo f 1", "`echo` takes one argument"),
+        (
+            "f n = check n:\n1 -> echo \"a\";\nelse -> 5\nmain = echo (f 1)",
+            "void cannot be mixed with other types",
+        ),
+        (
+            "nothing _ :: any -> void = 5\nmain = echo ((nothing 1) == (nothing 2))",
+            "operator `==` cannot be applied to void and void",
+        ),
+        (
+            "main =\n    x = \"s\"\n    y = x\n    echo x",
+            "`x` is used after its value was moved",
+        ),
+        (
+            "show s = echo s\nmain =\n    x = \"s\"\n    show x\n    show x",
+            "the value of `x` (string) was moved here",
+        ),
+        (
+            "both a b = a + b\ndup s = both s s\nmain = echo (dup \"x\")",
+            "`s` is used after its value was moved",
+        ),
+        (
+            "main =\n    s = \"s\"\n    t = check 1:\n        1 -> s;\n        else -> \"o\"\n    echo s",
+            "`s` is used after its value was moved",
         ),
         ("f a = a\nmain = f 1 2", "called with 2 argument(s)"),
         ("main = echo (1 + 2", "SyntaxError"),
@@ -131,7 +176,7 @@ fn compile_errors() {
     ];
     for (src, expected) in cases {
         let file = SourceFile::new("test.luna", src);
-        match driver::compile(Input::Luna(&file), false) {
+        match driver::compile(Input::Luna(&file), &Options::default()) {
             Ok(_) => panic!("expected an error for:\n{src}"),
             Err(e) => assert!(
                 e.message.contains(expected),
@@ -140,4 +185,143 @@ fn compile_errors() {
             ),
         }
     }
+}
+
+/// Every target compiles on every host, even where its programs cannot run.
+#[test]
+fn all_targets_link() {
+    let src = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases/readme.luna"),
+    )
+    .unwrap();
+    let file = SourceFile::new("readme.luna", src);
+    for target in Target::ALL {
+        let opts = Options {
+            target,
+            want_asm: true,
+            ..Options::default()
+        };
+        let artifacts = driver::compile(Input::Luna(&file), &opts)
+            .unwrap_or_else(|e| panic!("{target}: {}", e.message));
+        let exe = artifacts.exe.unwrap();
+        let magic: &[u8] = match target {
+            Target::WindowsX64 => b"MZ",
+            Target::MacosArm64 => &[0xCF, 0xFA, 0xED, 0xFE],
+        };
+        assert!(exe.starts_with(magic), "{target}: wrong file format");
+        assert!(artifacts.asm.unwrap().contains("rt.start:"), "{target}");
+    }
+}
+
+/// Runtime functions a program never reaches are left out of the executable.
+#[test]
+fn unused_runtime_is_removed() {
+    let file = SourceFile::new("hello.luna", "main = echo \"hi\"");
+    let opts = Options {
+        want_asm: true,
+        ..Options::default()
+    };
+    let asm = driver::compile(Input::Luna(&file), &opts)
+        .unwrap_or_else(|e| panic!("{}", e.message))
+        .asm
+        .unwrap();
+    assert!(asm.contains("rt.print_str:"), "{asm}");
+    assert!(!asm.contains("rt.print_float:"), "{asm}");
+    assert!(!asm.contains("rt.alloc:"), "{asm}");
+}
+
+/// Every value is freed exactly once: run each case with its `main` wrapped
+/// in a function that prints the runtime's count of live heap objects when
+/// the program is done. A leak leaves it above 0, a double free below.
+#[test]
+fn no_leaks() {
+    if Target::host().is_none() {
+        return;
+    }
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "luna"))
+        // A program stopped by a runtime error never reaches the count.
+        .filter(|p| !p.with_extension("err").exists())
+        .collect();
+    files.sort();
+    let mut failures = Vec::new();
+    for luna in &files {
+        let name = luna.file_stem().unwrap().to_string_lossy().to_string();
+        let src = SourceFile::new(name.clone(), std::fs::read_to_string(luna).unwrap());
+        let mut artifacts = driver::Artifacts::default();
+        let mut module = driver::frontend(&src, &mut artifacts)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.message));
+        for f in &mut module.funcs {
+            if f.name == "luna.main" {
+                f.name = "leak.program".into();
+            }
+        }
+        module.extend(
+            rluna::lir::parse::parse_module(
+                "func @luna.main() {
+entry:
+  call void @leak.program()
+  %slot = addr @rt.live
+  %live = load i64 %slot, 0
+  call void @rt.print_int(%live)
+  call void @rt.print_newline()
+  ret
+}",
+            )
+            .unwrap(),
+        );
+        module.extend(driver::runtime_module(Target::default()));
+        driver::backend(module, &Options::default(), &mut artifacts)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.message));
+        let (out, err, code) = run_exe(
+            artifacts.exe.as_ref().unwrap(),
+            &out_dir()
+                .join(format!("{name}-leaks"))
+                .with_extension(Target::default().exe_extension()),
+        );
+        let live = out.lines().last().unwrap_or_default();
+        if code != 0 || live != "0" {
+            failures.push(format!(
+                "{name}: {live} live object(s) at exit (exit {code}) {err}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Constant globals are computed by the compiler: their functions are gone
+/// from the executable. A global with a side effect stays a function.
+#[test]
+fn constant_globals_are_folded() {
+    let src = "count n = check n:\n0 -> 0;\nelse -> 1 + count (n - 1)
+foo = \"he\" + \"llo\"
+counted = count 50
+banner = echo \"hi\"
+main =
+    banner
+    echo foo
+    echo counted";
+    let file = SourceFile::new("globals.luna", src);
+    let opts = Options {
+        want_asm: true,
+        ..Options::default()
+    };
+    let asm = driver::compile(Input::Luna(&file), &opts)
+        .unwrap_or_else(|e| panic!("{}", e.message))
+        .asm
+        .unwrap();
+    let functions: Vec<&str> = asm
+        .lines()
+        .filter(|l| l.ends_with(':') && !l.starts_with('.'))
+        .collect();
+    for folded in ["foo:", "count:", "counted:"] {
+        assert!(
+            !functions.contains(&folded),
+            "{folded} was not folded: {functions:?}"
+        );
+    }
+    assert!(functions.contains(&"banner:"), "{functions:?}");
 }

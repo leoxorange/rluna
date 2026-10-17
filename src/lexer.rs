@@ -3,9 +3,23 @@
 //! Newlines are significant (they end statements) and are emitted as
 //! `Newline` tokens, except inside parentheses where they are skipped.
 //! Consecutive newlines and blank/comment-only lines collapse into one token.
+//!
+//! Why a separate lexing stage? Source text is a flat sequence of characters,
+//! but the grammar talks about *words*: numbers, names, operators. Grouping
+//! characters into tokens first means the parser never has to think about
+//! whitespace, comments, escape sequences or whether `>=` is one operator or
+//! two. Each stage solves one problem, which is the main idea of the whole
+//! compiler pipeline.
+//!
+//! Every token remembers its `Span` (byte range in the source). Nothing later
+//! needs the text itself, but error messages do: a type error found three
+//! stages later can still point at the exact characters that caused it.
 
 use crate::diag::{Diagnostic, ErrorKind, Span};
 
+/// What kind of token, plus its value for literals and names. The lexer
+/// already converts `42` to the integer 42 and `"a\n"` to the real string,
+/// so later stages work with values instead of re-parsing text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Int(i64),
@@ -82,6 +96,10 @@ pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
     /// The token is the first one on its line and starts in column 1.
+    /// Luna has no keyword like `def` or `fn`: a top-level definition is
+    /// recognized by starting in column 1 (see the parser's layout rules).
+    /// The lexer is the last stage that sees columns, so it records this
+    /// fact for the parser.
     pub at_col0: bool,
 }
 
@@ -97,10 +115,19 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
     .run()
 }
 
+/// The lexer is a hand-written state machine: it looks at the current byte,
+/// decides which kind of token starts here, and consumes it. Real compilers
+/// almost always lex by hand like this rather than with generator tools,
+/// because it is simple, fast, and gives full control over error messages.
 struct Lexer<'a> {
+    // Scanning bytes is fast and every Luna token is ASCII; `text` is the
+    // same source as `&str`, used to slice out names and decode UTF-8
+    // characters inside string literals.
     src: &'a [u8],
     text: &'a str,
     pos: usize,
+    /// How many `(` are open. Inside parentheses newlines are ignored, so a
+    /// long expression can be split across lines: `foo (1 +\n 2)`.
     paren_depth: usize,
     /// No token has been produced on the current line yet.
     line_start: bool,
@@ -108,6 +135,9 @@ struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    /// The current byte, or 0 at the end of input. Returning a sentinel
+    /// instead of an `Option` keeps every check a simple comparison: 0 never
+    /// matches a digit, letter or operator, so loops stop by themselves.
     fn peek(&self) -> u8 {
         self.src.get(self.pos).copied().unwrap_or(0)
     }
@@ -139,6 +169,10 @@ impl<'a> Lexer<'a> {
                 }
                 b'\n' => {
                     self.pos += 1;
+                    // Blank lines and comment-only lines would otherwise
+                    // produce several Newline tokens in a row. Collapsing
+                    // them here means the parser can treat "one Newline" as
+                    // "end of statement" without special cases.
                     let last_is_newline = matches!(
                         self.out.last(),
                         None | Some(Token {
@@ -162,6 +196,9 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                     }
                     let word = &self.text[start..self.pos];
+                    // Keywords are lexed exactly like names and then looked
+                    // up in this table. That is why a keyword cannot be used
+                    // as a variable name: it never becomes an `Ident`.
                     let kind = match word {
                         "check" => TokenKind::Check,
                         "else" => TokenKind::Else,
@@ -173,6 +210,9 @@ impl<'a> Lexer<'a> {
                     self.push(kind, start);
                 }
                 _ => {
+                    // "Maximal munch": always take the longest operator that
+                    // matches, so `>=` is one token and not `>` then `=`.
+                    // That is why the two-character patterns come first.
                     let (kind, len) = match (c, self.peek2()) {
                         (b'=', b'=') => (TokenKind::EqEq, 2),
                         (b'!', b'=') => (TokenKind::NotEq, 2),
@@ -211,6 +251,10 @@ impl<'a> Lexer<'a> {
                 }
             }
         }
+        // Guarantee that the token stream always ends with `Newline, Eof`,
+        // even if the file has no final newline. The parser can then assume
+        // every statement is terminated, and `Eof` lets it look ahead
+        // without ever running off the end of the vector.
         if !matches!(
             self.out.last(),
             None | Some(Token {
@@ -238,6 +282,8 @@ impl<'a> Lexer<'a> {
         while self.peek().is_ascii_digit() {
             self.pos += 1;
         }
+        // Require a digit after the dot, so `5.` is not a float. Checking two
+        // bytes ahead ("lookahead") lets the lexer decide without backtracking.
         if self.peek() == b'.' && self.peek2().is_ascii_digit() {
             is_float = true;
             self.pos += 1;
@@ -245,6 +291,9 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
         }
+        // An exponent (`1e5`, `2.5E-3`) needs digits after the `e`. If there
+        // are none, rewind to `save`: then `2e` lexes as the number `2`
+        // followed by the name `e`, instead of an error.
         if matches!(self.peek(), b'e' | b'E') {
             let save = self.pos;
             self.pos += 1;
@@ -283,8 +332,13 @@ impl<'a> Lexer<'a> {
     fn string(&mut self) -> Result<(), Diagnostic> {
         let start = self.pos;
         self.pos += 1;
+        // The token stores the *decoded* string (escapes already replaced),
+        // which is exactly the bytes the program will hold at run time.
         let mut value = String::new();
         loop {
+            // Strings may not span lines. Otherwise a missing `"` would
+            // swallow the rest of the file, and the error would show up far
+            // from the real mistake.
             if self.pos >= self.src.len() || self.peek() == b'\n' {
                 return Err(Diagnostic::error(
                     ErrorKind::SyntaxError,

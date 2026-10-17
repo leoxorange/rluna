@@ -6,6 +6,6 @@ else -> x
 half n :: numeric -> numeric = n / 2
 
 main =
-    echo half (pick 2)
-    echo half (pick 1)
+    echo (half (pick 2))
+    echo (half (pick 1))
     echo "not reached"

@@ -1,4 +1,10 @@
 //! Printing LIR in its textual `.lir` form.
+//!
+//! The printed form is what `--emit=ir` writes, and it is exactly what
+//! `parse.rs` reads, so a printed module can be compiled again. Being able
+//! to *read* the IR is the most useful debugging tool a compiler has: when a
+//! program misbehaves, the IR shows whether the frontend or the backend
+//! is wrong.
 
 use std::fmt::Write;
 

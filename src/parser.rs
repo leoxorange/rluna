@@ -9,7 +9,21 @@
 //! - `check e:` arms are separated by `;` and may span lines.
 //!
 //! Expression precedence, loosest to tightest:
-//!   check / echo  <  comparison  <  + -  <  * /  <  unary -  <  application  <  atoms
+//!   check  <  comparison  <  + -  <  * /  <  unary -  <  application  <  atoms
+//!
+//! `echo` is applied like a function of one argument: `echo x`, `echo (a + b)`.
+//!
+//! How it works: this is a *recursive descent* parser. Each grammar rule is
+//! one function (`program`, `def`, `expr`, `comparison`, ...), and rules
+//! call each other the same way the grammar nests. Operator precedence
+//! comes from the order of those calls: `additive` calls `multiplicative`
+//! for its operands, so `*` binds tighter than `+`. In `1 + 2 * 3`,
+//! `multiplicative` has already consumed `2 * 3` before `additive` sees the
+//! `+`. Each level is one line in the precedence table above.
+//!
+//! The parser only checks *shape*: whether the tokens form a valid program.
+//! Whether names exist or types match is checked by later stages, each of
+//! which can then assume the earlier checks already passed.
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, ErrorKind, Span};
@@ -23,6 +37,9 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, Diagnostic> {
     .program()
 }
 
+/// The parser walks the token vector left to right with a cursor (`pos`).
+/// It never goes back: every decision is made by looking at the current
+/// token, or a few tokens ahead with `peek_at`.
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
@@ -48,6 +65,9 @@ impl Parser {
         self.toks[self.pos.saturating_sub(1)].span
     }
 
+    /// Consume the current token. The cursor never moves past the final
+    /// `Eof`, so `peek()` is always valid and the parser cannot index out
+    /// of bounds, even on malformed input.
     fn bump(&mut self) -> Token {
         let t = self.toks[self.pos].clone();
         if self.pos < self.toks.len() - 1 {
@@ -88,6 +108,12 @@ impl Parser {
     }
 
     /// Does a top-level definition start at the current token?
+    ///
+    /// Luna has no `def` keyword and no braces, so this check is what ends a
+    /// function body: a line in column 1 shaped like `name params... =` or
+    /// `name params... ::`. The scan skips over the parameter names to find
+    /// the `=`/`::`. Without that lookahead, a call such as `summon 1` in
+    /// column 1 could not be told apart from a definition.
     fn at_def_start(&self) -> bool {
         let tok = &self.toks[self.pos];
         if !tok.at_col0 || !matches!(tok.kind, TokenKind::Ident(_)) {
@@ -164,6 +190,9 @@ impl Parser {
         Err(self.unexpected("a type (numeric, int, float, string, boolean, void, any)"))
     }
 
+    /// `:: T1, T2 -> R`. Knowing the number of parameters up front lets the
+    /// parser report a mismatched signature here, pointing at the
+    /// signature, rather than later as a confusing type error.
     fn signature(&mut self, nparams: usize) -> PResult<Signature> {
         let sig_start = self.span();
         if nparams == 0 {
@@ -219,6 +248,9 @@ impl Parser {
         Ok(Block { stmts })
     }
 
+    /// A statement is either a local binding `name = expr` or an expression.
+    /// Two tokens of lookahead decide it: `x = ...` is a binding, while
+    /// `x + 1` or `f x` is an expression.
     fn stmt(&mut self) -> PResult<Stmt> {
         if let (TokenKind::Ident(name), TokenKind::Assign) = (self.peek().clone(), self.peek_at(1))
         {
@@ -233,19 +265,14 @@ impl Parser {
     fn expr(&mut self) -> PResult<Expr> {
         match self.peek() {
             TokenKind::Check => self.check(),
-            TokenKind::Echo => {
-                let start = self.bump().span;
-                let inner = self.expr()?;
-                let span = start.to(inner.span);
-                Ok(Expr {
-                    kind: ExprKind::Echo(Box::new(inner)),
-                    span,
-                })
-            }
             _ => self.comparison(),
         }
     }
 
+    /// `check e: p1 -> a; p2 -> b; else -> c`. The scrutinee and patterns
+    /// are parsed with `comparison`, not `expr`, so that a nested `check`
+    /// cannot start in the middle of them. Arm bodies use the full `expr`,
+    /// so an arm can itself contain a `check`.
     fn check(&mut self) -> PResult<Expr> {
         let start = self.bump().span;
         let scrutinee = self.comparison()?;
@@ -285,6 +312,9 @@ impl Parser {
         })
     }
 
+    /// Comparisons are *non-associative*: at most one per level. `a < b < c`
+    /// is rejected because it would mean `(a < b) < c`, comparing a boolean
+    /// with a number, which is almost never what the programmer meant.
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.additive()?;
         let op = match self.peek() {
@@ -324,6 +354,10 @@ impl Parser {
         })
     }
 
+    /// `+` and `-` are *left-associative*: `a - b - c` is `(a - b) - c`.
+    /// A loop that keeps wrapping `lhs` builds the tree leaning left. A
+    /// recursive call for the right-hand side would build `a - (b - c)`,
+    /// which gives a different answer.
     fn additive(&mut self) -> PResult<Expr> {
         let mut lhs = self.multiplicative()?;
         loop {
@@ -373,7 +407,10 @@ impl Parser {
             let start = self.bump().span;
             let inner = self.unary()?;
             let span = start.to(inner.span);
-            // Fold negative literals directly.
+            // Fold negative literals directly: `-5` becomes the constant -5
+            // rather than "negate 5". This is constant folding, the
+            // simplest optimization: work done once at compile time instead
+            // of every time the program runs.
             return Ok(match inner.kind {
                 ExprKind::Int(v) => Expr {
                     kind: ExprKind::Int(v.wrapping_neg()),
@@ -392,6 +429,12 @@ impl Parser {
         self.application()
     }
 
+    /// Can the current token begin an argument? Application has no
+    /// punctuation (`f a b`), so the parser keeps taking arguments while the
+    /// next token could start one. It stops at an operator, `)`, `;`, a
+    /// newline, and so on. `-` is deliberately not in the list: `f -1` would
+    /// be ambiguous, so it means `f - 1`, and a negative argument is
+    /// written `f (-1)`.
     fn starts_atom(&self) -> bool {
         matches!(
             self.peek(),
@@ -405,7 +448,14 @@ impl Parser {
         )
     }
 
+    /// `f a b c`: a name followed by atoms. Arguments are parsed with
+    /// `atom`, not `expr`, which is what makes application bind tighter
+    /// than every operator: in `f a + 1` the `+` is not an atom, so the
+    /// arguments end at `a`.
     fn application(&mut self) -> PResult<Expr> {
+        if self.peek() == &TokenKind::Echo {
+            return self.echo();
+        }
         if let TokenKind::Ident(name) = self.peek().clone() {
             let callee_span = self.bump().span;
             let mut args = Vec::new();
@@ -439,6 +489,31 @@ impl Parser {
         Ok(atom)
     }
 
+    /// `echo` takes exactly one atom; anything larger goes in parentheses.
+    fn echo(&mut self) -> PResult<Expr> {
+        let start = self.bump().span;
+        if !self.starts_atom() {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                self.span(),
+                "`echo` needs an argument, e.g. `echo x` or `echo (a + b)`",
+            ));
+        }
+        let inner = self.atom()?;
+        if self.starts_atom() {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                start.to(self.span()),
+                "`echo` takes one argument; wrap the expression in parentheses, e.g. `echo (f x)`",
+            ));
+        }
+        let span = start.to(inner.span);
+        Ok(Expr {
+            kind: ExprKind::Echo(Box::new(inner)),
+            span,
+        })
+    }
+
     fn atom(&mut self) -> PResult<Expr> {
         let span = self.span();
         let kind = match self.peek().clone() {
@@ -449,6 +524,10 @@ impl Parser {
             TokenKind::False => ExprKind::Bool(false),
             TokenKind::Ident(n) => ExprKind::Name(n),
             TokenKind::LParen => {
+                // Parentheses restart at the loosest level (`expr`); this is
+                // how they override precedence. They leave no node in the
+                // tree: `(1 + 2)` is just the `+` node, with a span widened
+                // to cover the parentheses for error messages.
                 self.bump();
                 let inner = self.expr()?;
                 self.expect(&TokenKind::RParen, "`)`")?;
@@ -494,10 +573,18 @@ mod tests {
     }
 
     #[test]
-    fn echo_takes_whole_expression() {
-        let p = parse_src("main = echo 5 > 6");
-        let out = dump(&p);
+    fn echo_takes_one_argument() {
+        let out = dump(&parse_src("main = echo (5 > 6)"));
         assert!(out.contains("(echo (> 5 6))"), "{out}");
+        // Like any application, `echo` binds tighter than operators.
+        let out = dump(&parse_src("main = echo 5 > 6"));
+        assert!(out.contains("(> (echo 5) 6)"), "{out}");
+        let err = parse(lex("main = echo f 1").unwrap()).unwrap_err();
+        assert!(
+            err.message.contains("wrap the expression"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

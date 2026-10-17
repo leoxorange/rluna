@@ -6,25 +6,25 @@ else -> x
 half n :: numeric -> numeric = n / 2
 
 main =
-    echo pick 1
-    echo pick 2
-    echo pick 3
+    echo (pick 1)
+    echo (pick 2)
+    echo (pick 3)
     v = pick 2
-    echo v + 1
-    echo (pick 3) * 2
-    echo (pick 1) + "!"
-    echo pick 1 == "one"
-    echo half (pick 3)
+    echo (v + 1)
+    echo ((pick 3) * 2)
+    echo ((pick 1) + "!")
+    echo (pick 1 == "one")
+    echo (half (pick 3))
     echo 0.1
-    echo 0.1 + 0.2
+    echo (0.1 + 0.2)
     echo 1e20
     echo 1e16
     echo 1e15
     echo 0.0001
     echo 0.00001
     echo 123456.789
-    echo -0.5
-    echo 1 / 3
+    echo (-0.5)
+    echo (1 / 3)
     check true:
     true -> echo "yes";
     false -> echo "no"

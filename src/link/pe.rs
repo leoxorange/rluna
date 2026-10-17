@@ -10,11 +10,19 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::codegen::{CodeFunc, iat_symbol};
+use super::Image;
+use crate::codegen::{CodeFunc, RelocKind, import_symbol};
 use crate::lir::Module;
 
+/// The address Windows loads the image at (the conventional default for
+/// 64-bit executables). Without base relocations the image *must* load
+/// there, so the PE header marks it as not relocatable.
 pub const IMAGE_BASE: u64 = 0x1_4000_0000;
+/// Sections start on page boundaries in memory (4 KiB), because memory
+/// permissions (read/write/execute) are set per page.
 const SECTION_ALIGN: u32 = 0x1000;
+/// In the file, sections only need 512-byte alignment, which keeps the
+/// file small.
 const FILE_ALIGN: u32 = 0x200;
 
 fn align(v: u32, a: u32) -> u32 {
@@ -26,12 +34,6 @@ struct Section {
     data: Vec<u8>,
     rva: u32,
     characteristics: u32,
-}
-
-pub struct Image {
-    pub bytes: Vec<u8>,
-    /// RVA of each function, for listings.
-    pub func_rvas: HashMap<String, u32>,
 }
 
 pub fn link(module: &Module, code: &[CodeFunc], entry: &str) -> Result<Image, String> {
@@ -67,7 +69,7 @@ pub fn link(module: &Module, code: &[CodeFunc], entry: &str) -> Result<Image, St
     // .idata
     let mut dlls: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for e in &module.externs {
-        dlls.entry(e.dll())
+        dlls.entry(format!("{}.dll", e.library()))
             .or_default()
             .push((e.import_name().to_string(), e.name.clone()));
     }
@@ -82,11 +84,12 @@ pub fn link(module: &Module, code: &[CodeFunc], entry: &str) -> Result<Image, St
         symbols.insert(name.clone(), data_rva + off);
     }
     for (name, rva) in &iat_slots {
-        symbols.insert(iat_symbol(name), *rva);
+        symbols.insert(import_symbol(name), *rva);
     }
     for f in code {
         let base = func_offsets[&f.name];
         for r in &f.relocs {
+            assert_eq!(r.kind, RelocKind::Rel32, "PE images hold x86-64 code");
             let target = *symbols
                 .get(&r.symbol)
                 .ok_or_else(|| format!("undefined symbol `{}`", r.symbol))?;
@@ -122,17 +125,23 @@ pub fn link(module: &Module, code: &[CodeFunc], entry: &str) -> Result<Image, St
     ];
 
     let bytes = write_image(&sections, entry_rva, import_dir, iat_dir);
-    let func_rvas = func_offsets
+    let func_addrs = func_offsets
         .into_iter()
-        .map(|(k, v)| (k, v + text_rva))
+        .map(|(k, v)| (k, IMAGE_BASE + (v + text_rva) as u64))
         .collect();
-    Ok(Image { bytes, func_rvas })
+    Ok(Image { bytes, func_addrs })
 }
 
 /// (section bytes, IAT slot RVA per extern symbol, import directory (rva, size), IAT (rva, size))
 type Imports = (Vec<u8>, HashMap<String, u32>, (u32, u32), (u32, u32));
 
 /// Builds the .idata section placed at RVA `base`.
+///
+/// For each DLL there is a directory entry pointing at two parallel tables:
+/// the lookup table (which function names to import) and the import
+/// address table (IAT). The loader reads the names, finds the functions in
+/// the DLL, and overwrites each IAT entry with the function's address. Our
+/// code calls through the IAT entries.
 fn build_imports(dlls: &BTreeMap<String, Vec<(String, String)>>, base: u32) -> Imports {
     let ndlls = dlls.len() as u32;
     let total_funcs: u32 = dlls.values().map(|v| v.len() as u32).sum();
@@ -193,7 +202,9 @@ fn write_image(
     let u32le = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_le_bytes());
     let u64le = |o: &mut Vec<u8>, v: u64| o.extend_from_slice(&v.to_le_bytes());
 
-    // DOS header: only e_magic and e_lfanew matter.
+    // DOS header: only e_magic and e_lfanew matter. Every .exe still starts
+    // with "MZ" for compatibility with MS-DOS; e_lfanew points to the real
+    // PE header.
     let pe_offset = 0x40u32;
     out.extend_from_slice(b"MZ");
     out.resize(0x3C, 0);

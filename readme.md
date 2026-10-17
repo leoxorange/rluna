@@ -9,9 +9,9 @@ luna is a haskell-like language, the key concept of luna is we use as much less 
 - calculation
 
 ```
-echo 5 > 6 # false
-echo 5 == 5 # true
-echo 4 < 10 # true
+echo (5 > 6) # false
+echo (5 == 5) # true
+echo (4 < 10) # true
 foo :: boolean = 5 > 6 # foo is false
 ```
 

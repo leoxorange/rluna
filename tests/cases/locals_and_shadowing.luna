@@ -8,10 +8,10 @@ area w h =
 
 main =
     x = 5
-    echo sum x 1
+    echo (sum x 1)
     x = x * 2
     echo x
-    echo uses_global 1
-    echo area 3 4
+    echo (uses_global 1)
+    echo (area 3 4)
     greeting = "hi"
-    echo greeting + ", " + "there"
+    echo (greeting + ", " + "there")

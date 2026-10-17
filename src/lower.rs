@@ -9,19 +9,48 @@
 //!
 //! Operations on unions dispatch on the box tag and reuse the code for
 //! concrete kinds.
+//!
+//! What lowering does: until now the program was a *tree* (nested
+//! expressions). A CPU executes a *list* of simple instructions with jumps.
+//! Lowering bridges the two:
+//!
+//! - nested expressions become sequences of one-operation instructions,
+//!   each producing a named value: `a + b * c` becomes
+//!   `%1 = imul %b, %c; %2 = iadd %a, %1`;
+//! - `check` becomes basic blocks with conditional branches;
+//! - Luna types become machine types (`i64`/`f64`) using the representation
+//!   above, with boxing, unboxing and tag tests spelled out.
+//!
+//! Memory is freed here too, following the ownership rules checked by
+//! `ownership`: lowering tracks which locals and parameters still own a
+//! value and inserts a *drop* (`rt.free` for a string, `rt.drop_box` for a
+//! box) where each owner is done with it. See "Ownership and drops" below.
+//!
+//! After this stage nothing knows about Luna anymore. LIR could just as well
+//! have come from a C compiler, which is why the runtime can be written in
+//! it and why backends for new CPUs only need to understand LIR.
 
 use std::collections::HashMap;
 
 use crate::ast::BinOp;
 use crate::lir::{
-    self, Data, DataItem, FBinOp, FCond, FunctionBuilder, IBinOp, ICond, MemTy, Module, Type, Value,
+    self, BlockId, Data, DataItem, FBinOp, FCond, FunctionBuilder, IBinOp, ICond, MemTy, Module,
+    Type, Value,
 };
+use crate::ownership::Use;
 use crate::typeck::{TExpr, TExprKind, TFunc, TStmt, Tir, binop_result};
 use crate::types::{Kind, Ty};
 
 /// Name of the function the runtime calls to run the program.
 pub const ENTRY: &str = "luna.main";
 
+/// Allocator header of objects that must never be freed.
+const IMMORTAL: i64 = -1;
+
+/// The machine type a Luna type is stored in. Everything except a plain
+/// `float` fits in a 64-bit integer register: small values directly,
+/// strings and boxes as pointers. Floats get `f64` because CPUs keep them
+/// in separate floating-point registers and use different instructions.
 pub fn repr(ty: Ty) -> Type {
     if ty == Ty::FLOAT {
         Type::F64
@@ -46,13 +75,21 @@ pub fn lower(tir: &Tir) -> Module {
         module.funcs.push(func);
     }
 
+    // A fixed-name wrapper around the user's `main`. The runtime always
+    // calls `@luna.main`, whatever symbol typeck gave `main`'s instance and
+    // whatever `main` returns (its value is ignored).
+    // Its result is dropped like any discarded value.
+    let main = &tir.funcs[tir.entry];
     let mut b = FunctionBuilder::new(ENTRY, &[], None);
     b.func.comment = Some("program entry: runs `main`".into());
-    b.call(
-        &tir.funcs[tir.entry].symbol,
-        Vec::new(),
-        ret_repr(tir.funcs[tir.entry].ret),
-    );
+    let ret = if main.discard {
+        None
+    } else {
+        ret_repr(main.ret)
+    };
+    if let Some(v) = b.call(&main.symbol, Vec::new(), ret) {
+        emit_drop(&mut b, v, main.ret);
+    }
     b.ret(None);
     module.funcs.push(b.finish());
 
@@ -68,6 +105,15 @@ struct Strings {
 
 impl Strings {
     /// Symbol of a constant string object with the given contents.
+    ///
+    /// String literals are not built at run time. Each distinct literal is
+    /// stored once in the executable's data section, already in the runtime
+    /// layout `{ len, bytes }`, and the code just takes its address.
+    /// "Interning" means equal literals share one copy.
+    ///
+    /// The object is preceded by an allocator header marking it immortal
+    /// (see `rt.alloc` in `runtime/core.lir`), so a literal can flow
+    /// anywhere a heap string can, and freeing it is a harmless no-op.
     fn intern(&mut self, s: &str) -> String {
         if let Some(sym) = self.map.get(s) {
             return sym.clone();
@@ -76,6 +122,7 @@ impl Strings {
         self.data.push(Data {
             name: sym.clone(),
             items: vec![
+                DataItem::I64(IMMORTAL),
                 DataItem::I64(s.len() as i64),
                 DataItem::Bytes(s.as_bytes().to_vec()),
             ],
@@ -85,12 +132,50 @@ impl Strings {
     }
 }
 
+/// Free a value that is no longer needed. Only heap values need it: a
+/// string is a single allocation, a box may also own a string payload.
+fn emit_drop(b: &mut FunctionBuilder, v: Value, ty: Ty) {
+    if !ty.needs_drop() {
+        return;
+    }
+    let free = if ty == Ty::STR {
+        "rt.free"
+    } else {
+        "rt.drop_box"
+    };
+    b.call(free, vec![v], None);
+}
+
+/// Which parameters and locals currently own a value that must be dropped.
+#[derive(Clone)]
+struct Owned {
+    params: Vec<bool>,
+    locals: Vec<bool>,
+}
+
+impl Owned {
+    /// Owners that still own their value on *both* paths.
+    fn meet(&self, other: &Owned) -> Owned {
+        let and = |a: &[bool], b: &[bool]| a.iter().zip(b).map(|(x, y)| *x && *y).collect();
+        Owned {
+            params: and(&self.params, &other.params),
+            locals: and(&self.locals, &other.locals),
+        }
+    }
+}
+
 struct FnLower<'a> {
     tir: &'a Tir,
     f: &'a TFunc,
     strings: &'a mut Strings,
     b: FunctionBuilder,
+    /// The LIR value holding each Luna local. In SSA form (see `lir`) a
+    /// local is just a name for the value computed by its `x = ...`, so no
+    /// memory is needed. Shadowing `x = x * 2` simply maps the new local id
+    /// to the new value.
     locals: Vec<Option<Value>>,
+    /// Owners whose value has not been moved yet at the current point.
+    owned: Owned,
 }
 
 impl<'a> FnLower<'a> {
@@ -105,31 +190,93 @@ impl<'a> FnLower<'a> {
             strings,
             b,
             locals: vec![None; f.local_tys.len()],
+            // Arguments are moved into the call: the function owns them.
+            owned: Owned {
+                params: f.params.iter().map(|t| t.needs_drop()).collect(),
+                locals: vec![false; f.local_tys.len()],
+            },
         }
     }
 
     fn run(mut self) -> lir::Function {
-        let mut last = None;
-        for stmt in &self.f.body {
+        let returns = !self.f.discard && ret_repr(self.f.ret).is_some();
+        let mut result = None;
+        for (i, stmt) in self.f.body.iter().enumerate() {
             match stmt {
                 TStmt::Let { local, value } => {
-                    let v = self.expr(value);
+                    let v = self.expr(value, Use::Move);
                     self.locals[*local] = Some(v);
-                    last = None;
+                    self.owned.locals[*local] = value.ty.needs_drop();
                 }
-                TStmt::Expr(e) => last = Some((self.expr(e), e.ty)),
+                // The last statement's value is the result and moves to the
+                // caller; the values of other statements are discarded.
+                TStmt::Expr(e) => {
+                    let v = self.expr(e, Use::Move);
+                    if returns && i + 1 == self.f.body.len() {
+                        result = Some((v, e.ty));
+                    } else {
+                        // Moved here (even a bare `x` line), so drop it.
+                        emit_drop(&mut self.b, v, e.ty);
+                    }
+                }
             }
         }
-        if self.f.discard || ret_repr(self.f.ret).is_none() {
-            self.b.ret(None);
-        } else {
-            let (v, ty) = last.expect("non-void function ends with an expression");
-            let v = self.convert(v, ty, self.f.ret);
-            self.b.ret(Some(v));
-        }
+        let result = result.map(|(v, ty)| self.convert(v, ty, self.f.ret));
+        // The end of the function's scope: drop everything still owned.
+        self.drop_owned(&self.owned.clone(), None);
+        self.b.ret(result);
         self.b.finish()
     }
 
+    // -- ownership and drops --------------------------------------------------
+    //
+    // Every heap value has exactly one owner, as checked by `ownership`:
+    //
+    // - a parameter or local owns its value until the value is moved away
+    //   (`y = x`, `f x`, returned, or the result of a `check` arm); whatever
+    //   is still owned when the function ends is dropped;
+    // - a *temporary* (a fresh value from a call, an operator or a `check`)
+    //   that is only read, as in `echo (a + b)`, is dropped right after
+    //   that read;
+    // - a value read through its owner's name (`echo x`) is *borrowed*: the
+    //   owner keeps it and drops it later.
+    //
+    // All of this is decided at compile time. The generated code just calls
+    // `rt.free` at the right places, with no reference counts or flags.
+
+    /// Drop the value `v` of `e` after it has been read, unless it is
+    /// borrowed from a parameter or local (whose owner drops it later) or is
+    /// a string literal (which is immortal anyway).
+    fn drop_temp(&mut self, e: &TExpr, v: Value) {
+        if !matches!(
+            e.kind,
+            TExprKind::Param(_) | TExprKind::Local(_) | TExprKind::Str(_)
+        ) {
+            emit_drop(&mut self.b, v, e.ty);
+        }
+    }
+
+    /// Drop the values of the owners in `owned`, except those also in
+    /// `keep`.
+    fn drop_owned(&mut self, owned: &Owned, keep: Option<&Owned>) {
+        for (i, &own) in owned.params.iter().enumerate() {
+            if own && !keep.is_some_and(|k| k.params[i]) {
+                let v = self.b.param(i);
+                emit_drop(&mut self.b, v, self.f.params[i]);
+            }
+        }
+        for (l, &own) in owned.locals.iter().enumerate() {
+            if own && !keep.is_some_and(|k| k.locals[l]) {
+                let v = self.locals[l].expect("owned local has a value");
+                emit_drop(&mut self.b, v, self.f.local_tys[l]);
+            }
+        }
+    }
+
+    /// A placeholder value for code that can never run (an expression of
+    /// type `never`, or a call to a `void` function used as a value). The
+    /// IR still needs *some* value of the right machine type to stay well
+    /// formed, even though nothing will ever read it.
     fn dummy(&mut self, ty: Ty) -> Value {
         match repr(ty) {
             Type::F64 => self.b.fconst(0.0),
@@ -137,21 +284,38 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// The address of a string literal's object, just past its header.
     fn string_const(&mut self, s: &str) -> Value {
         let sym = self.strings.intern(s);
-        self.b.addr(&sym)
+        let header = self.b.addr(&sym);
+        let header_size = self.b.iconst(8);
+        self.b.ibin(IBinOp::Add, header, header_size)
     }
 
-    fn expr(&mut self, e: &TExpr) -> Value {
+    /// Lower an expression whose value is used as `usage` says: `Move` when
+    /// the value is given away (to a binding, a call, the caller), `Borrow`
+    /// when it is only read (by an operator, `echo`, `check`).
+    fn expr(&mut self, e: &TExpr, usage: Use) -> Value {
+        let moved = usage == Use::Move && e.ty.needs_drop();
         match &e.kind {
             TExprKind::Int(v) => self.b.iconst(*v),
             TExprKind::Float(v) => self.b.fconst(*v),
             TExprKind::Str(s) => self.string_const(s),
             TExprKind::Bool(v) => self.b.iconst(*v as i64),
-            TExprKind::Param(i) => self.b.param(*i),
-            TExprKind::Local(l) => self.locals[*l].expect("local used before definition"),
+            TExprKind::Param(i) => {
+                if moved {
+                    self.owned.params[*i] = false;
+                }
+                self.b.param(*i)
+            }
+            TExprKind::Local(l) => {
+                if moved {
+                    self.owned.locals[*l] = false;
+                }
+                self.locals[*l].expect("local used before definition")
+            }
             TExprKind::Call { inst, args } => {
-                let args: Vec<Value> = args.iter().map(|a| self.expr(a)).collect();
+                let args: Vec<Value> = args.iter().map(|a| self.expr(a, Use::Move)).collect();
                 let callee = &self.tir.funcs[*inst];
                 let ret = if callee.discard {
                     None
@@ -165,25 +329,29 @@ impl<'a> FnLower<'a> {
             }
             TExprKind::Diverge(args) => {
                 for a in args {
-                    self.expr(a);
+                    self.expr(a, Use::Move);
                 }
                 self.dummy(e.ty)
             }
             TExprKind::Binary { op, lhs, rhs } => {
-                let l = self.expr(lhs);
-                let r = self.expr(rhs);
+                let l = self.expr(lhs, Use::Borrow);
+                let r = self.expr(rhs, Use::Borrow);
                 if e.ty.is_never() {
                     return self.dummy(e.ty);
                 }
-                self.binary(*op, l, lhs.ty, r, rhs.ty, e.ty)
+                let result = self.binary(*op, l, lhs.ty, r, rhs.ty, e.ty);
+                // The operands were only read; the result is a new value.
+                self.drop_temp(lhs, l);
+                self.drop_temp(rhs, r);
+                result
             }
             TExprKind::Neg(inner) => {
-                let v = self.expr(inner);
+                let v = self.expr(inner, Use::Borrow);
                 if e.ty.is_never() {
                     return self.dummy(e.ty);
                 }
                 let result_ty = e.ty;
-                self.dispatch(v, inner.ty, result_ty, |this, kind, v| match kind {
+                let result = self.dispatch(v, inner.ty, result_ty, |this, kind, v| match kind {
                     Kind::Int => {
                         let zero = this.b.iconst(0);
                         Some((Ty::INT, this.b.ibin(IBinOp::Sub, zero, v)))
@@ -199,10 +367,12 @@ impl<'a> FnLower<'a> {
                         this.b.call("rt.op_error", vec![msg, tag, none], None);
                         None
                     }
-                })
+                });
+                self.drop_temp(inner, v);
+                result
             }
             TExprKind::Echo(inner) => {
-                let v = self.expr(inner);
+                let v = self.expr(inner, Use::Borrow);
                 if !inner.ty.is_never() {
                     self.dispatch(v, inner.ty, Ty::VOID, |this, kind, v| {
                         match kind {
@@ -216,44 +386,91 @@ impl<'a> FnLower<'a> {
                         Some((Ty::VOID, z))
                     });
                     self.b.call("rt.print_newline", vec![], None);
+                    self.drop_temp(inner, v);
                 }
                 self.b.iconst(0)
             }
+            // `check` becomes a chain of tests, like if / else if / else:
+            //
+            //   test arm 1 --yes--> arm1 body --+
+            //       |no                         |
+            //   test arm 2 --yes--> arm2 body --+--> check_end(result)
+            //       |no                         |
+            //   else body ----------------------+
+            //
+            // Every arm jumps to one merge block and passes its value as the
+            // block's parameter. That parameter is the result of the whole
+            // `check` (in other IRs this is called a "phi node").
+            //
+            // Ownership across the arms: each arm starts from the owners as
+            // they were before it, and may move some of them. After the
+            // `check`, an owner counts as moved if *any* arm moved it (the
+            // ownership checker forbids using it again). So an arm that did
+            // not move it drops it before jumping to the merge block, and
+            // every path leaves the same owners behind.
             TExprKind::Check {
                 scrutinee,
                 arms,
                 else_arm,
             } => {
-                let s = self.expr(scrutinee);
+                let s = self.expr(scrutinee, Use::Borrow);
                 let merge = self.b.new_block("check_end");
                 let result = self.b.block_param(merge, repr(e.ty));
+                // (block where the arm ends, its value, owners at its end)
+                let mut ends: Vec<(BlockId, Value, Owned)> = Vec::new();
                 for (pat, body) in arms {
-                    let p = self.expr(pat);
+                    let p = self.expr(pat, Use::Borrow);
                     let cond = if scrutinee.ty.is_never() || pat.ty.is_never() {
                         self.b.iconst(0)
                     } else {
                         self.binary(BinOp::Eq, s, scrutinee.ty, p, pat.ty, Ty::BOOL)
                     };
+                    self.drop_temp(pat, p);
                     let arm = self.b.new_block("arm");
                     let next = self.b.new_block("next");
                     self.b.br(cond, arm, vec![], next, vec![]);
                     self.b.switch_to(arm);
-                    let v = self.expr(body);
-                    self.b.jmp(merge, vec![v]);
+                    let before = self.owned.clone();
+                    let v = self.expr(body, Use::Move);
+                    if !self.b.is_terminated() {
+                        ends.push((self.b.current(), v, self.owned.clone()));
+                    }
+                    self.owned = before;
                     self.b.switch_to(next);
                 }
                 match else_arm {
                     Some(body) => {
-                        let v = self.expr(body);
-                        self.b.jmp(merge, vec![v]);
+                        let v = self.expr(body, Use::Move);
+                        if !self.b.is_terminated() {
+                            ends.push((self.b.current(), v, self.owned.clone()));
+                        }
                     }
+                    // Typeck proved a bool `check` covers both values, so
+                    // falling through every arm cannot happen. `unreachable`
+                    // says so (and traps if the proof were ever wrong).
                     None => self.b.unreachable(),
                 }
+                let after = ends
+                    .iter()
+                    .map(|(_, _, owned)| owned.clone())
+                    .reduce(|a, b| a.meet(&b))
+                    .unwrap_or_else(|| self.owned.clone());
+                for (block, v, owned) in ends {
+                    self.b.switch_to(block);
+                    self.drop_owned(&owned, Some(&after));
+                    self.b.jmp(merge, vec![v]);
+                }
+                self.owned = after;
                 self.b.switch_to(merge);
+                if !scrutinee.ty.is_never() {
+                    self.drop_temp(scrutinee, s);
+                }
                 result
             }
             TExprKind::Convert(inner) => {
-                let v = self.expr(inner);
+                // Conversions only appear where the value is moved (call
+                // arguments, `check` arms, return values), so `v` is owned.
+                let v = self.expr(inner, usage);
                 self.convert(v, inner.ty, e.ty)
             }
         }
@@ -261,8 +478,12 @@ impl<'a> FnLower<'a> {
 
     // -- representation changes -------------------------------------------
 
+    /// Wrap a concrete value in a heap-allocated `{ tag, payload }` box.
     fn box_value(&mut self, kind: Kind, v: Value) -> Value {
         let tag = self.b.iconst(kind.tag());
+        // The payload slot is an i64. A float's 64 bits are stored
+        // unchanged ("bitcast"), not converted to an integer: 2.5 stays
+        // 2.5 when read back as f64.
         let payload = if kind == Kind::Float {
             self.b.bitcast(v, Type::I64)
         } else {
@@ -283,6 +504,11 @@ impl<'a> FnLower<'a> {
     }
 
     /// Calls the runtime's type error if `tag` is not in `allowed`.
+    ///
+    /// The test reuses the bit-set encoding of `Ty`: kind with tag t is bit
+    /// t-1, so `(1 << (tag - 1)) & mask` is non-zero exactly when the
+    /// kind is allowed. One test covers any set of kinds, with no chain of
+    /// comparisons.
     fn check_tag(&mut self, tag: Value, allowed: Ty) {
         let ok = self.b.new_block("tag_ok");
         let bad = self.b.new_block("tag_bad");
@@ -301,6 +527,10 @@ impl<'a> FnLower<'a> {
 
     /// Convert a value of type `from` to type `to`. When `to` does not contain
     /// `from` this checks the value's kind at runtime.
+    ///
+    /// `v` is owned and is consumed: a boxed value becomes owned by the new
+    /// box, and unboxing frees the box once the payload is taken out (the
+    /// payload, if a string, now belongs to the result).
     fn convert(&mut self, v: Value, from: Ty, to: Ty) -> Value {
         if from == to {
             return v;
@@ -308,6 +538,12 @@ impl<'a> FnLower<'a> {
         if from.is_never() {
             return self.dummy(to);
         }
+        // Four cases, by whether each side is a single kind (unboxed) or a
+        // union (boxed):
+        //   single -> union:  box it (always safe: typeck checked to ⊇ from)
+        //   union  -> single: check the tag at run time, then unbox
+        //   union  -> union:  same box; check the tag only if `to` is smaller
+        //   single -> single: same kind, nothing to do
         match (from.as_kind(), to.as_kind()) {
             (Some(k), None) => {
                 debug_assert!(to.contains(k));
@@ -316,7 +552,9 @@ impl<'a> FnLower<'a> {
             (None, Some(k)) => {
                 let tag = self.b.load(MemTy::I64, v, 0);
                 self.check_tag(tag, to);
-                self.unbox_payload(k, v)
+                let payload = self.unbox_payload(k, v);
+                self.b.call("rt.free", vec![v], None);
+                payload
             }
             (None, None) => {
                 if !from.is_subset(to) {
@@ -336,6 +574,13 @@ impl<'a> FnLower<'a> {
     /// kind. `f` returns the kind and value of its result, or `None` if it
     /// ended its block (e.g. with a runtime error). Results are joined into
     /// a value of type `result`.
+    ///
+    /// This is the heart of how dynamic typing is compiled. For a union value
+    /// it generates "if tag == int { ... } else if tag == float { ... }",
+    /// and inside each branch the value is unboxed to a concrete kind.
+    /// `f` then only ever handles concrete kinds and emits the fast code
+    /// for them. For a value of a single kind there is no test at all, which
+    /// is why fully typed code pays nothing for this flexibility.
     fn dispatch(
         &mut self,
         v: Value,
@@ -363,6 +608,8 @@ impl<'a> FnLower<'a> {
         let kinds: Vec<Kind> = ty.kinds().collect();
         for (i, &kind) in kinds.iter().enumerate() {
             let case = self.b.new_block(&format!("is_{}", kind.name()));
+            // The last possible kind needs no test: if the tag was none of
+            // the others, it must be this one.
             if i + 1 < kinds.len() {
                 let next = self.b.new_block("not");
                 let k = self.b.iconst(kind.tag());
@@ -405,6 +652,11 @@ impl<'a> FnLower<'a> {
 
     // -- operators ----------------------------------------------------------
 
+    /// A binary operator: dispatch on the left kind, then (inside each case)
+    /// on the right kind, then emit the concrete operation for that pair.
+    /// For `int + int` both dispatches collapse to nothing and this emits a
+    /// single `iadd`. For `any + any` it emits a 5×5 decision tree whose
+    /// invalid combinations call `rt.op_error`.
     fn binary(&mut self, op: BinOp, l: Value, lt: Ty, r: Value, rt: Ty, result: Ty) -> Value {
         self.dispatch(l, lt, result, |this, ka, lv| {
             let inner = this.dispatch(r, rt, result, |this, kb, rv| {
@@ -424,6 +676,10 @@ impl<'a> FnLower<'a> {
         })
     }
 
+    /// The operation for two known kinds: the actual machine-level meaning
+    /// of each Luna operator. Mixed int/float arithmetic converts the int
+    /// first (`sitofp`), because the CPU has no "add int to float"
+    /// instruction.
     fn concrete_binary(&mut self, op: BinOp, ka: Kind, a: Value, kb: Kind, b: Value) -> Value {
         use Kind::*;
         let to_float =
@@ -467,8 +723,11 @@ impl<'a> FnLower<'a> {
                         .call("rt.str_eq", vec![a, b], Some(Type::I64))
                         .unwrap()
                 } else {
-                    self.b.iconst((ka == Void && kb == Void) as i64)
+                    // Values of different kinds are never equal.
+                    self.b.iconst(0)
                 };
+                // `a != b` is `(a == b) xor 1`: comparisons produce 0 or 1,
+                // so xor with 1 flips the boolean without a branch.
                 if op == BinOp::Ne {
                     let one = self.b.iconst(1);
                     self.b.ibin(IBinOp::Xor, eq, one)
@@ -477,6 +736,10 @@ impl<'a> FnLower<'a> {
                 }
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                // Strings are compared by a runtime function returning
+                // -1/0/1 (like C's strcmp). Comparing that result with 0
+                // using the same operator turns all four of < <= > >= into
+                // one call plus one integer compare.
                 if ka == Str {
                     let c = self
                         .b

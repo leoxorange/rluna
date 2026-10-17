@@ -1,0 +1,74 @@
+; Luna runtime: operating system layer for Windows.
+;
+; All OS access goes through kernel32.dll; no C runtime is used.
+; See core.lir for the interface this file provides.
+
+extern @kernel32.GetStdHandle(i64) -> i64
+extern @kernel32.WriteFile(i64, i64, i64, i64, i64) -> i64
+extern @kernel32.ExitProcess(i64)
+extern @kernel32.VirtualAlloc(i64, i64, i64, i64) -> i64
+extern @kernel32.VirtualFree(i64, i64, i64) -> i64
+
+data @rt.stdout = { i64 0 }
+data @rt.stderr = { i64 0 }
+data @rt.written = { i64 0 }
+
+func @rt.start() {
+entry:
+  %out_id = iconst -11
+  %out = call i64 @kernel32.GetStdHandle(%out_id)
+  %out_slot = addr @rt.stdout
+  store i64 %out_slot, 0, %out
+  %err_id = iconst -12
+  %err = call i64 @kernel32.GetStdHandle(%err_id)
+  %err_slot = addr @rt.stderr
+  store i64 %err_slot, 0, %err
+  call void @luna.main()
+  %zero = iconst 0
+  call void @rt.exit(%zero)
+  unreachable
+}
+
+func @rt.sys_exit(%code: i64) {
+entry:
+  call void @kernel32.ExitProcess(%code)
+  unreachable
+}
+
+func @rt.sys_write(%stream: i64, %p: i64, %n: i64) {
+entry:
+  %two = iconst 2
+  %is_err = icmp eq %stream, %two
+  br %is_err, stderr, stdout
+stderr:
+  %err_slot = addr @rt.stderr
+  %err = load i64 %err_slot, 0
+  jmp write(%err)
+stdout:
+  %out_slot = addr @rt.stdout
+  %out = load i64 %out_slot, 0
+  jmp write(%out)
+write(%h: i64):
+  %written = addr @rt.written
+  %zero = iconst 0
+  %ok = call i64 @kernel32.WriteFile(%h, %p, %n, %written, %zero)
+  ret
+}
+
+func @rt.sys_alloc(%size: i64) -> i64 {
+entry:
+  %null = iconst 0
+  %mem_commit_reserve = iconst 12288
+  %page_readwrite = iconst 4
+  %mem = call i64 @kernel32.VirtualAlloc(%null, %size, %mem_commit_reserve, %page_readwrite)
+  ret %mem
+}
+
+; VirtualFree releases a whole VirtualAlloc region: the size must be 0.
+func @rt.sys_free(%p: i64, %size: i64) {
+entry:
+  %zero = iconst 0
+  %mem_release = iconst 32768
+  %ok = call i64 @kernel32.VirtualFree(%p, %zero, %mem_release)
+  ret
+}

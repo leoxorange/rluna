@@ -8,11 +8,11 @@ count n = check n:
 else -> 1 + count (n - 1)
 
 main =
-    echo describe 1
-    echo describe 1.0
-    echo describe "s"
-    echo describe 1 2
-    echo count 100
-    echo 3 != 4
-    echo 2.0 == 2
-    echo true == false
+    echo (describe 1)
+    echo (describe 1.0)
+    echo (describe "s")
+    echo (describe 1 2)
+    echo (count 100)
+    echo (3 != 4)
+    echo (2.0 == 2)
+    echo (true == false)

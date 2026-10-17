@@ -5,6 +5,18 @@
 //! arguments, then global definitions; failing all three is a
 //! `SymbolNotFoundError`. Overloads are grouped by name; picking a specific
 //! overload by argument types is left to type checking.
+//!
+//! What is HIR? A "high-level IR": the same tree shape as the AST, but every
+//! name has been replaced by what it refers to. `x` becomes `Param(0)` or
+//! `Local(3)`, and a call names a function group. Strings are replaced by
+//! numbers because comparing numbers is cheaper and unambiguous: two
+//! different locals can both be called `x` (shadowing) yet get different
+//! ids, so later stages cannot confuse them.
+//!
+//! Why resolve names before type checking? Scoping rules (shadowing, which
+//! `b` is meant) are a separate concern from types. Handling them in one
+//! place keeps the type checker simpler, and means "unknown name" errors
+//! are reported before any confusing type errors they would cause.
 
 use std::collections::HashMap;
 
@@ -75,12 +87,20 @@ pub enum HExprKind {
     },
 }
 
+/// Resolution runs in two passes. Pass 1 collects every definition, so that
+/// pass 2 can resolve calls to functions defined *later* in the file (and
+/// recursive calls). A single top-to-bottom pass could not resolve
+/// `summon` calling `sum` if `sum` came after it.
+///
+/// Errors are collected rather than returned at the first one, so the user
+/// sees every unknown name at once instead of fixing them one per compile.
 pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Diagnostic>> {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
-    // Collect signatures; a later definition with the same name, arity and
-    // parameter types replaces the earlier one.
+    // Pass 1. Collect signatures; a later definition with the same name,
+    // arity and parameter types replaces the earlier one (this is how the
+    // readme's `foo = ...` then `foo = ...` redefinition works).
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     let mut live: Vec<Option<&ast::Def>> = Vec::new();
     for def in &program.defs {
@@ -105,7 +125,8 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
         live.push(Some(def));
     }
 
-    // Renumber the surviving definitions densely.
+    // Renumber the surviving definitions densely, so a `FuncId` can index
+    // straight into `funcs` with no gaps left by replaced definitions.
     let mut ids = vec![usize::MAX; live.len()];
     let mut defs = Vec::new();
     for (i, d) in live.iter().enumerate() {
@@ -119,6 +140,9 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
         .map(|(k, v)| (k, v.into_iter().map(|i| ids[i]).collect()))
         .collect();
 
+    // Which argument counts each name accepts. A call with a count no
+    // overload takes is an error that can be reported now, before types
+    // are known.
     let mut arities: HashMap<&str, Vec<usize>> = HashMap::new();
     for def in &defs {
         arities
@@ -130,6 +154,7 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
         a.sort();
     }
 
+    // Pass 2: resolve every name inside every body.
     let mut funcs = Vec::new();
     for def in &defs {
         let mut r = Resolver {
@@ -182,6 +207,7 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
                 } else {
                     Some(span)
                 },
+                notes: Vec::new(),
             });
             usize::MAX
         }
@@ -209,11 +235,17 @@ fn param_types(def: &ast::Def) -> Vec<Ty> {
     }
 }
 
+/// Resolves the names in one function body.
 struct Resolver<'a> {
     def: &'a ast::Def,
     arities: &'a HashMap<&'a str, Vec<usize>>,
-    /// Visible locals, innermost (most recent) last.
+    /// Visible locals, innermost (most recent) last. This stack is the
+    /// "symbol table" of the classic textbook: searching it from the end
+    /// finds the most recent binding first, which is exactly what shadowing
+    /// means (`x = x * 2` makes a new `x` that hides the old one).
     locals: Vec<(String, LocalId)>,
+    /// Name of each local by id. Every `x = ...` gets a fresh id even if the
+    /// name repeats, so the generated IR can give each one its own storage.
     local_names: Vec<String>,
 }
 
@@ -221,7 +253,8 @@ impl<'a> Resolver<'a> {
     fn stmt(&mut self, stmt: &Stmt) -> Result<HStmt, Diagnostic> {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                // The value is resolved before the new binding is visible.
+                // The value is resolved before the new binding is visible,
+                // so in `x = x * 2` the right-hand `x` is the *old* x.
                 let value = self.expr(value)?;
                 let id = self.local_names.len();
                 self.local_names.push(name.clone());
@@ -232,6 +265,9 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Look a name up from the innermost scope outward: locals, then
+    /// parameters. Globals are checked by the caller, last. That order is
+    /// the "name shadow" rule from the readme.
     fn lookup_value(&self, name: &str) -> Option<HExprKind> {
         if let Some((_, id)) = self.locals.iter().rev().find(|(n, _)| n == name) {
             return Some(HExprKind::Local(*id));
@@ -272,6 +308,10 @@ impl<'a> Resolver<'a> {
             ExprKind::Float(v) => HExprKind::Float(*v),
             ExprKind::Str(s) => HExprKind::Str(s.clone()),
             ExprKind::Bool(b) => HExprKind::Bool(*b),
+            // A bare name that is not a local or parameter must be a global.
+            // Globals are functions, so `foo` is a call with no arguments.
+            // This is how the readme's "sum = 1 is a function that always
+            // returns 1" works.
             ExprKind::Name(name) => match self.lookup_value(name) {
                 Some(k) => k,
                 None => {

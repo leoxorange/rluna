@@ -10,6 +10,30 @@
 //! contained in the declared parameter type is either a compile-time error
 //! (no overlap) or gets a runtime check (partial overlap, e.g. passing an
 //! `any` to a `numeric` parameter).
+//!
+//! Why specialize? Luna functions usually have no type annotations, so
+//! `sum a b = a + b` could receive ints, floats or strings. One machine-code
+//! version that works for everything would have to check types and box
+//! values on every `+`. Instead, the compiler makes a separate copy per
+//! combination of argument types actually used. `sum 1 2` gets an int-only
+//! copy that compiles to a single add instruction; `sum 1.5 2` gets a float
+//! copy. This is called *monomorphization*; C++ templates and Rust generics
+//! do the same.
+//!
+//! Example of the fixpoint, for `count n = check n: 0 -> 0; else -> 1 + count (n - 1)`:
+//!
+//! - round 1: `count(int)` returns `never` so far, so `1 + count(...)` is
+//!   `never` and the check's type is `int ∪ never = int`;
+//! - round 2: now `count(int)` returns `int`, so `1 + count(...)` is `int`,
+//!   and the result is still `int`. Nothing changed, so we stop.
+//!
+//! Types only ever grow (union) and there are finitely many, so the loop
+//! always ends.
+//!
+//! The output, TIR ("typed IR"), is the HIR tree with a type on every node,
+//! every call pointing at a concrete instance, and explicit `Convert` nodes
+//! wherever a value must change representation. Lowering then never has to
+//! make a type decision itself.
 
 use std::collections::HashMap;
 
@@ -38,6 +62,9 @@ pub struct TFunc {
     pub discard: bool,
     pub body: Vec<TStmt>,
     pub local_tys: Vec<Ty>,
+    /// Source names, for error messages.
+    pub param_names: Vec<String>,
+    pub local_names: Vec<String>,
 }
 
 impl TFunc {
@@ -73,6 +100,9 @@ pub enum TExprKind {
         args: Vec<TExpr>,
     },
     /// Evaluate the expressions, at least one of which never returns.
+    /// For example, a call whose argument is an infinite recursion: the
+    /// arguments still run (for their side effects), but the call itself
+    /// is never reached, so no instance is created for it.
     Diverge(Vec<TExpr>),
     /// Arithmetic or comparison. Operands may be unions; the result type is
     /// `ty`. Operand kind pairs that are invalid fail at runtime.
@@ -92,13 +122,29 @@ pub enum TExprKind {
     },
     /// Change representation from the inner expression's type to `ty`.
     /// If `ty` does not contain the inner type, this is a runtime type check.
+    ///
+    /// Types decide representation (see `types.rs`): an `int` is a raw
+    /// number but an `int|string` is a pointer to a tagged box. Whenever a
+    /// value flows from one type to another (an int arm of a `check` whose
+    /// result is `int|string`, say), the machine code must box or unbox it.
+    /// Making that an explicit node keeps lowering simple.
     Convert(Box<TExpr>),
 }
 
 /// Result type of applying an operator to two concrete kinds, if valid.
+///
+/// This table is the single source of truth for Luna's operator rules. The
+/// type checker uses it to compute static types, and lowering uses it to
+/// generate the runtime dispatch for union operands, so the two cannot
+/// disagree.
 pub fn binop_result(op: BinOp, a: Kind, b: Kind) -> Option<Kind> {
     use Kind::*;
     let numeric = |k: Kind| matches!(k, Int | Float);
+    // `void` marks code that produces nothing; there is nothing to compute
+    // with, not even to compare.
+    if a == Void || b == Void {
+        return None;
+    }
     match op {
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (a, b) {
             (Int, Int) if op != BinOp::Div => Some(Int),
@@ -129,8 +175,15 @@ pub fn check(hir: &Hir) -> Result<Tir, Vec<Diagnostic>> {
         instances: Vec::new(),
         map: HashMap::new(),
     };
+    // Start from `main`: only code reachable from it is compiled. Calls found
+    // while checking a body create new instances, which this same loop then
+    // checks too (the `while` re-reads `instances.len()`).
     let entry = tc.instantiate(hir.main, Vec::new());
 
+    // The fixpoint loop: re-check every instance until no return type grows.
+    // Each round uses the return types found by the previous one. Errors are
+    // only reported once types are stable, because an error seen in an early
+    // round may disappear once a callee's return type is known.
     loop {
         let mut changed = false;
         let mut errors = Vec::new();
@@ -176,6 +229,9 @@ pub fn check(hir: &Hir) -> Result<Tir, Vec<Diagnostic>> {
 struct Checker<'a> {
     hir: &'a Hir,
     instances: Vec<Instance>,
+    /// (function, argument types) -> instance. Memoizing here is what makes
+    /// recursion work: `count` calling `count(int)` finds the instance that
+    /// is already being checked, instead of creating copies forever.
     map: HashMap<(FuncId, Vec<Ty>), InstId>,
 }
 
@@ -210,6 +266,9 @@ impl<'a> Checker<'a> {
         self.instances.push(Instance {
             func,
             params: key.1.clone(),
+            // Start at the bottom of the lattice: "returns nothing yet".
+            // A recursive call seen before the body is understood
+            // contributes nothing, and the fixpoint loop fills in the truth.
             ret: Ty::NEVER,
             body: Vec::new(),
             local_tys: Vec::new(),
@@ -266,6 +325,11 @@ impl<'a> Checker<'a> {
     }
 
     /// Convert `e` to `e.ty ∩ target`, inserting a runtime check if needed.
+    ///
+    /// Three cases: the value certainly fits (no code needed), certainly
+    /// cannot fit (compile-time error), or might fit (runtime check). This is
+    /// *gradual typing*: annotations are checked statically where possible
+    /// and dynamically where the compiler cannot know.
     fn narrow(
         &self,
         e: TExpr,
@@ -295,9 +359,16 @@ impl<'a> Checker<'a> {
             HExprKind::Binary { op, lhs, rhs } => {
                 let lhs = self.expr(cx, lhs)?;
                 let rhs = self.expr(cx, rhs)?;
+                // If either side never produces a value, neither does the
+                // operation. Without this rule, round 1 of the fixpoint would
+                // report false "cannot add never and int" errors.
                 let ty = if lhs.ty.is_never() || rhs.ty.is_never() {
                     Ty::NEVER
                 } else {
+                    // Try every pair of possible kinds and collect the
+                    // results. `int|float + int` gives `int ∪ float`. It is
+                    // an error only if *no* pair is valid; pairs that are
+                    // invalid but possible become runtime errors instead.
                     let mut ty = Ty::NEVER;
                     for a in lhs.ty.kinds() {
                         for b in rhs.ty.kinds() {
@@ -376,6 +447,11 @@ impl<'a> Checker<'a> {
                         Some(e)
                     }
                     None => {
+                        // Exhaustiveness check: without `else`, some value
+                        // could match no arm and the `check` would have no
+                        // result. Only booleans can be covered completely
+                        // (by both `true` and `false`), since there are
+                        // infinitely many ints and strings.
                         let exhaustive =
                             scrutinee.ty.is_subset(Ty::BOOL) && seen_true && seen_false;
                         if !exhaustive {
@@ -390,6 +466,23 @@ impl<'a> Checker<'a> {
                         None
                     }
                 };
+                // `void` never mixes with other types: either every arm
+                // gives void (the `check` only does something) or none does
+                // (it computes a value). So no value can be "maybe void",
+                // and void never needs a box: there is only ever the one
+                // void, which is not stored anywhere.
+                if ty.is_union() && ty.contains(Kind::Void) {
+                    return Err(err(
+                        span,
+                        format!(
+                            "the arms of this `check` give {ty}, but void cannot be mixed with other types: every arm must give void, or none"
+                        ),
+                    ));
+                }
+                // All arms must produce the same representation, because
+                // after the `check` the code continues from one place with
+                // one result. Arms whose type is narrower than the union get
+                // converted (boxed).
                 let tarms = tarms
                     .into_iter()
                     .map(|(p, b)| (p, convert(b, ty)))
@@ -427,6 +520,14 @@ impl<'a> Checker<'a> {
                 span,
             });
         }
+        // Overload resolution, in three steps:
+        //   1. candidates: overloads taking this many arguments;
+        //   2. full matches: every argument type fits the parameter type;
+        //      the most specific one wins, so `describe x :: int` beats an
+        //      unannotated `describe x` (`any`) for an int argument;
+        //   3. otherwise partial matches: arguments that *might* fit. Exactly
+        //      one is needed, because choosing between several would require
+        //      looking at the value at run time.
         let hir = self.hir;
         let candidates: Vec<FuncId> = hir.groups[name]
             .iter()
@@ -514,6 +615,10 @@ impl<'a> Checker<'a> {
             }
         };
 
+        // Narrow each argument to what the parameter accepts (a runtime
+        // check where needed), then instantiate the callee for exactly
+        // those types. Its current return type may still be `never` if it
+        // is recursive; the fixpoint loop will come back to this call.
         let param_tys = hir.funcs[chosen].param_tys.clone();
         let args: Vec<TExpr> = args
             .into_iter()
@@ -533,6 +638,13 @@ impl<'a> Checker<'a> {
     }
 
     /// Keep only instances reachable from the entry and assign symbols.
+    ///
+    /// Early fixpoint rounds can create instances that the final types no
+    /// longer call. A breadth-first walk of the call graph from `main` finds
+    /// the live ones; the rest are dropped (dead code elimination at the
+    /// function level). Each instance gets a unique symbol, because
+    /// `sum(int, int)` and `sum(float, int)` become two machine-code
+    /// functions and the linker needs a distinct name for each.
     fn finish(mut self, entry: InstId) -> Tir {
         let mut order = vec![entry];
         let mut index: HashMap<InstId, usize> = HashMap::from([(entry, 0)]);
@@ -587,6 +699,8 @@ impl<'a> Checker<'a> {
                 discard: func.ret == Some(Ty::VOID),
                 body,
                 local_tys: std::mem::take(&mut inst.local_tys),
+                param_names: func.params.clone(),
+                local_names: func.local_names.clone(),
             });
         }
         Tir { funcs, entry: 0 }

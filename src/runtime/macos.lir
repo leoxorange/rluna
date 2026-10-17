@@ -1,0 +1,75 @@
+; Luna runtime: operating system layer for macOS.
+;
+; All OS access goes through libSystem.dylib, the only library a macOS
+; program may make system calls through. See core.lir for the interface
+; this file provides.
+;
+; Why not make system calls directly, as Linux programs can? Apple does
+; not keep the kernel's system call numbers stable between macOS versions;
+; only libSystem's functions (write, exit, mmap, ...) are a stable
+; interface. So even this tiny runtime is dynamically linked.
+;
+; The functions are called with i64 arguments even where C declares an
+; int: the arm64 convention passes each argument in a full 64-bit
+; register, and the callee simply reads the low 32 bits.
+
+extern @libSystem.write(i64, i64, i64) -> i64
+extern @libSystem.exit(i64)
+extern @libSystem.mmap(i64, i64, i64, i64, i64, i64) -> i64
+extern @libSystem.munmap(i64, i64) -> i64
+
+; dyld calls this as `main`; the arguments are ignored.
+func @rt.start() {
+entry:
+  call void @luna.main()
+  %zero = iconst 0
+  call void @rt.exit(%zero)
+  unreachable
+}
+
+func @rt.sys_exit(%code: i64) {
+entry:
+  call void @libSystem.exit(%code)
+  unreachable
+}
+
+; write(2) may write less than asked (e.g. to a pipe), so loop until done.
+func @rt.sys_write(%stream: i64, %p: i64, %n: i64) {
+entry:
+  %zero = iconst 0
+  jmp loop(%p, %n)
+loop(%at: i64, %left: i64):
+  %more = icmp sgt %left, %zero
+  br %more, write, done
+write:
+  %written = call i64 @libSystem.write(%stream, %at, %left)
+  %failed = icmp sle %written, %zero
+  br %failed, done, advance
+advance:
+  %next = iadd %at, %written
+  %rest = isub %left, %written
+  jmp loop(%next, %rest)
+done:
+  ret
+}
+
+func @rt.sys_alloc(%size: i64) -> i64 {
+entry:
+  %null = iconst 0
+  %prot_read_write = iconst 3
+  %map_private_anon = iconst 4098
+  %no_fd = iconst -1
+  %mem = call i64 @libSystem.mmap(%null, %size, %prot_read_write, %map_private_anon, %no_fd, %null)
+  %map_failed = icmp eq %mem, %no_fd
+  br %map_failed, failed, mapped
+failed:
+  ret %null
+mapped:
+  ret %mem
+}
+
+func @rt.sys_free(%p: i64, %size: i64) {
+entry:
+  %ok = call i64 @libSystem.munmap(%p, %size)
+  ret
+}

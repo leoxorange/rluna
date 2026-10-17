@@ -1,0 +1,101 @@
+; Tests of the runtime allocator (@rt.alloc / @rt.free in core.lir).
+; Each check prints one line; see allocator.out.
+
+data @literal = { i64 -1, i64 2, bytes "ok" }
+
+; print 1 if a == b, else 0
+func @same(%a: i64, %b: i64) {
+entry:
+  %eq = icmp eq %a, %b
+  call void @rt.print_int(%eq)
+  call void @rt.print_newline()
+  ret
+}
+
+func @header(%p: i64) {
+entry:
+  %h = load i64 %p, -8
+  call void @rt.print_int(%h)
+  call void @rt.print_newline()
+  ret
+}
+
+func @luna.main() {
+entry:
+  %zero = iconst 0
+  %one = iconst 1
+
+  ; a freed block is handed out again for the next request of its class
+  %n24 = iconst 24
+  %a = call i64 @rt.alloc(%n24)
+  call void @rt.free(%a)
+  %b = call i64 @rt.alloc(%n24)
+  call void @same(%a, %b)
+
+  ; free lists are last-in, first-out
+  %n10 = iconst 10
+  %x = call i64 @rt.alloc(%n10)
+  %y = call i64 @rt.alloc(%n10)
+  call void @rt.free(%x)
+  call void @rt.free(%y)
+  %z = call i64 @rt.alloc(%n10)
+  %w = call i64 @rt.alloc(%n10)
+  call void @same(%z, %y)
+  call void @same(%w, %x)
+
+  ; size class boundaries: 8 bytes fit a 16-byte block (class 0), 9 do not;
+  ; 2040 is the largest small size (class 7); 2041 is large (total size)
+  %n8 = iconst 8
+  %c0 = call i64 @rt.alloc(%n8)
+  call void @header(%c0)
+  %n9 = iconst 9
+  %c1 = call i64 @rt.alloc(%n9)
+  call void @header(%c1)
+  %n2040 = iconst 2040
+  %c7 = call i64 @rt.alloc(%n2040)
+  call void @header(%c7)
+  %n2041 = iconst 2041
+  %big = call i64 @rt.alloc(%n2041)
+  call void @header(%big)
+  call void @rt.free(%big)
+
+  ; a large block is usable to its last byte and can be freed
+  %n100k = iconst 100000
+  %l = call i64 @rt.alloc(%n100k)
+  %v = iconst 42
+  store i64 %l, 99992, %v
+  %back = load i64 %l, 99992
+  call void @rt.print_int(%back)
+  call void @rt.print_newline()
+  call void @rt.free(%l)
+
+  ; allocating and freeing in a loop reuses one block: no growth
+  %n1000 = iconst 1000
+  %first = call i64 @rt.alloc(%n1000)
+  call void @rt.free(%first)
+  %rounds = iconst 200000
+  jmp loop(%zero, %zero)
+loop(%i: i64, %moved: i64):
+  %more = icmp slt %i, %rounds
+  br %more, body, done
+body:
+  %p = call i64 @rt.alloc(%n1000)
+  store i64 %p, 992, %i
+  call void @rt.free(%p)
+  %differs = icmp ne %p, %first
+  %moved_next = iadd %moved, %differs
+  %i_next = iadd %i, %one
+  jmp loop(%i_next, %moved_next)
+done:
+  call void @rt.print_int(%moved)
+  call void @rt.print_newline()
+
+  ; freeing an immortal object does nothing
+  %lit_header = addr @literal
+  %eight = iconst 8
+  %lit = iadd %lit_header, %eight
+  call void @rt.free(%lit)
+  call void @rt.print_str(%lit)
+  call void @rt.print_newline()
+  ret
+}

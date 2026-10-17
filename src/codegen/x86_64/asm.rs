@@ -3,8 +3,22 @@
 //! Only the instructions the code generator needs are supported. Every
 //! emitted instruction is also recorded as text so `--emit=asm` can produce
 //! a readable listing.
+//!
+//! x86 encodings are variable length and layered from decades of extensions:
+//!
+//! ```text
+//!   [prefix] [REX] opcode [ModRM] [SIB] [displacement] [immediate]
+//! ```
+//!
+//! - REX (0x40-0x4F) is the 64-bit extension byte: W = 64-bit operand
+//!   size, and R/X/B supply the 4th bit of register numbers so r8-r15
+//!   can be named.
+//! - ModRM says which registers or memory form the operands.
+//! - SIB is needed for some addressing forms (see `modrm_mem`).
+//!
+//! The unit tests at the bottom check the encodings byte for byte.
 
-use std::fmt::Write;
+use crate::codegen::{Reloc, RelocKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reg(pub u8);
@@ -92,14 +106,6 @@ impl Cond {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Label(pub usize);
 
-/// A 32-bit PC-relative reference to a symbol, resolved by the linker:
-/// the field at `offset` receives `target - (address of field + 4)`.
-#[derive(Debug, Clone)]
-pub struct Reloc {
-    pub offset: usize,
-    pub symbol: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Alu {
     Add = 0x03,
@@ -163,6 +169,10 @@ impl Asm {
         self.code.extend_from_slice(&v.to_le_bytes());
     }
 
+    /// Emit a REX prefix if needed. A REX with no bits set (0x40) is
+    /// normally omitted, but `force` keeps it for byte registers: with any
+    /// REX, byte register 4-7 means spl/bpl/sil/dil; without one, it means
+    /// the legacy ah/ch/dh/bh.
     fn rex(&mut self, w: bool, r: u8, x: u8, b: u8, force: bool) {
         let rex = 0x40 | ((w as u8) << 3) | (r << 2) | (x << 1) | b;
         if rex != 0x40 || force {
@@ -171,6 +181,10 @@ impl Asm {
     }
 
     /// ModRM (+SIB) for `[base + disp32]` with the given reg field.
+    ///
+    /// Always uses a 32-bit displacement (mod = 10) for simplicity, even
+    /// where one byte would do. rsp/r12 as a base needs a SIB byte, because
+    /// that ModRM value was repurposed to mean "a SIB byte follows".
     fn modrm_mem(&mut self, reg: u8, base: Reg, disp: i32) {
         self.byte(0x80 | ((reg & 7) << 3) | base.low());
         if base.low() == 4 {
@@ -287,6 +301,7 @@ impl Asm {
         self.relocs.push(Reloc {
             offset: self.code.len(),
             symbol: symbol.to_string(),
+            kind: RelocKind::Rel32,
         });
         self.i32(0);
         self.note(s, format!("lea {}, [rip + {symbol}]", dst.name()));
@@ -513,6 +528,7 @@ impl Asm {
         self.relocs.push(Reloc {
             offset: self.code.len(),
             symbol: symbol.to_string(),
+            kind: RelocKind::Rel32,
         });
         self.i32(0);
         self.note(s, format!("call {symbol}"));
@@ -526,6 +542,7 @@ impl Asm {
         self.relocs.push(Reloc {
             offset: self.code.len(),
             symbol: slot_symbol.to_string(),
+            kind: RelocKind::Rel32,
         });
         self.i32(0);
         self.note(s, format!("call [rip + {slot_symbol}]"));
@@ -564,35 +581,6 @@ impl Asm {
         self.byte(0x0F);
         self.byte(0x0B);
         self.note(s, "ud2".into());
-    }
-
-    /// Render the listing with addresses relative to `base`.
-    pub fn render_listing(&self, base: u64) -> String {
-        let mut out = String::new();
-        let mut entries = self.listing.iter().peekable();
-        while let Some((off, text)) = entries.next() {
-            if text.starts_with(".L") || text.starts_with(';') {
-                writeln!(out, "{text}").unwrap();
-                continue;
-            }
-            let end = entries
-                .clone()
-                .find(|(_, t)| !t.starts_with(".L") && !t.starts_with(';'))
-                .map(|(o, _)| *o)
-                .unwrap_or(self.code.len());
-            let bytes: Vec<String> = self.code[*off..end]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            writeln!(
-                out,
-                "  {:08x}:  {:<30} {text}",
-                base + *off as u64,
-                bytes.join(" ")
-            )
-            .unwrap();
-        }
-        out
     }
 }
 

@@ -1,4 +1,14 @@
 //! Structural and type checks for LIR modules.
+//!
+//! The verifier is a safety net between the stages. A bug in lowering, or a
+//! typo in a hand-written `.lir` file such as the runtime, would otherwise
+//! become wrong machine code that crashes mysteriously at run time. The
+//! verifier turns it into a clear compile-time message naming the
+//! function, the value and the rule broken. LLVM and Cranelift do the same.
+//!
+//! It also lets the backends trust their input: code generation assumes
+//! every operand has the right type and every block ends in a terminator,
+//! without checking again.
 
 use std::collections::{HashMap, HashSet};
 
@@ -59,6 +69,8 @@ fn verify_function(
         return Err("entry block parameters do not match the signature".into());
     }
 
+    // The "single assignment" in SSA: each value may be defined only once,
+    // by a block parameter or an instruction result.
     let mut defined = vec![false; f.values.len()];
     for b in &f.blocks {
         for &p in &b.params {
@@ -80,6 +92,9 @@ fn verify_function(
             .blocks
             .get(target.0 as usize)
             .ok_or("branch to unknown block")?;
+        // The entry block's parameters are the function's arguments, which
+        // arrive in calling-convention registers. Jumping back to it would
+        // need a second way to set them; loops use a separate block.
         if target.0 == 0 {
             return Err("cannot branch to the entry block".into());
         }
