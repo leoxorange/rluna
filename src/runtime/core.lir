@@ -14,8 +14,10 @@
 ;   string: { len: i64, bytes[len] }
 ;           Storing the length up front (instead of ending with a 0 byte
 ;           like C) makes length O(1) and lets strings contain any byte.
-;   box:    { tag: i64, payload: i64 }   tags: 1 int, 2 float, 3 string, 4 boolean, 5 void, 6 array
+;   box:    { tag: i64, payload: i64 }   tags: 1 int, 2 float, 3 string, 4 boolean, 5 void, 6 array, 7 record
 ;   array:  { len: i64, elements[len] }  8 bytes per element
+;   record: { fields... }                8 bytes per field, in the order the
+;           trail lists them (the compiler knows which trail it is)
 ;
 ; Objects that may be freed sit right after an allocator header (see
 ; @rt.alloc); string literals have an immortal header so they can be
@@ -37,6 +39,10 @@ data @rt.void_box = { i64 -1, i64 5, i64 0 }
 ; stdio does it. Anything printed to stderr flushes stdout first, so the
 ; two streams still appear in the right order.
 data @rt.outbuf = { i64 0, zero 4096 }
+; While a value is printed into a string (`x.textualize`), output goes to
+; that string instead: { the string being built (0 when printing to the
+; terminal), its capacity in bytes }.
+data @rt.capture = { i64 0, i64 0 }
 
 data @rt.s_true = { i64 4, bytes "true" }
 data @rt.s_false = { i64 5, bytes "false" }
@@ -53,12 +59,13 @@ data @rt.s_type_found = { i64 8, bytes ", found " }
 data @rt.s_op_prefix = { i64 21, bytes "TypeError: operator `" }
 data @rt.s_op_middle = { i64 23, bytes "` cannot be applied to " }
 data @rt.s_and = { i64 5, bytes " and " }
-data @rt.s_int = { i64 3, bytes "int" }
-data @rt.s_float = { i64 5, bytes "float" }
-data @rt.s_string = { i64 6, bytes "string" }
-data @rt.s_boolean = { i64 7, bytes "boolean" }
+data @rt.s_int = { i64 3, bytes "Int" }
+data @rt.s_float = { i64 5, bytes "Float" }
+data @rt.s_string = { i64 6, bytes "String" }
+data @rt.s_boolean = { i64 7, bytes "Boolean" }
 data @rt.s_unknown = { i64 7, bytes "unknown" }
-data @rt.s_array = { i64 5, bytes "array" }
+data @rt.s_array = { i64 5, bytes "Array" }
+data @rt.s_trail = { i64 5, bytes "trail" }
 data @rt.s_no_match = { i64 29, bytes "TypeError: no definition of `" }
 data @rt.s_no_match_end = { i64 25, bytes "` accepts these arguments" }
 
@@ -312,9 +319,20 @@ entry:
   ret
 }
 
-; Append n bytes at p to the stdout buffer.
+; Append n bytes at p to the stdout buffer, unless @rt.out_hook takes them:
+; the compiler writes that function for each program, and it sends output
+; to the string being built (@rt.capture_out) in a program that prints
+; values into strings (`x.textualize`), and returns 0 in any other, so that
+; programs without it do not carry the capture code.
 func @rt.out(%p: i64, %n: i64) {
 entry:
+  %taken = call i64 @rt.out_hook(%p, %n)
+  %none = iconst 0
+  %was_taken = icmp ne %taken, %none
+  br %was_taken, captured, terminal
+captured:
+  ret
+terminal:
   %cap = iconst 4096
   %buf = addr @rt.outbuf
   %eight = iconst 8
@@ -341,6 +359,75 @@ copy:
   %new_len = iadd %cur, %n
   store i64 %buf, 0, %new_len
   ret
+}
+
+; Append n bytes at p to the string being built, doubling its room when
+; they do not fit.
+func @rt.capture_out(%p: i64, %n: i64) {
+entry:
+  %capture = addr @rt.capture
+  %s = load i64 %capture, 0
+  %room = load i64 %capture, 8
+  %len = load i64 %s, 0
+  %end = iadd %len, %n
+  %fits = icmp sle %end, %room
+  br %fits, append(%s), grow(%room)
+grow(%r: i64):
+  %two = iconst 2
+  %doubled = imul %r, %two
+  %enough = icmp sge %doubled, %end
+  br %enough, regrow(%doubled), grow(%doubled)
+regrow(%new_room: i64):
+  %eight = iconst 8
+  %size = iadd %new_room, %eight
+  %t = call i64 @rt.alloc(%size)
+  store i64 %t, 0, %len
+  %dst = iadd %t, %eight
+  %src = iadd %s, %eight
+  call void @rt.memcpy(%dst, %src, %len)
+  call void @rt.free(%s)
+  store i64 %capture, 0, %t
+  store i64 %capture, 8, %new_room
+  jmp append(%t)
+append(%b: i64):
+  %eight2 = iconst 8
+  %bytes = iadd %b, %eight2
+  %at = iadd %bytes, %len
+  call void @rt.memcpy(%at, %p, %n)
+  store i64 %b, 0, %end
+  ret
+}
+
+; Start printing into a new string. What was being built before (if
+; anything) is saved in the 16 bytes at %save, for @rt.capture_end.
+func @rt.capture_begin(%save: i64) {
+entry:
+  %capture = addr @rt.capture
+  %old = load i64 %capture, 0
+  %old_room = load i64 %capture, 8
+  store i64 %save, 0, %old
+  store i64 %save, 8, %old_room
+  %size = iconst 64
+  %s = call i64 @rt.alloc(%size)
+  %zero = iconst 0
+  store i64 %s, 0, %zero
+  %room = iconst 56
+  store i64 %capture, 0, %s
+  store i64 %capture, 8, %room
+  ret
+}
+
+; Stop printing into the string, which the caller now owns, and go back to
+; what was saved at %save.
+func @rt.capture_end(%save: i64) -> i64 {
+entry:
+  %capture = addr @rt.capture
+  %s = load i64 %capture, 0
+  %old = load i64 %save, 0
+  %old_room = load i64 %save, 8
+  store i64 %capture, 0, %old
+  store i64 %capture, 8, %old_room
+  ret %s
 }
 
 func @rt.out_byte(%c: i64) {
@@ -1064,7 +1151,15 @@ not_bool:
 not_void:
   %t6 = iconst 6
   %is_array = icmp eq %tag, %t6
-  br %is_array, array, unknown
+  br %is_array, array, not_array
+not_array:
+  %t7 = iconst 7
+  %is_trail = icmp eq %tag, %t7
+  br %is_trail, trail, unknown
+trail:
+  %s_trail = addr @rt.s_trail
+  call void @rt.err_str(%s_trail)
+  ret
 array:
   %s_array = addr @rt.s_array
   call void @rt.err_str(%s_array)

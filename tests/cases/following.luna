@@ -1,0 +1,55 @@
+# Following trails: a trail gets the fields of the trails it follows, and a
+# field it declares again replaces the inherited default. Following Show
+# means having a `textualize`, which `echo` prints. A parameter (or result)
+# declared with a trail takes values of any trail that follows it, and
+# `:: Show` anything that can be printed.
+
+trail Fruit follow Show:
+    name :: String
+    peel :: Boolean = false
+    textualize = copy name
+
+trail Apple follow Fruit:
+    color :: String = "red"
+    textualize = color + " " + name
+
+trail Warehouse follow Show:
+    rack :: [Fruit]
+    textualize = "count:[" + rack.textualize + "]"
+
+# a default may use any other field, also one below it
+trail Size:
+    label = "size " + n.textualize
+    n :: Int
+
+describe @f :: Fruit -> String = "a fruit called " + f.name
+show_it @any :: Show -> String = "<" + any.textualize + ">"
+
+buy money :: Int -> Fruit = check money > 5:
+    true -> {name = "pineapple", peel = true};
+    false -> {name = "grape"}
+
+pick_apple n :: Int -> Fruit = Apple {name = "gala", color = "green"}
+
+main =
+    echo buy 6
+    a = Apple {name = "fuji"}
+    echo a
+    echo a.peel
+    echo (describe a)
+    echo (describe (buy 1))
+    w = Warehouse {rack = [buy 1, buy 6]}
+    echo w
+    echo [buy 1, buy 6]
+    echo (show_it 5)
+    echo (show_it [1, 2])
+    echo (show_it a)
+    echo (show_it "text")
+    echo [1.5, 2.0].textualize
+    echo (head [3]).textualize
+    k = Warehouse {rack = [], textualize = "empty"}
+    echo k
+    echo (pick_apple 1)
+    echo (Size {n = 4}).label
+    loop f in [Apple {name = "a"}, Apple {name = "b", color = "blue"}]:
+        echo f

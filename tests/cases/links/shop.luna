@@ -1,0 +1,6 @@
+# Linked by `trails.luna`: a trail in a linked file.
+trail Item:
+    label :: String
+    price :: Float = 1.5
+
+cheap n = Item {label = n, price = 0.5}

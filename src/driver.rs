@@ -259,6 +259,7 @@ pub fn frontend_files(
     let names = file_names(&files, &library_names, &renames).map_err(|d| fail(&[d]))?;
     let mut program = ast::Program {
         links: Vec::new(),
+        trails: Vec::new(),
         defs: Vec::new(),
     };
     for (index, file) in files.iter().enumerate() {
@@ -268,8 +269,19 @@ pub fn frontend_files(
             def.file = index;
             program.defs.push(def);
         }
+        for trail in &file.program.trails {
+            let mut trail = trail.clone();
+            trail.name = file.global(index, &trail.name);
+            trail.file = index;
+            program.trails.push(trail);
+        }
     }
     program.defs.extend(library.defs);
+    for mut trail in library.trails {
+        trail.file = files.len();
+        trail.library = true;
+        program.trails.push(trail);
+    }
     let (hir, warnings) = hir::resolve_files(&program, &names).map_err(|ds| fail(&ds))?;
     // Warnings about the library are not the program's business.
     artifacts.warnings.extend(
@@ -282,6 +294,12 @@ pub fn frontend_files(
     // checking a program whose names do not resolve, and the later errors
     // would mostly be noise caused by the first one.
     let mut tir = typeck::check(&hir).map_err(|ds| fail(&ds))?;
+    artifacts.warnings.extend(
+        tir.warnings
+            .iter()
+            .filter(|w| w.span.is_none_or(|s| !sources.in_file(s, std_base)))
+            .map(|w| sources.render(w)),
+    );
     ownership::check(&tir).map_err(|ds| fail(&ds))?;
     consteval::fold_globals(&mut tir);
     let mut module = lower::lower(&tir);
@@ -299,12 +317,15 @@ fn file_names(
     library: &HashSet<String>,
     renames: &HashMap<String, String>,
 ) -> Result<Vec<hir::FileNames>, Diagnostic> {
+    // A file's definitions and trails share one set of names.
     let defined = |j: usize| -> HashMap<String, String> {
-        files[j]
-            .program
+        let program = &files[j].program;
+        program
             .defs
             .iter()
-            .map(|d| (d.name.clone(), files[j].global(j, &d.name)))
+            .map(|d| &d.name)
+            .chain(program.trails.iter().map(|t| &t.name))
+            .map(|n| (n.clone(), files[j].global(j, n)))
             .collect()
     };
     let mut tables = Vec::new();
@@ -372,8 +393,13 @@ fn file_names(
             }
         }
         if i > 0 {
-            for def in &files[0].program.defs {
-                let n = &def.name;
+            let main = &files[0].program;
+            let main_names = main
+                .defs
+                .iter()
+                .map(|d| &d.name)
+                .chain(main.trails.iter().map(|t| &t.name));
+            for n in main_names {
                 if table.names.contains_key(n) {
                     continue;
                 }
@@ -481,6 +507,10 @@ pub fn compile(input: Input, opts: &Options) -> Result<Artifacts, CompileError> 
             })?;
             if !module.funcs.iter().any(|f| f.name == RUNTIME_ENTRY) {
                 module.extend(runtime_module(opts.target));
+            }
+            // A hand-written program gets the plain `rt.out_hook`.
+            if !module.funcs.iter().any(|f| f.name == "rt.out_hook") {
+                module.funcs.push(lower::out_hook(false));
             }
             artifacts.ir = Some(lir::print::print_module(&module));
             module

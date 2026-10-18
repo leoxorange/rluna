@@ -194,6 +194,10 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
         | TExprKind::Convert(x)
         | TExprKind::Builtin(_, x) => substitute(x, consts),
         TExprKind::Array(items) => items.iter_mut().for_each(|i| substitute(i, consts)),
+        TExprKind::Construct { steps, .. } => {
+            steps.iter_mut().for_each(|(_, v)| substitute(v, consts))
+        }
+        TExprKind::Field(base, _) | TExprKind::Textualize(base) => substitute(base, consts),
         TExprKind::Ret(value) => value.iter_mut().for_each(|v| substitute(v, consts)),
         TExprKind::Range(a, b)
         | TExprKind::Concat(a, b)
@@ -355,6 +359,10 @@ impl Interp<'_> {
     fn expr(&mut self, e: &TExpr, frame: &mut Frame) -> Eval<Const> {
         self.fuel = self.fuel.checked_sub(1).ok_or(NotConstant)?;
         Ok(match &e.kind {
+            // Values of trails are made while the program runs.
+            TExprKind::Construct { .. } | TExprKind::Field(..) | TExprKind::Textualize(_) => {
+                return Err(NotConstant);
+            }
             TExprKind::Int(v) => Const::Int(*v),
             TExprKind::Float(v) => Const::Float(*v),
             TExprKind::Str(s) => Const::Str(s.clone()),

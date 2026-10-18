@@ -27,7 +27,7 @@ lunac hello.luna --emit=ast,ir,asm     # 同时输出语法树、中间表示（
 echo (5 > 6) # false
 echo (5 == 5) # true
 echo (4 < 10) # true
-foo :: boolean = 5 > 6 # foo 是 false
+foo :: Boolean = 5 > 6 # foo 是 false
 echo (7 / 2) # 3.5，`/` 的结果总是浮点数
 echo (7 * 2) # 14，整数与整数做 + - * 仍是整数
 echo (1 + 0.5) # 1.5，整数与浮点数运算得到浮点数
@@ -186,7 +186,7 @@ main =
 
 有了重载，函数定义还可以这样玩：
 ```
-test a :: numeric -> void = echo "winning"
+test a :: Numeric -> Void = echo "winning"
 test _ = echo "nothing left"
 ```
 这个函数有两个定义，所以 test 1 会输出 winning，而其他参数会得到 nothing left，这可以看作模式匹配。编译器从上到下为调用者寻找正确的定义，test _ 接住其余所有情况。
@@ -219,35 +219,122 @@ main = echo (first_negative [3, -1, 4]) # -1
 ```
 `ret` 不能在列表推导式里使用。
 
-### 类型定义
+### trail 定义
 
-目前有这些内置类型：
+trail 描述一类值：它包含什么，以及它能做什么。luna 没有其他的类型：从 `5` 到一个水果，每个值都由 trail 来描述。trail 的名字以大写字母开头，比如 `Fruit` 或 `Int`。这只是一种风格，用来把 trail 和其他名字区分开，并不是规则：`trail fruit` 也是正确的。
 
-- any（基础类型，其他所有类型都扩展自它）
-- iterable（字符串、数组或向量（以后加入））
-- array（所有数组类型）
-- numeric（所有数字，比如整数和浮点数）
-- int（整数）
-- float（浮点数）
-- string（字符序列）
-- boolean（true 和 false）
-- void（类似其他语言中的 null）
+目前有这些内置 trail：
+
+- Any（基础 trail，其他所有 trail 都隐式地遵循它）
+- Iterable（String、Array 或 Vector（以后加入））
+- Show（可打印，它包含一个 textualize 函数，echo 会调用这个函数来得到可打印的 String）
+- Compare（包含一个用于比较的 compare 函数）
+- Copy（`copy` 的通行证：只有 trail 遵循 Copy 的值才能用 `copy x` 复制）
+- Array（所有数组，它遵循 Iterable、Show）
+- Numeric（所有数字，比如整数和浮点数，它遵循 Show 和 Compare）
+- Int（整数）
+- Float（浮点数）
+- String（字符序列）
+- Boolean（true 和 false）
+- Void（类似其他语言中的 null）
+
+所有持有值的内置 trail 都遵循 Show 和 Copy，数字和字符串还遵循 Compare；数组在它的元素遵循这些 trail 时也遵循它们。这些 trail 是用 luna 写在标准库（`src/std.luna`）里的：每个 trail 要求什么（`trail Compare:` 要求 `compare @other :: Self -> Int`），以及内置的值遵循哪些 trail（`trail Int follow Numeric, Copy:`）。内置的值本身是机器值，由编译器给出它们的函数，所以整数和浮点数仍然可以混合运算：`1 + 0.5` 是 1.5，因为它们都是数字。
 
 ```
-sum a b :: numeric, numeric -> numeric = a + b + 5 # 正确
+sum a b :: Numeric, Numeric -> Numeric = a + b + 5 # 正确
 sum "hello" 5 # 错误，"hello" 不是数字
 ```
 
 任何函数的最后一行都被当作返回值，它的类型就是返回类型。你也可以用 ret 关键字提前返回。
 可以用下面的代码定义一个返回 void 的函数：
 ```
-foo _ :: any -> void = 5
+foo _ :: Any -> Void = 5
 ```
 虽然这里写了 5，但因为这个函数的返回类型是 void，所以什么也不会返回。离开这个函数时，5 会被丢弃。
 
+#### 创建你自己的 trail
+
+```
+# 内置的 trail Show，就像用 luna 写出来的样子（它是内置的，你不用自己写）
+trail Show:
+    textualize :: String # 没有默认值：每个遵循 Show 的 trail 都必须给出它
+
+trail Fruit follow Show:
+    name :: String # name 没有默认值，所以它是必需的：每个水果都必须给出 name
+    peel :: Boolean = false # peel 有默认值，所以可以省略
+    textualize = copy name
+
+# 或者你想要一个更具体的 trail
+trail Warehouse follow Show:
+    rack :: [Fruit]
+    textualize = "count:[" + rack.textualize + "]"
+    # 如果你不想在这里给出 textualize 的实现，可以省略，但这意味着创建 Warehouse 的地方必须给出它的实现。
+
+buy money :: Int -> Fruit = check true:
+    money < 5 -> {name = 1}; # 错误，name 必须是字符串
+    money == 5 -> {peel = true}; # 错误，缺少必需的字段
+    money > 5 -> {name = "pineapple", peel = true}; # 正确
+    else -> {name = "grape", money = 5} # 错误，不能添加多余的字段
+
+main = 
+    echo (buy 6).name
+    echo buy 6
+    t = buy 6
+    n = t.name # 错误，除非复制，否则不能把值从 trail 结构中移出来
+    n = copy t.name # 正确
+    o = Fruit {name = "orange"} # trail 的名字说明了它是什么
+```
+
+这定义了一个 trail Fruit，返回类型就是 Fruit。
+
+- **值。** `Fruit {name = "orange"}` 在任何地方都能创建一个 Fruit。单独的 `{...}` 只能用在它的 trail 已知的地方：声明的返回 trail（`-> Fruit`，比如 `buy`）、声明为 `:: Fruit` 的参数，或者声明为 `test :: Fruit = {...}` 的全局符号。没有默认值的字段必须给出；给出 trail 中没有的字段，或者给出 trail 不对的值，都是错误。`Fruit {}` 使用所有默认值。
+- **字段。** `t.name` 读取一个字段。和 `head` 一样，它给出的是字段本身，仍然在 `t` 里面：你可以读取它，想保留它就要复制（`copy t.name`）。
+- **有默认值的字段和没有参数的函数是同一回事。** `peel :: Boolean = false` 和 `textualize = copy name` 都是一个名字加一个值。这个值可以按名字使用其他字段，这些字段是借用的（想保留一个就要复制：`textualize = copy name`），并在创建值的时候、在它用到的字段之后计算；`Fruit {...}` 也可以给出它自己的（`Fruit {name = "kiwi", textualize = "a kiwi"}`）。
+- **follow。** `trail Apple follow Fruit:` 让 Apple 拥有 Fruit 的字段和函数，再加上它自己的，并且在参数或返回值声明为 `:: Fruit` 的地方都可以给出 Apple。（声明为 `Fruit` 的字段或数组目前只能装 Fruit：见“一次一种 trail”。）一个 trail 可以遵循多个 trail：`trail Box follow Show, Compare:`。
+- **trail 作为参数。** `print any :: Show -> Void` 接受任何 trail 遵循 Show 的值；这个函数会为它用到的每个 trail 分别编译一次。
+- **一次一种 trail。** 一个数组只装同一种 trail 的值，一个 `check` 的所有分支也给出同一种 trail：`[Fruit {name = "a"}, Warehouse {rack = []}]` 目前是错误的。
+- **echo。** `echo` 用值的 `textualize` 打印它。trail 没有遵循 Show 的值会打印它的 trail 名字（`Fruit`），并给出警告。
+- **Copy。** `copy x` 只接受 trail 遵循 Copy 的值，并逐个字段地复制它，所以每个字段也必须遵循 Copy。遵循 Copy 永远不会改变程序的行为：`y = x` 仍然会移动 `x`。只有内置的 Int、Float、Boolean 和 Void 会自动复制。
+- **Compare。** 遵循 Compare 的 trail 要给出 `compare @other :: Self -> Int`，在一个值上调用：`a.compare b` 在 `a` 在前时为 -1，相等时为 0，`b` 在前时为 1。`<`、`<=`、`>`、`>=`、`==` 和 `!=` 都由它得出（`a < b` 表示 `a.compare b < 0`），所以只有遵循 Compare 的 trail 才能比较，或者用作 `check` 的模式，而且只能和同一种 trail 的值比较。运算符只读取它的操作数，所以 `other` 是借用的（`@other`）。`Self` 表示这个 trail 本身（或遵循它的 trail）。
+- **Numeric。** 遵循 Numeric 的 trail 表现得像一个数字：它要给出 `add`、`sub`、`mul` 和 `div`（每个都像 `add @other :: Self -> Self`）、`compare` 和 `textualize`，这样对同一种 trail 的两个值，`a + b` 就表示 `a.add b`。不过，只有内置的数字会自动复制。目前只有内置 trail 才能遵循 Iterable 和 Array。
+- **暂不支持。** 一个 trail 只能在它自己的 `trail ... follow ...:` 这一行里遵循其他 trail；在别处给已有的 trail（比如 String）加上新的 trail，以后才会支持。
+
+trail 的名字在当前作用域中必须是唯一的，不能与任何其他外部或内部的 trail 或函数同名。
+
+```
+# 假设还有另一个文件 food.luna，它也包含一个 Fruit trail。
+| food#Fruit > # 会导致错误，因为这里已经有一个 Fruit trail 了
+| food > # 可以，因为你必须写 Int -> food.Fruit，这不会和我的混淆。
+| food#Fruit > OtherFruit # 可以，这样改变了它的名字。
+
+test = { x = "a", y = "b" } # 错误，编译器应该告诉用户这个未知的结构需要一个名字，并停止编译
+
+test :: Fruit = { name = "orange" } # 正确
+
+```
+如果用户的 trail 遵循了 Numeric 这样的内置 trail，它也应该表现得像一个数字，但仍然只有内置的数字（int、float）会默认复制。
+
+trail 的字段可以使用它自己的 trail，从而允许递归的 trail；但如果这样做，这个字段的类型会变成 T?，它可以是 void，以避免产生无穷无尽的链。
+
+#### 在 trail 中声明函数
+
+在 trail 内部，它的字段和函数都可以按名字使用（它们属于这个值本身），而 trail 的函数在一个值上调用：`t.print x`，或者 `(Test {}).print x`。没有函数体的函数（比如下面的 `compare`）要由遵循它的 trail 给出：缺少某个函数的 trail 不能创建值，而且 `{...}` 不能给出带参数的函数。字段的默认值不能调用 trail 的函数，因为这时值还没有创建出来。
+
+trail 的函数可以做任何函数能做的事：它可以有多个定义，从上到下依次尝试（`describe n :: Int -> String = ...` 和 `describe n :: String -> String = ...`），可以用模式拆开数组（`total (x:xs) = x + total xs` 和 `total [] = 0`），也可以用在调用链里（`echo b.total reverse xs` 就是 `echo (b.total (reverse xs))`）。遵循另一个 trail 的 trail 可以给出同名函数的定义：它们会先被尝试，然后才是继承来的定义。
+```
+trail Test:
+    print any :: Show -> Void = echo any
+
+# 内置的 trail Compare，就像用 luna 写出来的样子（它是内置的，你不用自己写）
+trail Compare:
+    compare @other :: Self -> Int # 没有函数体：每个遵循 Compare 的 trail 都必须给出它
+```
+
+Ordering 应该是一个枚举，这以后会加入，现在可以先用 Int 代替。
+
 #### void 与 maybe 类型
 
-void 是唯一的“无”值，`echo` 把它打印为 `void`。一个函数如果在某些路径上给出值、在另一些路径上给出 void，它的类型就是 *maybe* 类型：`head [1, 2]` 是 `int?`，因为 head 对空数组给出 void。编译器会自己推断出 maybe 类型。
+void 是唯一的“无”值，`echo` 把它打印为 `void`。一个函数如果在某些路径上给出值、在另一些路径上给出 void，它的类型就是 *maybe* 类型：`head [1, 2]` 是 `Int?`，因为 head 对空数组给出 void。编译器会自己推断出 maybe 类型。
 
 - void 会穿过运算符：`head [] + 1` 是 void。
 - 在需要真实值的地方（不接受 void 的参数、范围的结束值、声明的返回类型），maybe 值是错误的，直到你用 check 处理了 void 的情况：
@@ -256,7 +343,7 @@ first_or_zero a =
     h = head a
     check h:
         void -> 0;
-        else -> h # 这里 h 是 int，而不是 int?
+        else -> h # 这里 h 是 Int，而不是 Int?
 ```
 `void ->` 只匹配 void。目前还不能在类型定义中写出 maybe 类型。
 
@@ -335,7 +422,7 @@ head 取出可迭代对象的第一个元素，tail 取出剩下的部分。
 init 取出除最后一个之外的所有元素，last 只取最后一个。
 reverse 按相反的顺序给出元素。
 没有元素时，head、tail、init 和 last 给出 void。
-copy 给出任意值的一份副本（见第 3 章）。
+copy 给出 trail 遵循 Copy 的值的一份副本，所有内置的值都遵循它（见第 3 章和“trail 定义”）。
 
 字符串是字符的序列，而不是字节的序列：`len "héllo"` 是 5，`"héllo" !! 1` 是 `"é"`。
 
@@ -364,7 +451,7 @@ main =
 
 移动不会复制任何东西：新的所有者得到的就是同一个值。所以 `x = x ++ [4]` 是在旧数组的基础上追加，而不是复制它。给一个名字赋新值（`s = "again"`）会让它重新可用。
 
-数字则不同：`int`、`float`、`boolean` 和 `void` 的值（以及它们的混合，比如 `numeric`）会被**复制**，因为复制一个数字的开销并不比移动它大。它们遵循 `Copy` *trail*，trail 是一种标记，说明某个类型能做什么：
+数字则不同：`Int`、`Float`、`Boolean` 和 `Void` 的值（以及它们的混合，比如 `Numeric`）会被**复制**，因为复制一个数字的开销并不比移动它大。它们遵循 `Copy` *trail*，trail 是一种标记，说明某个类型能做什么：
 ```
 n = 5
 m = n
@@ -432,7 +519,7 @@ main =
         names = [] # 错误：names 正被循环借用
 ```
 
-trail 和用户自定义类型（你自己创建的类型）以后会加入；目前 `Copy` 是唯一的 trail，并且是内置的。
+`Copy` 是内置 trail 之一（见第 1 章的“trail 定义”）。
 
 ## 第 4 章 标准库
 
@@ -440,7 +527,8 @@ trail 和用户自定义类型（你自己创建的类型）以后会加入；�
 
 | 函数 | 结果 | 它的数组或字符串 |
 |---|---|---|
-| `abs x`、`max a b`、`min a b` | 与零的距离、较大的数、较小的数 | |
+| `abs x` | 与零的距离 | |
+| `max a b`、`min a b` | 两个可以比较的值中较大的、较小的 | |
 | `sum a`、`product a` | 总和（空数组为 0）、乘积（空数组为 1） | 借用 |
 | `average a` | 平均值（浮点数），空数组为 void | 借用 |
 | `maximum a`、`minimum a` | 最大、最小的元素，空数组为 void | 拿走 |
@@ -455,3 +543,5 @@ trail 和用户自定义类型（你自己创建的类型）以后会加入；�
 | `repeat s n` | 把 `s` 重复 `n` 次 | 借用 |
 
 “借用”表示调用者保留这个数组（`@a`）；“拿走”表示它被移动进函数，因为结果是由它的元素构成的。
+
+比较值的函数（`max`、`min`、`maximum`、`minimum`、`contains`、`count`、`index_of`、`remove`）适用于每个遵循 Compare 的 trail，包括程序自己定义的：`max (Money {cents = 150}) (Money {cents = 999})`。把数字加起来的函数（`sum`、`product`、`average`、`abs`）从 0 或 1 开始，所以它们用于内置的数字。

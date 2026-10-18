@@ -82,6 +82,7 @@ main =
     echo (init hi)
     echo (last hi)
     later
+    trails_chapter
 
 # chapter 1: patterns, conditions, ret, maybe types
 add_up (x:xs) = x + add_up xs
@@ -186,3 +187,36 @@ later =
     echo (join ["a", "b"] ", ")
     echo (split "a,b" ",")
     echo (repeat "ab" 3)
+
+# chapter 1: trails (the readme's `buy` without its examples of errors, and
+# its `test` global as `orange_test`, since `test` is taken above)
+trail Fruit follow Show:
+    name :: String
+    peel :: Boolean = false
+    textualize = copy name
+
+trail Warehouse follow Show:
+    rack :: [Fruit]
+    textualize = "count:[" + rack.textualize + "]"
+
+buy money :: Int -> Fruit = check true:
+    money > 5 -> {name = "pineapple", peel = true};
+    else -> {name = "grape"}
+
+orange_test :: Fruit = { name = "orange" }
+
+trail Test:
+    print any :: Show -> Void = echo any
+
+trails_chapter =
+    echo (buy 6).name
+    echo buy 6
+    t = buy 6
+    n = copy t.name
+    echo n
+    o = Fruit {name = "orange"}
+    echo o
+    echo orange_test
+    echo Warehouse {rack = [buy 6, buy 1]}
+    t = Test {}
+    t.print "printed by a function of a trail"

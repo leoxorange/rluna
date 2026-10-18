@@ -20,7 +20,51 @@ use crate::diag::Span;
 pub struct Program {
     /// The files this one links, from the `| ...` lines at its top.
     pub links: Vec<Link>,
+    pub trails: Vec<Trail>,
     pub defs: Vec<Def>,
+}
+
+/// `trail Fruit follow Copy:` and its indented fields.
+#[derive(Debug, Clone)]
+pub struct Trail {
+    pub name: String,
+    pub name_span: Span,
+    /// The trails it follows.
+    pub follows: Vec<(String, Span)>,
+    pub fields: Vec<Field>,
+    /// Its functions: `describe n = ...`, or `compare @other :: Self ->
+    /// Int` without a body, for the trails that follow it to give.
+    pub methods: Vec<Method>,
+    pub span: Span,
+    /// Which file it is in (see `Def::file`).
+    pub file: usize,
+    /// It comes from the standard library, which declares the embedded
+    /// trails (`Show`, `Compare`, ...) and which trails the embedded values
+    /// follow (`trail Int follow Numeric, Copy:`).
+    pub library: bool,
+}
+
+/// A function of a trail. It is called on a value (`t.describe 1`), whose
+/// fields and functions it sees by name.
+#[derive(Debug, Clone)]
+pub struct Method {
+    pub name: String,
+    pub span: Span,
+    pub params: Vec<Param>,
+    pub sig: Option<Signature>,
+    /// `None`: the trails that follow this one give it.
+    pub body: Option<Block>,
+}
+
+/// A field of a trail: `name :: String`, `peel :: Boolean = false`, or
+/// `textualize = copy name`. A field without a default must be given when
+/// a value is made.
+#[derive(Debug, Clone)]
+pub struct Field {
+    pub name: String,
+    pub span: Span,
+    pub ty: Option<TypeAnn>,
+    pub default: Option<Expr>,
 }
 
 /// `| entity/try > try` links the file `entity/try.luna`: its definitions
@@ -98,40 +142,59 @@ pub enum TypeName {
 }
 
 impl TypeName {
+    /// An embedded trail, by its name: `Int`, or `int` as Luna wrote it
+    /// before trails.
     pub fn parse(s: &str) -> Option<TypeName> {
         Some(match s {
-            "numeric" => TypeName::Numeric,
-            "int" => TypeName::Int,
-            "float" => TypeName::Float,
-            "string" => TypeName::String,
-            "boolean" => TypeName::Boolean,
-            "void" => TypeName::Void,
-            "array" => TypeName::Array,
-            "iterable" => TypeName::Iterable,
-            "any" => TypeName::Any,
+            "Numeric" | "numeric" => TypeName::Numeric,
+            "Int" | "int" => TypeName::Int,
+            "Float" | "float" => TypeName::Float,
+            "String" | "string" => TypeName::String,
+            "Boolean" | "boolean" => TypeName::Boolean,
+            "Void" | "void" => TypeName::Void,
+            "Array" | "array" => TypeName::Array,
+            "Iterable" | "iterable" => TypeName::Iterable,
+            "Any" | "any" => TypeName::Any,
             _ => return None,
         })
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
-            TypeName::Numeric => "numeric",
-            TypeName::Int => "int",
-            TypeName::Float => "float",
-            TypeName::String => "string",
-            TypeName::Boolean => "boolean",
-            TypeName::Void => "void",
-            TypeName::Array => "array",
-            TypeName::Iterable => "iterable",
-            TypeName::Any => "any",
+            TypeName::Numeric => "Numeric",
+            TypeName::Int => "Int",
+            TypeName::Float => "Float",
+            TypeName::String => "String",
+            TypeName::Boolean => "Boolean",
+            TypeName::Void => "Void",
+            TypeName::Array => "Array",
+            TypeName::Iterable => "Iterable",
+            TypeName::Any => "Any",
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A trail written in a signature or a field: a name (`Int`, `Fruit`,
+/// `food.Fruit`), or an array of something (`[Fruit]`).
+#[derive(Debug, Clone)]
 pub struct TypeAnn {
-    pub name: TypeName,
+    pub kind: TypeAnnKind,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeAnnKind {
+    Name(String),
+    Array(Box<TypeAnn>),
+}
+
+impl std::fmt::Display for TypeAnn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            TypeAnnKind::Name(n) => f.write_str(n),
+            TypeAnnKind::Array(inner) => write!(f, "[{inner}]"),
+        }
+    }
 }
 
 /// A function body: a sequence of statements; the last one is the result.
@@ -269,6 +332,21 @@ pub enum ExprKind {
         body: Box<Expr>,
         clauses: Vec<Clause>,
     },
+    /// `{name = "kiwi", peel = true}`: a value of a trail. Written after
+    /// the trail's name (`Fruit {...}`, which is a call in the syntax), or
+    /// alone where the trail is known.
+    Record(Vec<(String, Span, Expr)>),
+    /// `(buy 6).name`: a field of a value. (`t.name` is a `Name`, since a
+    /// name with dots can also mean a linked file's definition.)
+    Field(Box<Expr>, String, Span),
+    /// `(buy 6).describe 1`: a function of a value's trail, called on it.
+    /// (`t.describe 1` is a `Call` of `t.describe`.)
+    Method {
+        receiver: Box<Expr>,
+        name: String,
+        name_span: Span,
+        args: Vec<Expr>,
+    },
     /// `echo` is built into the language, not a library function, because
     /// it accepts a value of *any* type and prints each type differently.
     /// The compiler picks the right printing routine from the argument's type.
@@ -308,6 +386,37 @@ pub fn dump(program: &Program) -> String {
         }
         out.push_str(")\n");
     }
+    for trail in &program.trails {
+        write!(out, "(trail {}", trail.name).unwrap();
+        for (f, _) in &trail.follows {
+            write!(out, " follow {f}").unwrap();
+        }
+        for m in &trail.methods {
+            let params: Vec<String> = m
+                .params
+                .iter()
+                .map(|p| format!("{}{}", if p.borrowed { "@" } else { "" }, p.name))
+                .collect();
+            write!(out, "\n  (fn {} ({})", m.name, params.join(" ")).unwrap();
+            if let Some(body) = &m.body {
+                out.push('\n');
+                dump_stmts(&mut out, &body.stmts, 4);
+            }
+            out.push(')');
+        }
+        for field in &trail.fields {
+            write!(out, "\n  ({}", field.name).unwrap();
+            if let Some(t) = &field.ty {
+                write!(out, " :: {t}").unwrap();
+            }
+            if let Some(d) = &field.default {
+                out.push_str(" = ");
+                dump_expr(&mut out, d, 4);
+            }
+            out.push(')');
+        }
+        out.push_str(")\n");
+    }
     for def in &program.defs {
         let params: Vec<String> = def
             .params
@@ -316,10 +425,10 @@ pub fn dump(program: &Program) -> String {
             .collect();
         write!(out, "(def {} ({})", def.name, params.join(" ")).unwrap();
         if let Some(sig) = &def.sig {
-            let ps: Vec<&str> = sig.params.iter().map(|t| t.name.as_str()).collect();
+            let ps: Vec<String> = sig.params.iter().map(|t| t.to_string()).collect();
             write!(out, " :: ({})", ps.join(", ")).unwrap();
             if let Some(r) = &sig.ret {
-                write!(out, " -> {}", r.name.as_str()).unwrap();
+                write!(out, " -> {r}").unwrap();
             }
         }
         out.push('\n');
@@ -442,6 +551,37 @@ fn dump_expr(out: &mut String, e: &Expr, indent: usize) {
             dump_expr(out, inner, indent);
             out.push(')');
         }
+        ExprKind::Record(fields) => {
+            out.push('{');
+            for (k, (name, _, value)) in fields.iter().enumerate() {
+                if k > 0 {
+                    out.push_str(", ");
+                }
+                write!(out, "{name} = ").unwrap();
+                dump_expr(out, value, indent);
+            }
+            out.push('}');
+        }
+        ExprKind::Field(base, name, _) => {
+            out.push_str("(. ");
+            dump_expr(out, base, indent);
+            write!(out, " {name})").unwrap();
+        }
+        ExprKind::Method {
+            receiver,
+            name,
+            args,
+            ..
+        } => {
+            out.push_str("(.call ");
+            dump_expr(out, receiver, indent);
+            write!(out, " {name}").unwrap();
+            for a in args {
+                out.push(' ');
+                dump_expr(out, a, indent);
+            }
+            out.push(')');
+        }
         ExprKind::Check {
             scrutinee,
             arms,
@@ -552,7 +692,12 @@ fn rename_expr(e: &mut Expr, renames: &std::collections::HashMap<String, String>
             go(a);
             go(b);
         }
-        ExprKind::Neg(x) | ExprKind::Echo(x) => go(x),
+        ExprKind::Neg(x) | ExprKind::Echo(x) | ExprKind::Field(x, _, _) => go(x),
+        ExprKind::Record(fields) => fields.iter_mut().for_each(|(_, _, v)| go(v)),
+        ExprKind::Method { receiver, args, .. } => {
+            go(receiver);
+            args.iter_mut().for_each(go);
+        }
         ExprKind::Ret(x) => x.iter_mut().for_each(|x| go(x)),
         ExprKind::Array(items) => items.iter_mut().for_each(go),
         ExprKind::Comprehension { body, clauses } => {

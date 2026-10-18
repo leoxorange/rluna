@@ -27,7 +27,7 @@ The targets are `macos-arm64` (Apple silicon Macs) and `windows-x64`. Without `-
 echo (5 > 6) # false
 echo (5 == 5) # true
 echo (4 < 10) # true
-foo :: boolean = 5 > 6 # foo is false
+foo :: Boolean = 5 > 6 # foo is false
 echo (7 / 2) # 3.5, `/` always gives a float
 echo (7 * 2) # 14, int with int stays an int for + - *
 echo (1 + 0.5) # 1.5, an int with a float gives a float
@@ -186,7 +186,7 @@ The **main** function will be used as the main entrance like other languages, so
 
 And since we have overloads, here's a new way to play with function definitions.
 ```
-test a :: numeric -> void = echo "winning"
+test a :: Numeric -> Void = echo "winning"
 test _ = echo "nothing left"
 ```
 this function has two definitions, so test 1 will output winning but other arguments will get nothing left; this can be seen as pattern matching. the compiler searches from top to bottom to find the correct definition for the caller, and test _ catches everything else.
@@ -219,37 +219,122 @@ main = echo (first_negative [3, -1, 4]) # -1
 ```
 `ret` cannot be used inside a list comprehension.
 
-### type definition
+### trail definition
 
-we now have these embedded types:
+a trail describes a kind of value: what it holds, and what it can do. luna has no other types: every value, from `5` to a fruit, is described by a trail. Trail names start with an uppercase letter, like `Fruit` or `Int`. This is only a style that tells trails apart from other names, not a rule: `trail fruit` is correct too.
 
-- any (this is the basic type, all other types extend it)
-- iterable (string, array or vector(come later))
-- array (for all array types)
-- numeric (for all numbers like integer and float)
-- int (for integer)
-- float
-- string (for char sequences)
-- boolean (true and false)
-- void (like null in other languages)
+we now have these embedded trails:
+
+- Any (this is the basic trail, all other trails follow it implicitly)
+- Iterable (String, Array or Vector(come later))
+- Show (printable, it contains a textualize function and echo will call this function to get a printable String)
+- Compare (contains a compare function for compare use)
+- Copy (a pass for `copy`: only a value whose trail follows Copy can be copied with `copy x`)
+- Array (for all arrays, it follow Iterable, Show)
+- Numeric (for all numbers like integer and float, it follow Show and Compare)
+- Int (for integer)
+- Float
+- String (for char sequences)
+- Boolean (true and false)
+- Void (like null in other languages)
+
+All the embedded trails that hold values follow Show and Copy, and numbers and strings follow Compare; an array follows them when its elements do. These trails are written in luna, in the standard library (`src/std.luna`): what each asks for (`trail Compare:` asks for `compare @other :: Self -> Int`), and which trails the embedded values follow (`trail Int follow Numeric, Copy:`). The embedded values themselves are machine values, which the compiler gives their functions, so ints and floats keep mixing: `1 + 0.5` is 1.5, since both are numbers.
 
 ```
-sum a b :: numeric, numeric -> numeric = a + b + 5 # correct
+sum a b :: Numeric, Numeric -> Numeric = a + b + 5 # correct
 sum "hello" 5 # error, "hello" is not a number
 ```
 
 the last line of any function will be treated as the return value, and its type will be seen as the return type. or you can use the ret keyword to return early.
 you can use the following code to define a function that returns void.
 ```
-foo _ :: any -> void = 5
+foo _ :: Any -> Void = 5
 ```
 although you write a 5 here, nothing will be returned since this function has a void return type. The 5 will be discarded when exiting this function.
 
+#### create your own trails
 
+```
+# the embedded trail Show, as if it were written in luna (it is built in, so you do not write it)
+trail Show:
+    textualize :: String # no default value: every trail that follows Show must give one
+
+trail Fruit follow Show:
+    name :: String # name has no default value, so it is required: every fruit must be given a name
+    peel :: Boolean = false # peel has a default value, so it can be left out
+    textualize = copy name
+
+# or you want a more specific trail
+trail Warehouse follow Show:
+    rack :: [Fruit]
+    textualize = "count:[" + rack.textualize + "]"
+    # if you dont want to give textualize an implementation, you can ignore here, but this means the place where you create the Warehouse must give it an implementation.
+
+buy money :: Int -> Fruit = check true:
+    money < 5 -> {name = 1}; # error, name must be string
+    money == 5 -> {peel = true}; # error, required field is missing.
+    money > 5 -> {name = "pineapple", peel = true}; # correct
+    else -> {name = "grape", money = 5} # error, can not add extra fields
+
+main = 
+    echo (buy 6).name
+    echo buy 6
+    t = buy 6
+    n = t.name # error, you can not move a value outside a trail structure unless you copy it.
+    n = copy t.name # correct
+    o = Fruit {name = "orange"} # the trail's name says what it is
+```
+
+this defines a trail Fruit, and the return type will be Fruit.
+
+- **values.** `Fruit {name = "orange"}` makes a Fruit anywhere. A bare `{...}` works only where its trail is already known: a declared return trail (`-> Fruit`, as in `buy`), a parameter declared `:: Fruit`, or a global declared `test :: Fruit = {...}`. A field without a default must be given; giving a field the trail does not have, or a value of the wrong trail, is an error. `Fruit {}` takes every default.
+- **fields.** `t.name` reads a field. Like `head`, it gives the field itself, still inside `t`: you can read it, and to keep it you copy it (`copy t.name`).
+- **a field with a default and a function without arguments are the same thing.** `peel :: Boolean = false` and `textualize = copy name` are both a name with a value. The value can use the other fields by name, borrowed (to keep one, it copies it: `textualize = copy name`), and is computed when the value is made, after the fields it uses; a `Fruit {...}` may give its own (`Fruit {name = "kiwi", textualize = "a kiwi"}`).
+- **follow.** `trail Apple follow Fruit:` gives Apple the fields and functions of Fruit, plus its own, and an Apple can be given wherever a parameter or a result is declared `:: Fruit`. (A field or an array declared with `Fruit` holds Fruits only, for now: see "one trail at a time".) A trail can follow several: `trail Box follow Show, Compare:`.
+- **trails as parameters.** `print any :: Show -> Void` accepts any value whose trail follows Show; the function is compiled for each trail it is used with.
+- **one trail at a time.** An array holds values of one trail, and all the branches of a `check` give the same trail: `[Fruit {name = "a"}, Warehouse {rack = []}]` is an error for now.
+- **echo.** `echo` prints a value with its `textualize`. A value whose trail does not follow Show prints its trail name (`Fruit`), with a warning.
+- **Copy.** `copy x` only accepts a value whose trail follows Copy, and copies it field by field, so every field must follow Copy too. Following Copy never changes what a program does: `y = x` still moves `x`. Only the embedded Int, Float, Boolean and Void are copied by themselves.
+- **Compare.** A trail that follows Compare gives `compare @other :: Self -> Int`, called on a value: `a.compare b` is -1 if `a` comes first, 0 if they are equal, 1 if `b` comes first. `<`, `<=`, `>`, `>=`, `==` and `!=` all come from it (`a < b` means `a.compare b < 0`), so only trails that follow Compare can be compared, or used as `check` patterns, and only with values of the same trail. An operator only reads its operands, which is why `other` is borrowed (`@other`). `Self` means the trail itself (or one that follows it).
+- **Numeric.** A trail that follows Numeric plays like a number: it gives `add`, `sub`, `mul` and `div` (each like `add @other :: Self -> Self`), `compare` and `textualize`, and then `a + b` means `a.add b`, for two values of the same trail. Still, only the embedded numbers are copied by themselves. For now, only the embedded trails follow Iterable and Array.
+- **not yet.** A trail follows others only in its own `trail ... follow ...:` line; giving an existing trail (like String) a new trail elsewhere will come later.
+
+the trail name must be unique in current scope, can not have same identical name with any other external or internal trail or functions.
+
+```
+# assume we have another file food.luna and it contains a Fruit trail as well.
+| food#Fruit > # will cause an error, since we already have a Fruit trail here
+| food > # acceptable, since you have to write Int -> food.Fruit, this will not be confused with mine.
+| food#Fruit > OtherFruit # acceptable, this changed its identical name.
+
+test = { x = "a", y = "b" } # error, compiler should tell user that this unknown structure needs a name and stop compiling
+
+test :: Fruit = { name = "orange" } # correct
+
+```
+if user trails following the internal trails like Numeric, it should also plays like a number, but still only built-ins (int, float) are under the copy by default.
+
+trail fields can use their own trail, allowing the recursive trails, but if user did so, the field type will goes T?, which will have a void value to avoid creating endless chains.
+
+#### declare functions inside the trail
+
+Inside a trail, its fields and functions are visible by name (they are the value's own), and a function of a trail is called on a value: `t.print x`, or `(Test {}).print x`. A function declared without a body, like `compare` below, is one the trails that follow must give: a value of a trail that leaves one out cannot be made, and a `{...}` cannot give a function with parameters. A field's default cannot call the trail's functions, since the value is not made yet.
+
+A function of a trail can do what any function does: it can have several definitions, tried from top to bottom (`describe n :: Int -> String = ...` and `describe n :: String -> String = ...`), take arrays apart with patterns (`total (x:xs) = x + total xs` and `total [] = 0`), and be called in a chain (`echo b.total reverse xs` is `echo (b.total (reverse xs))`). A trail that follows another may give definitions of the same function: they are tried first, then the inherited ones.
+```
+trail Test:
+    print any :: Show -> Void = echo any
+
+# the embedded trail Compare, as if it were written in luna (it is built in, so you do not write it)
+trail Compare:
+    compare @other :: Self -> Int # no body: every trail that follows Compare must give one
+```
+
+and Ordering shoule be a enum, this will comes later, now you can use Int instead.
 
 #### void and maybe types
 
-void is the one "nothing" value, and `echo` prints it as `void`. A function that gives a value on some paths and void on others has a *maybe* type: `head [1, 2]` is an `int?`, because head gives void for an empty array. The compiler finds maybe types by itself.
+void is the one "nothing" value, and `echo` prints it as `void`. A function that gives a value on some paths and void on others has a *maybe* type: `head [1, 2]` is an `Int?`, because head gives void for an empty array. The compiler finds maybe types by itself.
 
 - void flows through operators: `head [] + 1` is void.
 - Where a real value is needed (an argument that does not accept void, the end of a range, a declared return type), a maybe value is an error until you handle the void case with a check:
@@ -258,7 +343,7 @@ first_or_zero a =
     h = head a
     check h:
         void -> 0;
-        else -> h # here h is an int, not an int?
+        else -> h # here h is an Int, not an Int?
 ```
 `void ->` only matches void. Maybe types cannot be written in type definitions yet.
 
@@ -337,7 +422,7 @@ head grabs the first element in an iterable object, tail grabs the rest.
 init grabs all the elements except the last one, and last only grabs the last one.
 reverse gives the elements in the opposite order.
 head, tail, init and last give void when there is no element.
-copy gives a copy of any value (see chapter 3).
+copy gives a copy of a value whose trail follows Copy, as all the embedded ones do (see chapter 3 and "trail definition").
 
 A string is a sequence of characters, not bytes: `len "héllo"` is 5 and `"héllo" !! 1` is `"é"`.
 
@@ -366,7 +451,7 @@ A value moves when you:
 
 A move copies nothing: the new owner gets the very same value. So `x = x ++ [4]` adds to the old array without copying it. Giving a name a new value (`s = "again"`) makes it usable again.
 
-Numbers are different: `int`, `float`, `boolean` and `void` values (and mixes of them, like `numeric`) are **copied** instead, because copying a number costs no more than moving it. They follow the `Copy` *trail*, a mark that says what a type can do:
+Numbers are different: `Int`, `Float`, `Boolean` and `Void` values (and mixes of them, like `Numeric`) are **copied** instead, because copying a number costs no more than moving it. They follow the `Copy` *trail*, a mark that says what a type can do:
 ```
 n = 5
 m = n
@@ -434,7 +519,7 @@ main =
         names = [] # error: names is borrowed by the loop
 ```
 
-Trails and user-defined types (types you make yourself) will come later; for now `Copy` is the only trail, and it is built in.
+`Copy` is one of the embedded trails (see "trail definition" in chapter 1).
 
 ## chapter 4. standard library
 
@@ -442,7 +527,8 @@ These functions are written in luna itself (`src/std.luna`) and come with every 
 
 | function | what it gives | its array or string |
 |---|---|---|
-| `abs x`, `max a b`, `min a b` | the distance from zero, the larger, the smaller number | |
+| `abs x` | the distance from zero | |
+| `max a b`, `min a b` | the larger, the smaller of two values that can be compared | |
 | `sum a`, `product a` | the sum (0 if empty), the product (1 if empty) | borrowed |
 | `average a` | the average as a float, or void if empty | borrowed |
 | `maximum a`, `minimum a` | the largest, the smallest element, or void if empty | taken |
@@ -457,3 +543,5 @@ These functions are written in luna itself (`src/std.luna`) and come with every 
 | `repeat s n` | `s` repeated `n` times | borrowed |
 
 "borrowed" means the caller keeps the array (`@a`); "taken" means it moves in, because the result is made of its elements.
+
+The functions that compare values (`max`, `min`, `maximum`, `minimum`, `contains`, `count`, `index_of`, `remove`) work for every trail that follows Compare, the ones a program defines too: `max (Money {cents = 150}) (Money {cents = 999})`. The ones that add up numbers (`sum`, `product`, `average`, `abs`) start from 0 or 1, so they are for the embedded numbers.

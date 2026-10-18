@@ -16,6 +16,7 @@
 //!   string  { len, bytes... }
 //!   array   { len, elements... }   8 bytes per element, as `lower::repr`
 //!   box     { tag, payload }        a value of a union type
+//!   record  { fields... }           8 bytes per field, in the trail's order
 //! ```
 //!
 //! Every object starts after an allocator header, so freeing a box of the
@@ -25,6 +26,7 @@ use std::collections::HashMap;
 
 use crate::lir::{BlockId, FunctionBuilder, IBinOp, ICond, MemTy, Module, Type, Value};
 use crate::lower::repr;
+use crate::typeck::TTrail;
 use crate::types::{Kind, Ty};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,6 +41,27 @@ enum Helper {
 pub struct TypeFns {
     funcs: Vec<crate::lir::Function>,
     names: HashMap<(Helper, Ty), String>,
+    /// The fields of every trail, which say how to free, copy and print
+    /// its values.
+    pub trails: HashMap<String, TTrail>,
+    /// The program prints values into strings (see `lower::out_hook`).
+    pub captures: bool,
+}
+
+/// Load field `k` of a record, of type `ty`.
+pub fn load_field(b: &mut FunctionBuilder, record: Value, k: usize, ty: Ty) -> Value {
+    b.load(mem_ty(ty), record, (k * 8) as i32)
+}
+
+/// Store `v` as field `k` of a record.
+pub fn store_field(b: &mut FunctionBuilder, record: Value, k: usize, ty: Ty, v: Value) {
+    b.store(mem_ty(ty), record, (k * 8) as i32, v);
+}
+
+/// A new record with room for `n` fields.
+pub fn new_record(b: &mut FunctionBuilder, n: usize) -> Value {
+    let size = b.iconst((n.max(1) * 8) as i64);
+    b.call("rt.alloc", vec![size], Some(Type::I64)).unwrap()
 }
 
 /// Load element `i` of an array of `elem`.
@@ -122,6 +145,12 @@ impl TypeFns {
         module.funcs.extend(self.funcs);
     }
 
+    /// The fields of the trail of the record type `ty`.
+    fn fields(&self, ty: Ty) -> Vec<Ty> {
+        let trail = ty.trail().expect("a record type");
+        self.trails[trail].fields.iter().map(|(_, t)| *t).collect()
+    }
+
     /// The name of the helper for `ty`, generating it on first use.
     fn helper(
         &mut self,
@@ -175,6 +204,25 @@ impl TypeFns {
                     f.jmp(end, vec![]);
                 }
                 f.switch_to(end);
+            } else if ty.as_kind() == Some(Kind::Record) {
+                // An immortal object stands in for a record that was moved
+                // out of an array (see `lower::FnLower::placeholder`): it
+                // owns nothing.
+                let header = f.load(MemTy::I64, v, -8);
+                let zero = f.iconst(0);
+                let immortal = f.icmp(ICond::Slt, header, zero);
+                let skip = f.new_block("immortal");
+                let fields = f.new_block("fields");
+                f.br(immortal, skip, vec![], fields, vec![]);
+                f.switch_to(skip);
+                f.ret(None);
+                f.switch_to(fields);
+                for (k, fty) in fns.fields(ty).into_iter().enumerate() {
+                    if fty.needs_drop() {
+                        let x = load_field(f, v, k, fty);
+                        fns.drop(f, x, fty);
+                    }
+                }
             } else if let Some(elem) = ty.elem().filter(|e| e.needs_drop()) {
                 for_each(f, v, |f, i| {
                     let e = load_elem(f, v, i, elem);
@@ -224,6 +272,15 @@ impl TypeFns {
                     }
                     f.switch_to(end);
                     f.unreachable();
+                } else if ty.as_kind() == Some(Kind::Record) {
+                    let fields = fns.fields(ty);
+                    let copy = new_record(f, fields.len());
+                    for (k, fty) in fields.into_iter().enumerate() {
+                        let x = load_field(f, v, k, fty);
+                        let x = fns.clone(f, x, fty);
+                        store_field(f, copy, k, fty, x);
+                    }
+                    f.ret(Some(copy));
                 } else {
                     let elem = ty.elem().unwrap_or(Ty::NEVER);
                     let len = f.load(MemTy::I64, v, 0);
@@ -277,6 +334,24 @@ impl TypeFns {
                             f.jmp(end, vec![]);
                         }
                         f.switch_to(end);
+                    } else if let Some(trail) = ty.trail() {
+                        let t = &fns.trails[trail];
+                        let textualize = t.fields.iter().position(|(n, _)| n == "textualize");
+                        match textualize {
+                            // A trail that follows Show prints its textualize.
+                            Some(k) if t.shows => {
+                                let text = load_field(f, v, k, Ty::STR);
+                                f.call("rt.print_str", vec![text], None);
+                            }
+                            // Any other prints its name.
+                            _ => {
+                                let name = t.name.clone();
+                                for byte in name.bytes() {
+                                    let c = f.iconst(byte as i64);
+                                    f.call("rt.out_byte", vec![c], None);
+                                }
+                            }
+                        }
                     } else {
                         let elem = ty.elem().unwrap_or(Ty::NEVER);
                         let open = f.iconst('[' as i64);
@@ -345,6 +420,11 @@ impl TypeFns {
                 }
                 f.switch_to(end);
                 f.unreachable();
+            } else if ty.as_kind() == Some(Kind::Record) {
+                // `typeck` rejects comparing values of trails (until Compare
+                // exists); the same value is equal to itself.
+                let same = f.icmp(ICond::Eq, x, y);
+                f.ret(Some(same));
             } else {
                 let elem = ty.elem().unwrap_or(Ty::NEVER);
                 let lx = f.load(MemTy::I64, x, 0);

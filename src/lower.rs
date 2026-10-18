@@ -43,7 +43,7 @@ use crate::typeck::{
     LenTest, LoopSource, TClause, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result,
     gives_element_itself,
 };
-use crate::typefns::{TypeFns, load_elem, store_elem};
+use crate::typefns::{TypeFns, load_elem, load_field, new_record, store_elem, store_field};
 use crate::types::{Kind, Ty};
 
 /// Name of the function the runtime calls to run the program.
@@ -75,6 +75,7 @@ fn ret_repr(ty: Ty) -> Option<Type> {
 pub fn lower(tir: &Tir) -> Module {
     let mut strings = Strings::default();
     let mut fns = TypeFns::default();
+    fns.trails = tir.trails.clone();
     let mut module = Module::default();
     for f in &tir.funcs {
         let func = FnLower::new(tir, f, &mut strings, &mut fns).run();
@@ -98,10 +99,37 @@ pub fn lower(tir: &Tir) -> Module {
     }
     b.ret(None);
     module.funcs.push(b.finish());
+    module.funcs.push(out_hook(fns.captures));
     fns.finish(&mut module);
 
     module.data = strings.data;
     module
+}
+
+/// `rt.out_hook`, which the runtime's `rt.out` calls with every piece of
+/// output (see `runtime/core.lir`): it gives the bytes to the string being
+/// built, if the program prints values into strings and one is being
+/// built, and returns 1; otherwise it returns 0.
+pub fn out_hook(captures: bool) -> lir::Function {
+    let mut b = FunctionBuilder::new("rt.out_hook", &[Type::I64, Type::I64], Some(Type::I64));
+    b.func.comment = Some("where output goes: the terminal, or a string being built".into());
+    let zero = b.iconst(0);
+    if captures {
+        let (p, n) = (b.param(0), b.param(1));
+        let capture = b.addr("rt.capture");
+        let building = b.load(MemTy::I64, capture, 0);
+        let capturing = b.icmp(ICond::Ne, building, zero);
+        let take = b.new_block("take");
+        let leave = b.new_block("leave");
+        b.br(capturing, take, vec![], leave, vec![]);
+        b.switch_to(take);
+        b.call("rt.capture_out", vec![p, n], None);
+        let one = b.iconst(1);
+        b.ret(Some(one));
+        b.switch_to(leave);
+    }
+    b.ret(Some(zero));
+    b.finish()
 }
 
 #[derive(Default)]
@@ -585,7 +613,9 @@ impl<'a> FnLower<'a> {
 
     /// The immortal object left in an array slot whose element was moved
     /// out: freeing it does nothing. An empty string and an empty array
-    /// have the same layout (`{ len 0 }`), and a box holds the void.
+    /// have the same layout (`{ len 0 }`), and a box holds the void; a
+    /// record's drop function skips immortal objects, so the empty string
+    /// does for records too.
     fn placeholder(&mut self, elem: Ty) -> Value {
         if elem.is_union() {
             self.void_box()
@@ -1114,6 +1144,64 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    // -- trails ---------------------------------------------------------------
+
+    /// A value of a trail: each field's value goes into a variable of its
+    /// own (owned, so a `ret` meanwhile frees it), and then into the new
+    /// record, which takes them all.
+    fn construct(&mut self, trail: &str, steps: &[(usize, TExpr)], slots: &[usize]) -> Value {
+        for (l, v) in steps {
+            let x = self.expr(v, Use::Move);
+            self.locals[*l] = Some(x);
+            self.local_tys[*l] = v.ty;
+            self.owned.locals[*l] = v.ty.needs_drop();
+        }
+        let fields: Vec<Ty> = self.tir.trails[trail]
+            .fields
+            .iter()
+            .map(|(_, t)| *t)
+            .collect();
+        let record = new_record(&mut self.b, fields.len());
+        for (k, (&l, fty)) in slots.iter().zip(fields).enumerate() {
+            let x = self.locals[l].expect("every field has a value");
+            let x = self.convert(x, self.local_tys[l], fty);
+            store_field(&mut self.b, record, k, fty, x);
+            self.owned.locals[l] = false;
+        }
+        record
+    }
+
+    /// Field `k` of `base` (the expression `e`): the field itself, still in
+    /// the record (see `TExpr::is_borrowed`), or a copy of a number; void
+    /// when the value may be void and is.
+    fn field(&mut self, e: &TExpr, base: &TExpr, k: usize) -> Value {
+        let itself = e.is_borrowed();
+        let vb = self.expr(base, Use::Borrow);
+        let trail = base.ty.trail().expect("typeck checked it is a record");
+        let fty = self.tir.trails[trail].fields[k].1;
+        let ty = e.ty;
+        let r = self.dispatch(vb, base.ty, ty, |this, kind, record| {
+            let r = match kind {
+                Kind::Record => {
+                    let x = load_field(&mut this.b, record, k, fty);
+                    if itself {
+                        this.convert_borrowed(x, fty, ty)
+                    } else {
+                        let x = this.fns.clone(&mut this.b, x, fty);
+                        this.convert(x, fty, ty)
+                    }
+                }
+                _ => {
+                    let void = this.b.iconst(0);
+                    this.convert(void, Ty::VOID, ty)
+                }
+            };
+            Some((ty, r))
+        });
+        self.keep_or_drop(e, itself, base, vb);
+        r
+    }
+
     /// `cond ? f() : void`, as a value of type `ty`. `f` returns its value
     /// and that value's type.
     fn or_void(&mut self, cond: Value, ty: Ty, f: impl FnOnce(&mut Self) -> (Value, Ty)) -> Value {
@@ -1413,7 +1501,10 @@ impl<'a> FnLower<'a> {
             self.fns.drop(&mut self.b, v, ty);
         }
         match &e.kind {
-            TExprKind::Builtin(_, a) | TExprKind::Index(a, _) | TExprKind::Convert(a)
+            TExprKind::Builtin(_, a)
+            | TExprKind::Index(a, _)
+            | TExprKind::Convert(a)
+            | TExprKind::Field(a, _)
                 if a.is_borrowed() =>
             {
                 self.release(a)
@@ -1588,6 +1679,26 @@ impl<'a> FnLower<'a> {
                 }
                 _ => self.comprehension_general(body, clauses, e.ty),
             },
+            TExprKind::Construct {
+                trail,
+                steps,
+                slots,
+            } => self.construct(trail, steps, slots),
+            TExprKind::Field(base, k) => self.field(e, base, *k),
+            // What `echo` would print, printed into a new string instead.
+            TExprKind::Textualize(inner) => {
+                let v = self.expr(inner, Use::Borrow);
+                let save = self.b.alloca(16);
+                self.fns.captures = true;
+                self.b.call("rt.capture_begin", vec![save], None);
+                self.fns.print(&mut self.b, v, inner.ty, false);
+                let text = self
+                    .b
+                    .call("rt.capture_end", vec![save], Some(Type::I64))
+                    .unwrap();
+                self.drop_temp(inner, v);
+                text
+            }
             TExprKind::Concat(a, b) => self.concat(a, b, e.ty),
             TExprKind::ElemMul(a, b) => self.elem_mul(a, b, e.ty),
             TExprKind::Builtin(b, arg) => self.builtin(e, *b, arg),
@@ -1810,6 +1921,7 @@ impl<'a> FnLower<'a> {
                 arms,
                 else_arm,
                 narrowing,
+                compares,
             } => {
                 let s = self.expr(scrutinee, Use::Borrow);
                 // A temporary being checked lives until the end of the
@@ -1842,6 +1954,12 @@ impl<'a> FnLower<'a> {
                     let p = self.expr(pat, Use::Borrow);
                     let cond = if scrutinee.ty.is_never() || pat.ty.is_never() {
                         self.b.iconst(0)
+                    } else if let Some(inst) = compares[k] {
+                        // a value of a trail: equal when `compare` gives 0
+                        let symbol = self.tir.funcs[inst].symbol.clone();
+                        let order = self.b.call(&symbol, vec![s, p], Some(Type::I64)).unwrap();
+                        let zero = self.b.iconst(0);
+                        self.b.icmp(ICond::Eq, order, zero)
                     } else {
                         self.matches(s, scrutinee.ty, p, pat.ty)
                     };

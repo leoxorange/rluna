@@ -326,21 +326,29 @@ impl Checker<'_> {
             && !e.ty.is_copy()
             && matches!(
                 e.kind,
-                TExprKind::Builtin(Builtin::Head | Builtin::Last, _) | TExprKind::Index(..)
+                TExprKind::Builtin(Builtin::Head | Builtin::Last, _)
+                    | TExprKind::Index(..)
+                    | TExprKind::Field(..)
             )
             && e.is_borrowed()
         {
+            let is_field = matches!(e.kind, TExprKind::Field(..));
             let whose = match e.borrowed_from() {
                 Some(l) => format!("`{}`", self.name(l)),
+                None if is_field => "its value".to_string(),
                 None => "its array".to_string(),
             };
-            self.errors.push(Diagnostic::error(
-                ErrorKind::OwnershipError,
-                e.span,
+            let msg = if is_field {
+                format!(
+                    "this is a field still inside {whose}, so it cannot be given away: a field cannot be moved out of its value; to keep it, give a copy with `copy`"
+                )
+            } else {
                 format!(
                     "this is an element still inside {whose} (`head`, `last` and `!!` give the element itself, not a copy), so it cannot be given away; to keep it, give a copy with `copy`"
-                ),
-            ));
+                )
+            };
+            self.errors
+                .push(Diagnostic::error(ErrorKind::OwnershipError, e.span, msg));
         }
         match &e.kind {
             TExprKind::Local(l) => self.owner(*l, e, usage),
@@ -377,6 +385,21 @@ impl Checker<'_> {
                 // New arrays (or strings) made of the elements of `x`.
                 Builtin::Tail | Builtin::Init | Builtin::Reverse => self.take(&[x]),
             },
+            // A field is like an element: the field itself keeps its value
+            // borrowed while it is used.
+            TExprKind::Field(base, _) if e.is_borrowed() => self.expr(base, Use::Borrow),
+            TExprKind::Field(base, _) => self.read(&[base]),
+            TExprKind::Textualize(x) => self.read(&[x]),
+            // The values move into the new value, through variables of its
+            // own (which the defaults of later fields borrow).
+            TExprKind::Construct { steps, .. } => {
+                let mark = self.borrows.len();
+                for (l, v) in steps {
+                    self.expr(v, Use::Move);
+                    self.moved.remove(l);
+                }
+                self.borrows.truncate(mark);
+            }
             TExprKind::Index(a, i) => {
                 if gives_element_itself(a.ty) {
                     self.expr(a, Use::Borrow);
@@ -527,7 +550,13 @@ impl Checker<'_> {
             Use::Move => {
                 let name = self.name(owner).to_string();
                 if let Some(lent) = self.lent.get(&owner) {
+                    // A field's default is a function of the fields before
+                    // it (see `hir`), named `Trail$field`.
+                    let in_default = self.f.name.contains('$');
                     let whose = match lent {
+                        Lent::Param if in_default => {
+                            format!("`{name}` is a field of the value being made, which keeps it")
+                        }
                         Lent::Param => format!(
                             "`{name}` is borrowed (`@{name}`): its value still belongs to the caller"
                         ),
@@ -535,13 +564,17 @@ impl Checker<'_> {
                             "`{name}` is an element borrowed from what the loop goes through (`in @...`)"
                         ),
                     };
-                    self.errors.push(Diagnostic::error(
-                        ErrorKind::OwnershipError,
-                        e.span,
+                    let msg = if in_default {
+                        format!(
+                            "{whose}, so a default cannot give it away; give a copy with `copy {name}`"
+                        )
+                    } else {
                         format!(
                             "{whose}, so it cannot be given away; lend it on (to a `@` parameter, or a loop over `@{name}`), or give a copy with `copy {name}`"
-                        ),
-                    ));
+                        )
+                    };
+                    self.errors
+                        .push(Diagnostic::error(ErrorKind::OwnershipError, e.span, msg));
                 } else if let Some(&(_, at)) = self.borrows.iter().find(|(o, _)| *o == owner) {
                     self.errors.push(
                         Diagnostic::error(

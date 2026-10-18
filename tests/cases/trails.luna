@@ -1,0 +1,83 @@
+# Trails: a trail lists fields (with defaults or without), and its values are
+# written `Fruit {...}`, or `{...}` where the trail is known. A field is read
+# with `.name` and, like an element, is the field itself: kept with `copy`.
+| links/shop
+| links/shop#Item > Thing
+
+trail Fruit:
+    name :: String
+    peel :: Boolean = false
+    label = name + "!"
+
+trail Warehouse:
+    rack :: [Fruit]
+    count :: Int = 0
+
+trail Node:
+    value :: Int
+    next :: Node
+
+trail Point follow Copy:
+    x :: Float
+    y :: Float = 0.0
+    n :: Numeric = 1
+
+trail Line follow Copy:
+    from :: Point
+    to :: Point
+
+buy money :: Int -> Fruit = check money > 5:
+    true -> {name = "pineapple", peel = true};
+    false -> {name = "grape"}
+
+greet @f = "hello " + f.name
+total @node = check node:
+    void -> 0;
+    else -> node.value + total node.next
+first_long fruits =
+    loop f in fruits:
+        check len f.name > 4:
+            true -> ret f;
+            false -> void
+    Fruit {name = "none"}
+pick n = check n > 0:
+    true -> Point {x = 1.5};
+    false -> 7
+store :: Warehouse = {rack = [{name = "fig"}]}
+
+main =
+    echo (buy 6).name
+    echo (buy 1).label
+    t = buy 6
+    echo t.peel
+    echo t.label
+    echo (greet t)
+    n = copy t.name
+    echo n
+    t = Fruit {name = "orange"}
+    echo t.label
+    w = Warehouse {rack = [t, {name = "kiwi"}]}
+    echo (len w.rack)
+    echo (head w.rack).name
+    echo w.count
+    echo (len store.rack)
+    loop f in @w.rack:
+        echo f.name
+    echo [copy f.label | f in @w.rack]
+    echo (first_long [Fruit {name = "plum"}, Fruit {name = "mango"}, Fruit {name = "lemon"}]).name
+    echo (first_long []).name
+    list = Node {value = 1, next = Node {value = 2, next = Node {value = 3}}}
+    echo (total list)
+    p = Point {x = 2.5, n = 2.5}
+    q = copy p
+    echo (q.x + q.y + q.n)
+    l = Line {from = p, to = {x = 1.0}}
+    m = copy l
+    echo m.to.x
+    echo (pick 0)
+    items = [Thing {label = "a"}, shop.cheap "b"]
+    loop it in items:
+        echo it.label
+        echo it.price
+    echo (shop.Item {label = "z"}).label
+    echo (buy 1)

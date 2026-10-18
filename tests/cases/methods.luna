@@ -1,0 +1,66 @@
+# Functions of trails: called on a value (`a.describe 2`), they see its
+# fields and functions by name, and `Self` is the trail. Following Compare
+# gives `<`, `==`, ... and `check` patterns; following Numeric gives
+# `+ - * /`. A trail that follows another gets its functions, and may give
+# its own instead.
+
+trail Fruit follow Show, Compare:
+    name :: String
+    weight :: Int = 1
+    textualize = copy name
+    describe n :: Int -> String = name + " x" + n.textualize
+    heavier @other :: Self -> Boolean = weight > other.weight
+    compare @other :: Self -> Int = check true:
+        weight < other.weight -> -1;
+        weight == other.weight -> 0;
+        else -> 1
+
+trail Apple follow Fruit:
+    color :: String = "red"
+    describe n :: Int -> String = color + " " + name + " x" + n.textualize
+
+trail Fraction follow Numeric:
+    top :: Int
+    bottom :: Int = 1
+    textualize = top.textualize + "/" + bottom.textualize
+    add @other :: Self -> Self = Fraction {top = top * other.bottom + other.top * bottom, bottom = bottom * other.bottom}
+    sub @other :: Self -> Self = Fraction {top = top * other.bottom - other.top * bottom, bottom = bottom * other.bottom}
+    mul @other :: Self -> Self = Fraction {top = top * other.top, bottom = bottom * other.bottom}
+    div @other :: Self -> Self = Fraction {top = top * other.bottom, bottom = bottom * other.top}
+    compare @other :: Self -> Int =
+        l = top * other.bottom
+        r = other.top * bottom
+        check true:
+            l < r -> -1;
+            l == r -> 0;
+            else -> 1
+
+trail Test:
+    print any :: Show -> Void = echo any
+
+main =
+    a = Fruit {name = "plum", weight = 3}
+    b = Fruit {name = "fig"}
+    echo (a.describe 2)
+    echo (a.heavier b)
+    echo (a < b)
+    echo (a > b)
+    echo (a == b)
+    echo (a != b)
+    p = Apple {name = "fuji", weight = 3}
+    echo (p.describe 1)
+    echo (p.heavier a)
+    echo (check b:
+        a -> "same as a";
+        else -> "not a")
+    half = Fraction {top = 1, bottom = 2}
+    third = Fraction {top = 1, bottom = 3}
+    echo (half + third)
+    echo (half - third)
+    echo (half * third)
+    echo (half / third)
+    echo (half > third)
+    t = Test {}
+    t.print "hello"
+    t.print [1, 2]
+    (Test {}).print half

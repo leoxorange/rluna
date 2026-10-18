@@ -1,0 +1,46 @@
+# Functions of trails can do what other functions do: several definitions
+# tried top to bottom, patterns, call chains. A follower's definitions are
+# tried before the inherited ones. And the library's functions that compare
+# values work for a program's trails that follow Compare.
+
+trail Bag:
+    items :: [Int]
+    label :: String = "bag"
+    describe n :: Int -> String = label + " of " + n.textualize
+    describe n :: String -> String = label + " says " + n
+    describe a b = label + " " + a + b
+    total (x:xs) = x + total xs
+    total [] = 0
+
+trail BigBag follow Bag:
+    describe n :: Int -> String = "big " + label + " of " + n.textualize
+
+trail Money follow Show, Compare:
+    cents :: Int
+    textualize = "$" + (cents / 100).textualize
+    compare @other :: Self -> Int = cents - other.cents
+
+main =
+    b = Bag {items = [1, 2, 3]}
+    echo (b.describe 5)
+    echo (b.describe "hi")
+    echo (b.describe "a" "b")
+    echo (b.total [4, 5, 6])
+    echo b.total [7, 8]
+    echo b.total reverse [1, 2, 3]
+    g = BigBag {items = [9]}
+    echo (g.describe 2)
+    echo (g.describe "yo")
+    # the library, on a trail that follows Compare
+    cheap = Money {cents = 150}
+    dear = Money {cents = 999}
+    echo (max cheap dear)
+    echo (min (Money {cents = 5}) (Money {cents = 7}))
+    echo (max "pear" "apple")
+    wallet = [Money {cents = 300}, Money {cents = 100}, Money {cents = 200}]
+    echo (contains wallet (Money {cents = 100}))
+    echo (count wallet (Money {cents = 200}))
+    echo (index_of wallet (Money {cents = 200}))
+    echo (maximum wallet)
+    echo (minimum [Money {cents = 300}, Money {cents = 100}])
+    echo (remove [Money {cents = 1}, Money {cents = 2}] (Money {cents = 1}))

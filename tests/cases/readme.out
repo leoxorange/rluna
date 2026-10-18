@@ -102,3 +102,10 @@ true
 a, b
 ["a", "b"]
 ababab
+pineapple
+pineapple
+pineapple
+orange
+orange
+count:[[pineapple, grape]]
+printed by a function of a trail

@@ -35,27 +35,33 @@ pub enum TokenKind {
     Loop,
     In,
     Ret,
+    Trail,
     // punctuation
-    Assign,     // =
-    EqEq,       // ==
-    NotEq,      // !=
-    Lt,         // <
-    Gt,         // >
-    Le,         // <=
-    Ge,         // >=
-    Plus,       // +
-    PlusPlus,   // ++
-    StarStar,   // **
-    BangBang,   // !!
-    DotDot,     // ..
-    Bar,        // |
-    Minus,      // -
-    Star,       // *
-    Slash,      // /
-    LParen,     // (
-    RParen,     // )
-    LBracket,   // [
-    RBracket,   // ]
+    Assign,   // =
+    EqEq,     // ==
+    NotEq,    // !=
+    Lt,       // <
+    Gt,       // >
+    Le,       // <=
+    Ge,       // >=
+    Plus,     // +
+    PlusPlus, // ++
+    StarStar, // **
+    BangBang, // !!
+    DotDot,   // ..
+    Bar,      // |
+    Minus,    // -
+    Star,     // *
+    Slash,    // /
+    LParen,   // (
+    RParen,   // )
+    LBracket, // [
+    RBracket, // ]
+    LBrace,   // {
+    RBrace,   // }
+    /// `.name` right after a closing bracket: a field, `(buy 6).name`.
+    /// (`t.name` is one `Ident`.)
+    FieldName(String),
     ColonColon, // ::
     Colon,      // :
     Arrow,      // ->
@@ -82,6 +88,10 @@ impl TokenKind {
             TokenKind::Loop => "`loop`".into(),
             TokenKind::In => "`in`".into(),
             TokenKind::Ret => "`ret`".into(),
+            TokenKind::Trail => "`trail`".into(),
+            TokenKind::LBrace => "`{`".into(),
+            TokenKind::RBrace => "`}`".into(),
+            TokenKind::FieldName(n) => format!("`.{n}`"),
             TokenKind::Assign => "`=`".into(),
             TokenKind::EqEq => "`==`".into(),
             TokenKind::NotEq => "`!=`".into(),
@@ -301,6 +311,7 @@ impl<'a> Lexer<'a> {
                         "loop" => TokenKind::Loop,
                         "in" => TokenKind::In,
                         "ret" => TokenKind::Ret,
+                        "trail" => TokenKind::Trail,
                         _ => TokenKind::Ident(word.to_string()),
                     };
                     self.push(kind, start);
@@ -332,6 +343,19 @@ impl<'a> Lexer<'a> {
                         (b')', _) => (TokenKind::RParen, 1),
                         (b'[', _) => (TokenKind::LBracket, 1),
                         (b']', _) => (TokenKind::RBracket, 1),
+                        (b'{', _) => (TokenKind::LBrace, 1),
+                        (b'}', _) => (TokenKind::RBrace, 1),
+                        // `.name` after `)`, `]` or `}`: a field
+                        (b'.', c) if c == b'_' || c.is_ascii_alphabetic() => {
+                            self.pos += 1;
+                            let name_start = self.pos;
+                            while self.peek() == b'_' || self.peek().is_ascii_alphanumeric() {
+                                self.pos += 1;
+                            }
+                            let name = self.text[name_start..self.pos].to_string();
+                            self.push(TokenKind::FieldName(name), start);
+                            continue;
+                        }
                         (b':', _) => (TokenKind::Colon, 1),
                         (b',', _) => (TokenKind::Comma, 1),
                         (b';', _) => (TokenKind::Semi, 1),
@@ -348,8 +372,10 @@ impl<'a> Lexer<'a> {
                     // Inside brackets, as inside parentheses, a line break
                     // does not end the statement.
                     match kind {
-                        TokenKind::LParen | TokenKind::LBracket => self.paren_depth += 1,
-                        TokenKind::RParen | TokenKind::RBracket => {
+                        TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                            self.paren_depth += 1
+                        }
+                        TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
                             self.paren_depth = self.paren_depth.saturating_sub(1)
                         }
                         _ => {}

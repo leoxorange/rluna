@@ -39,7 +39,7 @@ use std::collections::HashMap;
 
 use crate::ast::BinOp;
 use crate::diag::{Diagnostic, ErrorKind, Span};
-use crate::hir::{Builtin, FuncId, HClause, HExpr, HExprKind, HPattern, HStmt, Hir};
+use crate::hir::{Builtin, FieldDefault, FuncId, HClause, HExpr, HExprKind, HPattern, HStmt, Hir};
 use crate::types::{Kind, Ty};
 
 pub type InstId = usize;
@@ -48,6 +48,18 @@ pub type InstId = usize;
 pub struct Tir {
     pub funcs: Vec<TFunc>,
     pub entry: InstId,
+    /// The fields of every trail, with their final types, by global name.
+    pub trails: HashMap<String, TTrail>,
+    pub warnings: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TTrail {
+    /// The name to show for it (`Fruit`).
+    pub name: String,
+    pub fields: Vec<(String, Ty)>,
+    /// It follows Show: it is printed as its `textualize` field.
+    pub shows: bool,
 }
 
 #[derive(Debug)]
@@ -124,7 +136,7 @@ pub enum TClause {
     Gen {
         pos: Option<usize>,
         var: usize,
-        source: LoopSource,
+        source: Box<LoopSource>,
         /// `in @source`, as for `TStmt::Loop`.
         borrowed: bool,
     },
@@ -213,6 +225,8 @@ impl TExpr {
             TExprKind::Builtin(Builtin::Head | Builtin::Last, a) | TExprKind::Index(a, _) => {
                 gives_element_itself(a.ty)
             }
+            // A field is like an element: itself, unless it is a number.
+            TExprKind::Field(..) => !self.ty.is_copy(),
             TExprKind::Convert(inner) => inner.is_borrowed(),
             _ => false,
         }
@@ -229,6 +243,7 @@ impl TExpr {
             {
                 a.borrowed_from()
             }
+            TExprKind::Field(base, _) if !self.ty.is_copy() => base.borrowed_from(),
             TExprKind::Convert(inner) => inner.borrowed_from(),
             _ => None,
         }
@@ -287,6 +302,9 @@ pub enum TExprKind {
         else_arm: Option<Box<TExpr>>,
         /// Arms where the checked variable cannot be void.
         narrowing: Option<Narrowing>,
+        /// For each arm whose pattern is a value of a trail, the instance of
+        /// that trail's `compare`: the arm matches when it gives 0.
+        compares: Vec<Option<InstId>>,
     },
     /// The void value.
     Void,
@@ -311,6 +329,20 @@ pub enum TExprKind {
     /// `a ** b`: element by element products of two arrays, which it only
     /// reads.
     ElemMul(Box<TExpr>, Box<TExpr>),
+    /// A value of a trail (see `hir::HExprKind::Construct`): each step gives
+    /// a variable a field's value, already converted to the field's type;
+    /// `slots` are the variables of the fields, in order.
+    Construct {
+        trail: String,
+        steps: Vec<(usize, TExpr)>,
+        slots: Vec<usize>,
+    },
+    /// Field number `.1` of a value of a trail (or void, if the value may
+    /// be void and is).
+    Field(Box<TExpr>, usize),
+    /// `x.textualize` for an embedded value (`[1, 2].textualize` is
+    /// `"[1, 2]"`): what `echo` would print, as a new string.
+    Textualize(Box<TExpr>),
     /// Change representation from the inner expression's type to `ty`.
     /// If `ty` does not contain the inner type, this is a runtime type check.
     ///
@@ -419,6 +451,7 @@ pub fn check(hir: &Hir) -> Result<Tir, Vec<Diagnostic>> {
         hir,
         instances: Vec::new(),
         map: HashMap::new(),
+        warnings: Vec::new(),
     };
     // Start from `main`: only code reachable from it is compiled. Calls found
     // while checking a body create new instances, which this same loop then
@@ -432,6 +465,8 @@ pub fn check(hir: &Hir) -> Result<Tir, Vec<Diagnostic>> {
     loop {
         let mut changed = false;
         let mut errors = Vec::new();
+        // Only the last round's warnings count, as for errors.
+        tc.warnings.clear();
         let mut i = 0;
         while i < tc.instances.len() {
             match tc.check_instance(i) {
@@ -478,6 +513,7 @@ struct Checker<'a> {
     /// recursion work: `count` calling `count(int)` finds the instance that
     /// is already being checked, instead of creating copies forever.
     map: HashMap<(FuncId, Vec<Ty>), InstId>,
+    warnings: Vec<Diagnostic>,
 }
 
 struct Ctx<'a> {
@@ -492,6 +528,9 @@ struct Ctx<'a> {
     ret_ty: Ty,
     /// The declared return type, if any.
     declared: Option<Ty>,
+    /// The declared result is a trail the result must follow (`-> Fruit`
+    /// accepts a trail that follows Fruit), instead of `declared`.
+    ret_bound: Option<String>,
     /// The function is declared `-> void`: `ret` values are discarded.
     discard: bool,
     /// How many list comprehensions enclose the current expression.
@@ -500,6 +539,25 @@ struct Ctx<'a> {
 
 fn err(span: Span, msg: impl Into<String>) -> Diagnostic {
     Diagnostic::error(ErrorKind::TypeError, span, msg)
+}
+
+/// `a ∪ b`, unless that mixes values of two trails, which one value cannot
+/// be (for now).
+fn join(a: Ty, b: Ty, span: Span, what: &str) -> Result<Ty, Diagnostic> {
+    if a.clashes(b) {
+        return Err(err(
+            span,
+            format!(
+                "{what} give {a} and {b}, but a value has one trail at a time (mixing trails is not supported yet)"
+            ),
+        ));
+    }
+    Ok(a.union(b))
+}
+
+/// The name of a trail to show: `food.Fruit`, without the folders.
+pub fn shown_trail(global: &str) -> String {
+    global.rsplit('/').next().unwrap_or(global).to_string()
 }
 
 fn convert(e: TExpr, to: Ty) -> TExpr {
@@ -557,7 +615,12 @@ impl<'a> Checker<'a> {
             names: &func.local_names,
             loop_vars: Vec::new(),
             ret_ty: Ty::NEVER,
-            declared: func.ret,
+            declared: if func.ret_bound.is_some() {
+                None
+            } else {
+                func.ret
+            },
+            ret_bound: func.ret_bound.clone(),
             discard: func.ret == Some(Ty::VOID),
             in_comprehension: 0,
         };
@@ -570,7 +633,15 @@ impl<'a> Checker<'a> {
                 unreachable!()
             };
             result = v.ty;
-            if let Some(declared) = func.ret
+            if let Some(bound) = &func.ret_bound {
+                v = self.narrow(v, self.accepted(bound), || {
+                    format!("`{}` is declared to return {bound}", func.name)
+                })?;
+                self.bound(&v, bound, || {
+                    format!("`{}` is declared to return {bound}", func.name)
+                })?;
+                result = v.ty;
+            } else if let Some(declared) = func.ret
                 && declared != Ty::VOID
             {
                 v = self.narrow(v, declared, || {
@@ -581,7 +652,12 @@ impl<'a> Checker<'a> {
             body.push(TStmt::Expr(v));
         }
         // `ret` gives the function's result too.
-        result = result.union(cx.ret_ty);
+        result = join(
+            result,
+            cx.ret_ty,
+            func.name_span,
+            "the results of this function",
+        )?;
         if func.ret == Some(Ty::VOID) {
             result = Ty::VOID;
         }
@@ -665,8 +741,15 @@ impl<'a> Checker<'a> {
                     let widened: Vec<Ty> = carried
                         .iter()
                         .zip(&header)
-                        .map(|(&l, &t)| t.union(cx.local_tys[l]))
-                        .collect();
+                        .map(|(&l, &t)| {
+                            join(
+                                t,
+                                cx.local_tys[l],
+                                *var_span,
+                                "the values a variable gets in this loop",
+                            )
+                        })
+                        .collect::<Result<_, _>>()?;
                     if widened != header {
                         header = widened;
                         continue;
@@ -709,7 +792,7 @@ impl<'a> Checker<'a> {
                     TClause::Gen {
                         pos: *pos,
                         var: *var,
-                        source,
+                        source: Box::new(source),
                         borrowed: *borrowed,
                     }
                 }
@@ -768,7 +851,7 @@ impl<'a> Checker<'a> {
         let mut elem = Ty::NEVER;
         let mut first: Option<&TExpr> = None;
         for item in &items {
-            elem = elem.union(item.ty);
+            elem = join(elem, item.ty, item.span, "the elements of this array")?;
             // A void element fits any element type (`[void, 2]` is `[int?]`).
             if item.ty.without(Ty::VOID).is_never() {
                 continue;
@@ -893,6 +976,325 @@ impl<'a> Checker<'a> {
         Ok((TExprKind::Index(Box::new(a), Box::new(i)), ty))
     }
 
+    /// The function group of the function `name` of the trail of `ty`,
+    /// for a call with `nargs` arguments after the value.
+    fn method_of(
+        &self,
+        ty: Ty,
+        name: &str,
+        span: Span,
+        nargs: usize,
+    ) -> Result<String, Diagnostic> {
+        let Some(trail) = ty.trail().filter(|_| ty.as_kind() == Some(Kind::Record)) else {
+            let hint = if ty.is_maybe() {
+                ", which may be void: handle the void case first, e.g. with a `check` that has a `void ->` arm"
+            } else {
+                ""
+            };
+            return Err(err(
+                span,
+                format!("`.{name}` calls a function of a trail's value, but this is {ty}{hint}"),
+            ));
+        };
+        let t = &self.hir.trails[trail];
+        let shown = shown_trail(trail);
+        let Some(m) = t.methods.iter().find(|m| m.name == name) else {
+            let msg = if t.fields.iter().any(|f| f.name == name) {
+                format!("`{name}` is a field of `{shown}`, not a function")
+            } else {
+                format!("`{shown}` has no function `{name}`")
+            };
+            return Err(err(span, msg));
+        };
+        if !m.shapes.iter().any(|s| s.len() == nargs) {
+            let counts: Vec<String> = m.shapes.iter().map(|s| s.len().to_string()).collect();
+            return Err(err(
+                span,
+                format!(
+                    "`{name}` of `{shown}` takes {} argument(s), but it is given {nargs}",
+                    counts.join(" or ")
+                ),
+            ));
+        }
+        m.func.clone().ok_or_else(|| {
+            err(
+                span,
+                format!(
+                    "`{shown}` does not give the function `{name}`, which `{}` asks for",
+                    shown_trail(&m.from)
+                ),
+            )
+        })
+    }
+
+    /// `a op b` on values of trails: the trail's function behind the
+    /// operator, called on `a` with `b` (both only read). Both must be
+    /// values of the same trail, for now.
+    fn trail_operator(
+        &mut self,
+        op: BinOp,
+        lhs: TExpr,
+        rhs: TExpr,
+        span: Span,
+    ) -> Result<TExpr, Diagnostic> {
+        if lhs.ty.is_never() || rhs.ty.is_never() {
+            return Ok(TExpr {
+                kind: TExprKind::Diverge(vec![lhs, rhs]),
+                ty: Ty::NEVER,
+                span,
+            });
+        }
+        let (method, needs) = match op {
+            BinOp::Add => ("add", "Numeric"),
+            BinOp::Sub => ("sub", "Numeric"),
+            BinOp::Mul => ("mul", "Numeric"),
+            BinOp::Div => ("div", "Numeric"),
+            BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("typed separately"),
+            _ => ("compare", "Compare"),
+        };
+        let single = |t: Ty| t.as_kind() == Some(Kind::Record);
+        if !single(lhs.ty) || !single(rhs.ty) {
+            let msg = if lhs.ty.is_maybe() || rhs.ty.is_maybe() {
+                format!(
+                    "`{}` cannot be applied to {} and {}: a value that may be void must be handled first",
+                    op.as_str(),
+                    lhs.ty,
+                    rhs.ty
+                )
+            } else {
+                format!(
+                    "`{}` cannot be applied to {} and {}: on values of a trail it needs two of the same trail",
+                    op.as_str(),
+                    lhs.ty,
+                    rhs.ty
+                )
+            };
+            return Err(err(span, msg));
+        }
+        let trail = lhs.ty.trail().unwrap();
+        if !self.follows(rhs.ty, trail) {
+            return Err(err(
+                span,
+                format!(
+                    "`{}` cannot be applied to {} and {}: on values of a trail it needs two of the same trail",
+                    op.as_str(),
+                    lhs.ty,
+                    rhs.ty
+                ),
+            ));
+        }
+        if !self.hir.trails[trail].follows.iter().any(|f| f == needs) {
+            let what = if needs == "Compare" {
+                "compared"
+            } else {
+                "used as numbers"
+            };
+            return Err(err(
+                span,
+                format!(
+                    "`{}` values cannot be {what}: `{}` does not follow {needs}",
+                    shown_trail(trail),
+                    shown_trail(trail)
+                ),
+            ));
+        }
+        let group = self.method_of(lhs.ty, method, span, 1)?;
+        let call = self.call_typed(&group, vec![lhs, rhs], span)?;
+        if needs == "Numeric" {
+            return Ok(call);
+        }
+        // `a < b` is `a.compare b < 0`, and so on.
+        let zero = TExpr {
+            kind: TExprKind::Int(0),
+            ty: Ty::INT,
+            span,
+        };
+        Ok(TExpr {
+            kind: TExprKind::Binary {
+                op,
+                lhs: Box::new(call),
+                rhs: Box::new(zero),
+            },
+            ty: Ty::BOOL,
+            span,
+        })
+    }
+
+    /// The instance of `compare` that tests whether the value checked by a
+    /// `check` matches a pattern that is a value of a trail.
+    fn pattern_compare(&mut self, scrutinee: &TExpr, pat: &TExpr) -> Result<InstId, Diagnostic> {
+        let single = |t: Ty| t.as_kind() == Some(Kind::Record);
+        if !single(pat.ty) || !single(scrutinee.ty) || scrutinee.ty.trail() != pat.ty.trail() {
+            return Err(err(
+                pat.span,
+                format!(
+                    "a pattern that is a value of a trail needs the checked value to be one of the same trail, but they are {} and {}",
+                    scrutinee.ty, pat.ty
+                ),
+            ));
+        }
+        let trail = pat.ty.trail().unwrap();
+        if !self.hir.trails[trail]
+            .follows
+            .iter()
+            .any(|f| f == "Compare")
+        {
+            return Err(err(
+                pat.span,
+                format!(
+                    "a `check` compares its value with each pattern, and `{}` does not follow Compare",
+                    shown_trail(trail)
+                ),
+            ));
+        }
+        let group = self.method_of(pat.ty, "compare", pat.span, 1)?;
+        let f = self.hir.groups[&group][0];
+        Ok(self.instantiate(f, vec![scrutinee.ty, pat.ty]))
+    }
+
+    /// The types of a trail's fields: declared, or, for a field declared
+    /// only with a default, what its default gives (from the fields before
+    /// it). The latter grows during the fixpoint, like a return type.
+    fn field_tys(&mut self, trail: &str) -> Vec<Ty> {
+        let hir = self.hir;
+        let fields = &hir.trails[trail].fields;
+        let mut tys: Vec<Option<Ty>> = vec![None; fields.len()];
+        for k in 0..fields.len() {
+            self.field_ty(trail, k, &mut tys, &mut Vec::new());
+        }
+        tys.into_iter().map(|t| t.unwrap_or(Ty::NEVER)).collect()
+    }
+
+    /// The type of field `k`, after those of the fields its default uses.
+    fn field_ty(
+        &mut self,
+        trail: &str,
+        k: usize,
+        tys: &mut Vec<Option<Ty>>,
+        visiting: &mut Vec<usize>,
+    ) -> Ty {
+        if let Some(t) = tys[k] {
+            return t;
+        }
+        let hir = self.hir;
+        let fields = &hir.trails[trail].fields;
+        let ty = match (&fields[k].ty, &fields[k].default) {
+            (Some(ty), _) => *ty,
+            // defaults that use each other: reported when a value is made
+            _ if visiting.contains(&k) => Ty::NEVER,
+            (None, FieldDefault::Func { name, uses }) => {
+                visiting.push(k);
+                let args: Vec<Ty> = uses
+                    .iter()
+                    .map(|u| {
+                        let j = fields.iter().position(|f| &f.name == u).unwrap();
+                        self.field_ty(trail, j, tys, visiting)
+                    })
+                    .collect();
+                visiting.pop();
+                let inst = self.instantiate(hir.groups[name][0], args);
+                self.instances[inst].ret
+            }
+            (None, _) => Ty::NEVER,
+        };
+        tys[k] = Some(ty);
+        ty
+    }
+
+    /// Every value of `ty` follows the trail `bound`: a trail of the
+    /// program follows the trails in its `follow` line (and itself); the
+    /// embedded values follow Show and Copy, and an array does when its
+    /// elements do.
+    fn follows(&self, ty: Ty, bound: &str) -> bool {
+        let embedded = |k: Kind| {
+            self.hir
+                .embedded
+                .get(&k)
+                .is_some_and(|f| f.iter().any(|f| f == bound))
+        };
+        ty.kinds().all(|k| match k {
+            Kind::Record => ty
+                .trail()
+                .is_some_and(|t| self.hir.trails[t].follows.iter().any(|f| f == bound)),
+            Kind::Array => embedded(k) && ty.elem().is_some_and(|e| self.follows(e, bound)),
+            k => embedded(k),
+        })
+    }
+
+    /// `follows`, for the trail values and arrays in `ty`. The other
+    /// embedded values a bound takes are settled by its accepted type, with
+    /// a run-time check where the type cannot tell (a `Numeric` parameter
+    /// given an `Int|String` value, as before trails).
+    fn follows_bound(&self, ty: Ty, bound: &str) -> bool {
+        [Kind::Record, Kind::Array]
+            .into_iter()
+            .filter(|k| ty.contains(*k))
+            .all(|k| self.follows(ty.only(k), bound))
+    }
+
+    /// What a parameter or result declared with `bound` takes (see
+    /// `hir::accepts`).
+    fn accepted(&self, bound: &str) -> Ty {
+        crate::hir::accepts(Ty::ANY, &Some(bound.to_string()), &self.hir.embedded)
+    }
+
+    /// `v` follows `bound`, or an error saying what was expected.
+    fn bound(
+        &self,
+        v: &TExpr,
+        bound: &str,
+        what: impl FnOnce() -> String,
+    ) -> Result<(), Diagnostic> {
+        if v.ty.is_never() || self.follows_bound(v.ty, bound) {
+            return Ok(());
+        }
+        Err(err(
+            v.span,
+            format!("{}, but this is {}, which does not follow it", what(), v.ty),
+        ))
+    }
+
+    /// `copy` takes values whose trail follows Copy, and so must every
+    /// field of such a trail.
+    fn copyable(
+        &mut self,
+        ty: Ty,
+        span: Span,
+        seen: &mut Vec<&'static str>,
+    ) -> Result<(), Diagnostic> {
+        let hir = self.hir;
+        for t in ty.trails() {
+            if seen.contains(&t) {
+                continue;
+            }
+            seen.push(t);
+            let trail = &hir.trails[t];
+            if !trail.follows_copy {
+                return Err(err(
+                    span,
+                    format!(
+                        "`copy` needs a value whose trail follows Copy, but `{}` does not follow Copy",
+                        shown_trail(t)
+                    ),
+                ));
+            }
+            let tys = self.field_tys(t);
+            for (f, fty) in trail.fields.iter().zip(tys) {
+                self.copyable(fty, span, seen).map_err(|_| {
+                    err(
+                        span,
+                        format!(
+                            "`{}` follows Copy, so its fields must too, but `{}` is {fty}, which does not",
+                            shown_trail(t),
+                            f.name
+                        ),
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Convert `e` to `e.ty ∩ target`, inserting a runtime check if needed.
     ///
     /// Three cases: the value certainly fits (no code needed), certainly
@@ -969,7 +1371,14 @@ impl<'a> Checker<'a> {
                 let value = match value {
                     Some(v) => {
                         let mut v = self.expr(cx, v)?;
-                        if let Some(declared) = cx.declared
+                        if let Some(bound) = &cx.ret_bound {
+                            v = self.narrow(v, self.accepted(bound), || {
+                                format!("the function is declared to return {bound}")
+                            })?;
+                            self.bound(&v, bound, || {
+                                format!("the function is declared to return {bound}")
+                            })?;
+                        } else if let Some(declared) = cx.declared
                             && declared != Ty::VOID
                         {
                             v = self.narrow(v, declared, || {
@@ -998,6 +1407,7 @@ impl<'a> Checker<'a> {
                 }
                 // `copy` takes a value of any type and gives one of the same.
                 if *b == Builtin::Copy {
+                    self.copyable(arg.ty, arg.span, &mut Vec::new())?;
                     let ty = arg.ty;
                     return Ok(TExpr {
                         kind: TExprKind::Builtin(*b, Box::new(arg)),
@@ -1076,9 +1486,134 @@ impl<'a> Checker<'a> {
                     ty,
                 )
             }
+            HExprKind::MethodCall {
+                receiver,
+                name,
+                name_span,
+                args,
+            } => {
+                let receiver = self.expr(cx, receiver)?;
+                if receiver.ty.is_never() {
+                    return Ok(TExpr {
+                        kind: TExprKind::Diverge(vec![receiver]),
+                        ty: Ty::NEVER,
+                        span,
+                    });
+                }
+                let group = self.method_of(receiver.ty, name, *name_span, args.len())?;
+                let mut targs = vec![receiver];
+                for a in args {
+                    targs.push(self.expr(cx, a)?);
+                }
+                return self.call_typed(&group, targs, span);
+            }
+            HExprKind::Construct {
+                trail,
+                steps,
+                slots,
+            } => {
+                let hir = self.hir;
+                let tys = self.field_tys(trail);
+                let fields = &hir.trails[trail].fields;
+                let shown = shown_trail(trail);
+                let mut checked = Vec::new();
+                for (l, v) in steps {
+                    let k = slots
+                        .iter()
+                        .position(|s| s == l)
+                        .expect("every step fills a slot");
+                    let v = self.expr(cx, v)?;
+                    let target = tys[k];
+                    // An undeclared field's type comes from its default,
+                    // which may not be known yet in an early round.
+                    let v = if v.ty.is_never() || target.is_never() {
+                        v
+                    } else {
+                        let v = self.narrow(v, target, || {
+                            format!("the field `{}` of `{shown}` is {target}", fields[k].name)
+                        })?;
+                        convert(v, target)
+                    };
+                    cx.local_tys[*l] = v.ty;
+                    checked.push((*l, v));
+                }
+                (
+                    TExprKind::Construct {
+                        trail: trail.clone(),
+                        steps: checked,
+                        slots: slots.clone(),
+                    },
+                    Ty::record(trail),
+                )
+            }
+            HExprKind::Field(base, name, field_span) => {
+                let base = self.expr(cx, base)?;
+                if base.ty.is_never() {
+                    return Ok(TExpr {
+                        kind: TExprKind::Diverge(vec![base]),
+                        ty: Ty::NEVER,
+                        span,
+                    });
+                }
+                // The embedded values follow Show too: their `textualize` is
+                // what `echo` prints.
+                if name == "textualize"
+                    && !base.ty.contains(Kind::Record)
+                    && self.follows(base.ty, "Show")
+                {
+                    return Ok(TExpr {
+                        kind: TExprKind::Textualize(Box::new(base)),
+                        ty: Ty::STR,
+                        span,
+                    });
+                }
+                // A value that may be void gives void (nothing flows through).
+                let Some(trail) = base
+                    .ty
+                    .trail()
+                    .filter(|_| base.ty.without(Ty::VOID).as_kind() == Some(Kind::Record))
+                else {
+                    return Err(err(
+                        *field_span,
+                        format!(
+                            "`.{name}` reads a field of a trail's value, but this is {}",
+                            base.ty
+                        ),
+                    ));
+                };
+                let hir = self.hir;
+                let Some(k) = hir.trails[trail]
+                    .fields
+                    .iter()
+                    .position(|f| &f.name == name)
+                else {
+                    let why = if name == "textualize" {
+                        " (it does not follow Show)"
+                    } else if hir.trails[trail].methods.iter().any(|m| &m.name == name) {
+                        " (it is a function: give it its arguments)"
+                    } else {
+                        ""
+                    };
+                    return Err(err(
+                        *field_span,
+                        format!("`{}` has no field `{name}`{why}", shown_trail(trail)),
+                    ));
+                };
+                let mut ty = self.field_tys(trail)[k];
+                if base.ty.contains(Kind::Void) && !ty.is_never() {
+                    ty = ty.union(Ty::VOID);
+                }
+                (TExprKind::Field(Box::new(base), k), ty)
+            }
             HExprKind::Binary { op, lhs, rhs } => {
                 let lhs = self.expr(cx, lhs)?;
                 let rhs = self.expr(cx, rhs)?;
+                // On values of trails, the operators are the trails'
+                // functions: `compare` (Compare), `add`, `sub`, `mul`,
+                // `div` (Numeric).
+                if !lhs.ty.trails().is_empty() || !rhs.ty.trails().is_empty() {
+                    return self.trail_operator(*op, lhs, rhs, span);
+                }
                 // If either side never produces a value, neither does the
                 // operation. Without this rule, round 1 of the fixpoint would
                 // report false "cannot add never and int" errors.
@@ -1138,6 +1673,18 @@ impl<'a> Checker<'a> {
             }
             HExprKind::Echo(inner) => {
                 let inner = self.expr(cx, inner)?;
+                let mut trails = inner.ty.trails();
+                trails.dedup();
+                trails.retain(|t| !self.hir.trails[*t].shows);
+                for t in trails {
+                    self.warnings.push(Diagnostic::warning(
+                        inner.span,
+                        format!(
+                            "`{}` does not follow Show, so `echo` prints only its trail name",
+                            shown_trail(t)
+                        ),
+                    ));
+                }
                 (TExprKind::Echo(Box::new(inner)), Ty::VOID)
             }
             HExprKind::Check {
@@ -1157,6 +1704,7 @@ impl<'a> Checker<'a> {
                 };
                 let narrowed_ty = scrutinee.ty.without(Ty::VOID);
                 let mut narrowed_arms = Vec::new();
+                let mut compares = Vec::new();
                 let mut tarms = Vec::new();
                 let mut ty = Ty::NEVER;
                 let mut seen_true = false;
@@ -1175,6 +1723,15 @@ impl<'a> Checker<'a> {
                 };
                 for (pat, body) in arms {
                     let pat = self.expr(cx, pat)?;
+                    // `void ->` on a value that may be void is fine; a
+                    // pattern that is a trail's value would need comparing.
+                    // A pattern that is a value of a trail is compared with
+                    // the trail's `compare`.
+                    compares.push(if pat.ty.trails().is_empty() {
+                        None
+                    } else {
+                        Some(self.pattern_compare(&scrutinee, &pat)?)
+                    });
                     match pat.kind {
                         TExprKind::Bool(true) => seen_true = true,
                         TExprKind::Bool(false) => seen_false = true,
@@ -1183,7 +1740,7 @@ impl<'a> Checker<'a> {
                     }
                     let narrowed = narrow_local.is_some() && !pat.ty.contains(Kind::Void);
                     let body = arm_body(self, cx, body, narrowed)?;
-                    ty = ty.union(body.ty);
+                    ty = join(ty, body.ty, body.span, "the branches of this `check`")?;
                     narrowed_arms.push(narrowed);
                     tarms.push((pat, body));
                 }
@@ -1191,7 +1748,7 @@ impl<'a> Checker<'a> {
                 let else_arm = match else_arm {
                     Some(e) => {
                         let e = arm_body(self, cx, e, else_narrowed)?;
-                        ty = ty.union(e.ty);
+                        ty = join(ty, e.ty, e.span, "the branches of this `check`")?;
                         Some(e)
                     }
                     None => {
@@ -1243,6 +1800,7 @@ impl<'a> Checker<'a> {
                         arms: tarms,
                         else_arm,
                         narrowing,
+                        compares,
                     },
                     ty,
                 )
@@ -1262,6 +1820,19 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|a| self.expr(cx, a))
             .collect::<Result<_, _>>()?;
+        self.call_typed(name, args, span)
+    }
+
+    /// A call of the function group `group` with arguments already typed.
+    /// (A function of a trail is the group `Trail$name`; messages show
+    /// `name`.)
+    fn call_typed(
+        &mut self,
+        group: &str,
+        args: Vec<TExpr>,
+        span: Span,
+    ) -> Result<TExpr, Diagnostic> {
+        let name = group.rsplit('$').next().unwrap_or(group);
         if args.iter().any(|a| a.ty.is_never()) {
             // The call is never reached.
             return Ok(TExpr {
@@ -1279,7 +1850,7 @@ impl<'a> Checker<'a> {
         // definitions in the same order, until one accepts every possible
         // value (or none is left and the call fails at run time).
         let hir = self.hir;
-        let candidates: Vec<FuncId> = hir.groups[name]
+        let candidates: Vec<FuncId> = hir.groups[group]
             .iter()
             .copied()
             .filter(|&f| hir.funcs[f].params.len() == args.len())
@@ -1303,6 +1874,15 @@ impl<'a> Checker<'a> {
                 .any(|(a, t)| a.intersect(*t).is_never())
             {
                 continue; // cannot accept these arguments
+            }
+            // A parameter declared with a trail takes values of trails that
+            // follow it, which the types tell while compiling.
+            if args
+                .iter()
+                .zip(&func.bounds)
+                .any(|(a, b)| b.as_ref().is_some_and(|b| !self.follows_bound(a.ty, b)))
+            {
+                continue;
             }
             let tests: Vec<Option<Ty>> = remaining
                 .iter()
@@ -1383,12 +1963,38 @@ impl<'a> Checker<'a> {
                 let arg_tys: Vec<String> = args.iter().map(|a| a.ty.to_string()).collect();
                 if candidates.len() == 1 {
                     let f = &hir.funcs[candidates[0]];
+                    if let Some((i, (a, b))) =
+                        args.iter().zip(&f.bounds).enumerate().find(|(_, (a, b))| {
+                            b.as_ref().is_some_and(|b| !self.follows_bound(a.ty, b))
+                        })
+                    {
+                        return Err(err(
+                            a.span,
+                            format!(
+                                "argument {} of `{name}` must follow {}, but this is {}, which does not",
+                                i + 1,
+                                shown_trail(b.as_ref().unwrap()),
+                                a.ty
+                            ),
+                        ));
+                    }
                     let (i, (a, t)) = args
                         .iter()
                         .zip(&f.param_tys)
                         .enumerate()
                         .find(|(_, (a, t))| a.ty.intersect(**t).is_never())
                         .unwrap();
+                    if let Some(b) = &f.bounds[i] {
+                        return Err(err(
+                            a.span,
+                            format!(
+                                "argument {} of `{name}` must follow {}, but this is {}, which does not",
+                                i + 1,
+                                shown_trail(b),
+                                a.ty
+                            ),
+                        ));
+                    }
                     return Err(err(
                         a.span,
                         format!(
@@ -1452,7 +2058,12 @@ impl<'a> Checker<'a> {
         // Each instance receives the arguments narrowed to what reaches it.
         for c in cases {
             let inst = self.instantiate(c.f, c.receives.clone());
-            ty = ty.union(self.instances[inst].ret);
+            ty = join(
+                ty,
+                self.instances[inst].ret,
+                span,
+                "the definitions this call may reach",
+            )?;
             tcases.push(DispatchCase {
                 tests: c.tests,
                 lens: c.lens,
@@ -1534,7 +2145,40 @@ impl<'a> Checker<'a> {
                 borrowed: func.borrowed.clone(),
             });
         }
-        Tir { funcs, entry: 0 }
+        let mut trails = HashMap::new();
+        let names: Vec<String> = self.hir.trails.keys().cloned().collect();
+        for name in names {
+            let tys = self.field_tys(&name);
+            let fields = self.hir.trails[&name]
+                .fields
+                .iter()
+                .zip(tys)
+                .map(|(f, t)| (f.name.clone(), t))
+                .collect();
+            trails.insert(
+                name.clone(),
+                TTrail {
+                    name: shown_trail(&name),
+                    fields,
+                    shows: self.hir.trails[&name].shows,
+                },
+            );
+        }
+        let mut warnings: Vec<Diagnostic> = Vec::new();
+        for w in std::mem::take(&mut self.warnings) {
+            if !warnings
+                .iter()
+                .any(|o| o.span == w.span && o.message == w.message)
+            {
+                warnings.push(w);
+            }
+        }
+        Tir {
+            funcs,
+            entry: 0,
+            trails,
+            warnings,
+        }
     }
 }
 
@@ -1570,6 +2214,8 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
             clauses.iter().flat_map(TClause::exprs).for_each(&mut *f);
             f(body);
         }
+        TExprKind::Construct { steps, .. } => steps.iter().for_each(|(_, v)| f(v)),
+        TExprKind::Field(base, _) | TExprKind::Textualize(base) => f(base),
         TExprKind::Check {
             scrutinee,
             arms,
@@ -1591,6 +2237,7 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
 fn collect_calls(e: &TExpr, out: &mut Vec<InstId>) {
     match &e.kind {
         TExprKind::Call { inst, .. } => out.push(*inst),
+        TExprKind::Check { compares, .. } => out.extend(compares.iter().flatten()),
         TExprKind::Dispatch { cases, .. } => out.extend(cases.iter().map(|c| c.inst)),
         _ => {}
     }
@@ -1634,12 +2281,20 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
                 .for_each(|e| remap_calls(e, index));
             remap_calls(body, index);
         }
+        TExprKind::Construct { steps, .. } => {
+            steps.iter_mut().for_each(|(_, v)| remap_calls(v, index))
+        }
+        TExprKind::Field(base, _) | TExprKind::Textualize(base) => remap_calls(base, index),
         TExprKind::Check {
             scrutinee,
             arms,
             else_arm,
+            compares,
             ..
         } => {
+            for c in compares.iter_mut().flatten() {
+                *c = index[c];
+            }
             remap_calls(scrutinee, index);
             for (p, b) in arms {
                 remap_calls(p, index);

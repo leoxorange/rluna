@@ -159,7 +159,8 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   because it needs the elements in the opposite order, which no loop or
   comprehension gives. A program that defines a function with the
   same name uses its own instead.
-- **Standard library.** `src/std.luna` is written in Luna and compiled
+- **Standard library.** `src/std.luna` is written in Luna (the embedded
+  trails too, see Trails) and compiled
   together with every program (only what a program uses reaches its
   executable): `abs max min sum product average maximum minimum contains
   count index_of remove take drop flatten is_empty join split repeat`. A program that defines a name the library defines uses its own
@@ -276,7 +277,7 @@ marked, and nothing is copied unless the program asks.
   stays valid and a borrowed one can be given away. Copying one costs no
   more than moving it (`Ty::is_copy`). Strings and arrays (and unions with
   them) are never copied implicitly. This is the built-in `Copy` trail;
-  user-defined types and trails are planned (`todo.md`).
+  user-defined types and trails are planned.
 - **Overloads.** All definitions with the same name and number of
   parameters must borrow the same ones: a call cannot tell in advance which
   definition it reaches, yet it must know whether its arguments move.
@@ -337,6 +338,124 @@ Dropping a string calls `rt.free`; arrays and boxes get a drop function
 per type (`typefns`), which frees what they own and then themselves. The
 runtime counts live objects (`rt.live`); the `no_leaks` test runs every
 test program and checks the count is 0 at exit.
+
+## Trails
+
+A trail the program defines is a record: named fields, each with a trail
+and maybe a default, and functions (see the readme). Implemented: fields,
+values, field reads, defaults, recursive fields, `copy`, trails in linked
+files, `follow` (of `Show`, `Copy`, `Compare`, `Numeric` and the program's
+trails), `textualize` and `echo`, trails in signatures, functions of
+trails, and the operators of `Compare` and `Numeric`.
+
+- **Types.** A record is the seventh kind (`Kind::Record`, runtime tag 7),
+  and a `Ty` with that kind names its trail (`Ty::trail`, the global name:
+  `Fruit`, or `food.Fruit` from a linked file). A type holds at most one
+  trail; joining two (an array of both, a `check` giving either) is an error
+  (`Ty::clashes`, `typeck::join`). Type names print capitalized (`Int`,
+  `[String]`, `Fruit?`), and annotations accept both `Int` and `int`.
+- **Values.** `Fruit {name = "kiwi"}` parses as a call of `Fruit` with a
+  record argument, which `hir` turns into `HExprKind::Construct`. A bare
+  `{...}` gets its trail from what `hir` expects there: the declared result
+  of the function (for its last expression, `ret`, and through `check` arms
+  and array elements), the declared trail of a parameter (when every
+  definition with that many parameters agrees), or a field's.
+- **Defaults** become functions of the fields they use, which they
+  borrow: `textualize = copy name` in `Fruit` is `Fruit$textualize @name`
+  (`$` keeps these names unwritable). Which fields a default uses is found
+  before any function body is resolved, by resolving the default once with
+  all the other fields visible (`used_locals`). A construction evaluates
+  the fields given, in the order written, into variables of its own
+  (`#name`), then the defaults of the others, each once the fields it uses
+  have values (defaults that use each other are an error unless one is
+  given), and the record takes all the variables. A field declared without
+  a trail has the type its default gives, found during the fixpoint like a
+  return type (`Checker::field_ty`).
+- **follow.** A trail's fields are those of the trails it follows (in
+  order, a field from two of them once), then its own; a field it declares
+  again replaces the inherited one, at its own place, keeping the inherited
+  trail (`build_trail`). `HTrail::follows` lists everything a trail
+  follows, through other trails too, and itself.
+- **The embedded trails** are declared in `std.luna`, like any trail:
+  `Show` asks for `textualize :: String`, `Compare` for `compare @other ::
+  Self -> Int`, `Numeric` (following Show and Compare) for `add`, `sub`,
+  `mul`, `div`; `Copy`, `Any` and `Iterable` ask for nothing. They are
+  library trails (`ast::Trail::library`): programs cannot define them
+  again or make values of them. `std.luna` also declares what the embedded
+  values follow (`trail Int follow Numeric, Copy:`); those declarations
+  become `Hir::embedded` (per kind, with everything followed through
+  other trails), which `Checker::follows` reads. The embedded values get
+  their functions from the compiler: their operators are the built-in
+  ones, so ints and floats keep mixing.
+- **Trails in signatures** are bounds: a parameter `:: Fruit` takes any
+  record whose trail follows Fruit, and `:: Show`, `:: Compare`, `::
+  Numeric` also the embedded values that follow them (`hir::accepts`).
+  Only records and arrays are checked against the bound
+  (`Checker::follows_bound`); the other embedded values are settled by the
+  accepted type, with a run-time check where the type cannot tell, as
+  before trails (`:: Numeric` given an `Int|String`). The function is
+  compiled for each trail it gets, like any function, so no value carries
+  its trail at run time. A declared result `-> Fruit` is a bound too. A
+  field or an array declared with `Fruit` holds exactly Fruits.
+- **Show.** `echo` prints a value whose trail follows Show as its
+  `textualize` field. `x.textualize` on an embedded value is
+  `TExprKind::Textualize`: what `echo` would print, printed into a new
+  string. The runtime's `rt.out` hands every piece of output to
+  `rt.out_hook`, which `lower` writes for each program: in a program that
+  uses `textualize` it sends the output to the string being built
+  (`rt.capture_begin` / `rt.capture_end`), and in any other it does
+  nothing, so those programs do not carry the capture code.
+- **Recursive fields.** A field whose trail leads back to its own trail
+  (directly or through other fields) may be void: its type becomes `T?`,
+  and it is void when not given.
+- **Fields.** `t.name` is one name token; `hir` reads the part before the
+  first `.` as a variable, a linked file, or a global, in that order, and
+  the rest as fields. After a bracket, `.name` is a token of its own
+  (`(buy 6).name`). Like `head`, a field read gives the field itself, still
+  in the record (`TExpr::is_borrowed`), unless it is a number; keeping it
+  needs `copy`. On a value that may be void, a field read gives void.
+- **Copy.** `copy x` needs every trail in `x`'s type to follow Copy, and a
+  trail that follows Copy needs its fields to follow it too
+  (`Checker::copyable`). The copy is field by field (`typefns`).
+- **Functions of trails.** `describe n = ...` in `trail Fruit` becomes the
+  function `Fruit$describe #self n`, whose first parameter is the value,
+  borrowed, with the bound `Fruit` (so a trail that follows Fruit gets its
+  own instance). In its body, the trail's fields are fields of `#self`, and
+  its functions are calls on `#self` (`Resolver::member`). `t.describe 1`
+  and `(e).describe 1` are `HExprKind::MethodCall`; typeck finds the
+  function in the receiver's trail (`HTrail::methods`, inherited ones
+  too) and calls it with the receiver as the first argument
+  (`Checker::method_of`, `call_typed`). `Self` in a signature is the
+  trail, as a bound. A function without a body is asked for: the trails
+  that follow give it, and a trail that leaves one out has no values
+  (`construct` refuses).
+- A function of a trail is a function group like any other, so it can
+  have several definitions (tried top to bottom, agreeing on `@` for each
+  number of parameters: `HMethod::shapes`), patterns, and call chains (by
+  the numbers of arguments the trails' functions of that name take). A
+  follower's own definitions are tried before the inherited ones: its
+  group lists them first, then the inherited group (`HMethod::then`).
+- **Compare and Numeric.** Following Compare asks for `compare @other ::
+  Self -> Int`, and Numeric for `add`, `sub`, `mul`, `div` (each `@other ::
+  Self -> Self`), plus Compare and Show. The parameter must be borrowed,
+  because operators only read their operands. On two values of the same
+  trail, `a < b` is typed as `a.compare b < 0` and `a + b` as `a.add b`
+  (`Checker::trail_operator`); a `check` pattern that is a value of a
+  trail matches when `compare` gives 0 (`TExprKind::Check::compares`).
+- **Not yet.** `echo` prints the name of a trail that does not follow Show,
+  with a warning. A `check` narrows only variables, not fields: checking
+  `node.next` for void does not make it a `Node` in the other arms. The
+  library's `sum`, `product`, `average` and `abs` start from 0 or 1, so a
+  program's Numeric trails cannot use them (a trail cannot be asked for a
+  zero without a value of it).
+
+**Representation.** A record is `{ fields... }`, 8 bytes per field in the
+trail's order, allocated with `rt.alloc` (`typefns::new_record`). The
+static type always says which trail it is, so the record has no tag of its
+own; inside a union it is boxed with tag 7. `typefns` writes a drop, clone
+and print function per trail from the final field types (`Tir::trails`).
+A record's drop function skips immortal objects, so a loop that moves
+records out of an array can leave the empty string as the placeholder.
 
 ## Types and specialization
 

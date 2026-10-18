@@ -149,6 +149,7 @@ impl Parser {
     fn program(&mut self) -> PResult<Program> {
         let mut defs = Vec::new();
         let mut links = Vec::new();
+        let mut trails = Vec::new();
         self.skip_newlines();
         while self.at_link() {
             links.push(self.link()?);
@@ -162,6 +163,11 @@ impl Parser {
                     "links (`| file`) go at the top of the file, before the definitions",
                 ));
             }
+            if self.at_trail() {
+                trails.push(self.trail()?);
+                self.skip_newlines();
+                continue;
+            }
             if !self.at_def_start() {
                 let msg = if self.toks[self.pos].at_col0 {
                     "expected a definition (`name args = body`); top-level code must live inside a function such as `main`"
@@ -173,7 +179,173 @@ impl Parser {
             defs.push(self.def()?);
             self.skip_newlines();
         }
-        Ok(Program { links, defs })
+        Ok(Program {
+            links,
+            trails,
+            defs,
+        })
+    }
+
+    /// A line starting with `trail` in column 1.
+    fn at_trail(&self) -> bool {
+        let tok = &self.toks[self.pos];
+        tok.at_col0 && tok.kind == TokenKind::Trail
+    }
+
+    /// `trail Name [follow A, B]:` and its fields, one per line, indented:
+    /// `name :: T`, `name :: T = default` or `name = default`.
+    fn trail(&mut self) -> PResult<Trail> {
+        let start = self.bump().span;
+        let (name, name_span) = match self.peek().clone() {
+            TokenKind::Ident(n) => (n, self.bump().span),
+            _ => return Err(self.unexpected("the name of the trail")),
+        };
+        plain(&name, name_span)?;
+        let mut follows = Vec::new();
+        if matches!(self.peek(), TokenKind::Ident(w) if w == "follow") {
+            self.bump();
+            loop {
+                match self.peek().clone() {
+                    TokenKind::Ident(n) => follows.push((n, self.bump().span)),
+                    _ => return Err(self.unexpected("the name of a trail to follow")),
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&TokenKind::Colon, "`:` after the trail's name")?;
+        if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                self.span(),
+                "the fields of a trail go on the following lines, indented",
+            ));
+        }
+        let mut fields: Vec<Field> = Vec::new();
+        let mut methods: Vec<Method> = Vec::new();
+        loop {
+            self.skip_newlines();
+            let tok = &self.toks[self.pos];
+            if tok.kind == TokenKind::Eof || tok.col == 0 {
+                break;
+            }
+            let col = tok.col;
+            let (fname, span) = match self.peek().clone() {
+                TokenKind::Ident(n) => (n, self.bump().span),
+                _ => return Err(self.unexpected("a field of the trail (`name :: String`)")),
+            };
+            plain(&fname, span)?;
+            // With parameters, it is a function of the trail; a function
+            // may have several definitions, tried top to bottom.
+            let is_function = matches!(
+                self.peek(),
+                TokenKind::Ident(_) | TokenKind::At | TokenKind::LParen | TokenKind::LBracket
+            );
+            if fields.iter().any(|f| f.name == fname)
+                || (!is_function && methods.iter().any(|m| m.name == fname))
+            {
+                return Err(Diagnostic::error(
+                    ErrorKind::DefinitionError,
+                    span,
+                    format!("`{fname}` is declared more than once in this trail"),
+                ));
+            }
+            if is_function {
+                methods.push(self.method(fname, span, col)?);
+                continue;
+            }
+            let ty = if self.eat(&TokenKind::ColonColon) {
+                Some(self.type_ann()?)
+            } else {
+                None
+            };
+            let default = if self.eat(&TokenKind::Assign) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            if ty.is_none() && default.is_none() {
+                return Err(self.unexpected("`::` and the field's trail, or `=` and its value"));
+            }
+            if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+                return Err(self.unexpected("end of line after the field"));
+            }
+            fields.push(Field {
+                name: fname,
+                span,
+                ty,
+                default,
+            });
+        }
+        Ok(Trail {
+            name,
+            name_span,
+            follows,
+            fields,
+            methods,
+            span: start.to(self.prev_span()),
+            file: 0,
+            library: false,
+        })
+    }
+
+    /// A function of a trail, after its name: `p1 p2 [:: sig] [= body]`.
+    /// The body is the rest of the line, or the lines below indented
+    /// further than the name; without one, the trails that follow give it.
+    fn method(&mut self, name: String, span: Span, col: usize) -> PResult<Method> {
+        let mut params = Vec::new();
+        while let Some(p) = self.param()? {
+            if params.iter().any(|q: &Param| q.name == p.name) {
+                return Err(Diagnostic::error(
+                    ErrorKind::DefinitionError,
+                    p.span,
+                    format!("parameter `{}` is declared more than once", p.name),
+                ));
+            }
+            params.push(p);
+        }
+        let sig = if self.eat(&TokenKind::ColonColon) {
+            Some(self.signature(params.len())?)
+        } else {
+            None
+        };
+        let body = if self.eat(&TokenKind::Assign) {
+            let stmts = if matches!(self.peek(), TokenKind::Newline) {
+                self.stmts(Some(col))?
+            } else {
+                let e = self.expr()?;
+                if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+                    return Err(self.unexpected("end of line after the function"));
+                }
+                vec![Stmt::Expr(e)]
+            };
+            if stmts.is_empty() {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    span,
+                    "this function has an empty body",
+                ));
+            }
+            Some(Block { stmts })
+        } else {
+            if sig.is_none() {
+                return Err(
+                    self.unexpected("`::` and the function's signature, or `=` and its body")
+                );
+            }
+            if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+                return Err(self.unexpected("end of line after the function"));
+            }
+            None
+        };
+        Ok(Method {
+            name,
+            span,
+            params,
+            sig,
+            body,
+        })
     }
 
     /// A line starting with `|` in column 1.
@@ -381,15 +553,29 @@ impl Parser {
         }
     }
 
+    /// A trail in a signature or a field: `Int`, `Fruit`, `food.Fruit`, or
+    /// `[T]` for an array of `T`.
     fn type_ann(&mut self) -> PResult<TypeAnn> {
         let span = self.span();
-        if let TokenKind::Ident(n) = self.peek()
-            && let Some(name) = TypeName::parse(n)
-        {
-            self.bump();
-            return Ok(TypeAnn { name, span });
+        match self.peek().clone() {
+            TokenKind::Ident(n) => {
+                self.bump();
+                Ok(TypeAnn {
+                    kind: TypeAnnKind::Name(n),
+                    span,
+                })
+            }
+            TokenKind::LBracket => {
+                self.bump();
+                let inner = self.type_ann()?;
+                self.expect(&TokenKind::RBracket, "`]` after the trail of the elements")?;
+                Ok(TypeAnn {
+                    kind: TypeAnnKind::Array(Box::new(inner)),
+                    span: span.to(self.prev_span()),
+                })
+            }
+            _ => Err(self.unexpected("a trail (Int, String, Numeric, Any, Fruit, [Int], ...)")),
         }
-        Err(self.unexpected("a type (numeric, int, float, string, boolean, void, any)"))
     }
 
     /// `:: T1, T2 -> R`. Knowing the number of parameters up front lets the
@@ -451,6 +637,7 @@ impl Parser {
             if tok.kind == TokenKind::Eof
                 || self.at_def_start()
                 || self.at_link()
+                || self.at_trail()
                 || deeper_than.is_some_and(|col| tok.col <= col)
             {
                 return Ok(stmts);
@@ -842,6 +1029,7 @@ impl Parser {
                 | TokenKind::False
                 | TokenKind::LParen
                 | TokenKind::LBracket
+                | TokenKind::LBrace
                 // not an atom, but `f @x` gets `atom`'s explanation
                 | TokenKind::At
         )
@@ -881,6 +1069,23 @@ impl Parser {
         }
         let atom = self.atom()?;
         if self.starts_atom() {
+            // `(buy 6).describe 1`: a function of the value's trail
+            if let ExprKind::Field(receiver, name, name_span) = atom.kind {
+                let mut args = Vec::new();
+                while self.starts_atom() {
+                    args.push(self.atom()?);
+                }
+                let span = atom.span.to(args.last().unwrap().span);
+                return Ok(Expr {
+                    kind: ExprKind::Method {
+                        receiver,
+                        name,
+                        name_span,
+                        args,
+                    },
+                    span,
+                });
+            }
             return Err(Diagnostic::error(
                 ErrorKind::SyntaxError,
                 self.span(),
@@ -981,9 +1186,59 @@ impl Parser {
         done(self, ExprKind::Array(items))
     }
 
+    /// An atom and the fields read from it: `(buy 6).name`.
     fn atom(&mut self) -> PResult<Expr> {
+        let mut e = self.primary()?;
+        while let TokenKind::FieldName(name) = self.peek().clone() {
+            let span = self.bump().span;
+            e = Expr {
+                span: e.span.to(span),
+                kind: ExprKind::Field(Box::new(e), name, span),
+            };
+        }
+        Ok(e)
+    }
+
+    /// `{name = "kiwi", peel = true}`: the fields of a trail's value.
+    fn record(&mut self) -> PResult<Expr> {
+        let start = self.bump().span;
+        let mut fields: Vec<(String, Span, Expr)> = Vec::new();
+        if !self.eat(&TokenKind::RBrace) {
+            loop {
+                let (name, span) = match self.peek().clone() {
+                    TokenKind::Ident(n) => (n, self.bump().span),
+                    _ => return Err(self.unexpected("a field name (`{name = value}`)")),
+                };
+                plain(&name, span)?;
+                if fields.iter().any(|(n, _, _)| *n == name) {
+                    return Err(Diagnostic::error(
+                        ErrorKind::DefinitionError,
+                        span,
+                        format!("the field `{name}` is given more than once"),
+                    ));
+                }
+                self.expect(&TokenKind::Assign, "`=` after the field name")?;
+                fields.push((name, span, self.expr()?));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                // a comma before `}` is fine
+                if self.peek() == &TokenKind::RBrace {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBrace, "`,` or `}` after a field")?;
+        }
+        Ok(Expr {
+            kind: ExprKind::Record(fields),
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    fn primary(&mut self) -> PResult<Expr> {
         let span = self.span();
         let kind = match self.peek().clone() {
+            TokenKind::LBrace => return self.record(),
             TokenKind::Int(v) => ExprKind::Int(v),
             TokenKind::Float(v) => ExprKind::Float(v),
             TokenKind::Str(s) => ExprKind::Str(s),
@@ -1096,10 +1351,41 @@ mod tests {
         );
         let sig = p.defs[0].sig.as_ref().unwrap();
         assert_eq!(sig.params.len(), 2);
-        assert_eq!(sig.ret.unwrap().name, TypeName::Numeric);
+        assert_eq!(sig.ret.as_ref().unwrap().to_string(), "numeric");
         assert_eq!(
-            p.defs[1].sig.as_ref().unwrap().ret.unwrap().name,
-            TypeName::Boolean
+            p.defs[1]
+                .sig
+                .as_ref()
+                .unwrap()
+                .ret
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            "boolean"
+        );
+    }
+
+    #[test]
+    fn trails() {
+        let p = parse_src(
+            "trail Fruit follow Copy:\n    name :: String\n    peel :: Boolean = false\n    label = name + \"!\"\n    box :: [food.Fruit]\n\nbuy n :: Int -> Fruit = {name = \"kiwi\", peel = true}\nmain = echo (Fruit {name = \"a\"}).name\n",
+        );
+        assert_eq!(p.trails.len(), 1);
+        assert_eq!(p.defs.len(), 2);
+        let dumped = crate::ast::dump(&p);
+        assert!(
+            dumped.contains(
+                "(trail Fruit follow Copy\n  (name :: String)\n  (peel :: Boolean = false)\n  (label = (+ name \"!\"))\n  (box :: [food.Fruit]))"
+            ),
+            "{dumped}"
+        );
+        assert!(
+            dumped.contains("{name = \"kiwi\", peel = true}"),
+            "{dumped}"
+        );
+        assert!(
+            dumped.contains("(echo (. (Fruit {name = \"a\"}) name))"),
+            "{dumped}"
         );
     }
 

@@ -9,40 +9,89 @@
 # their result out of the elements (`take`, `drop`, `flatten`, `remove`,
 # `maximum`, `minimum`) take it, like `tail` and `++`, and nothing is
 # copied.
+#
+# Functions that compare values (`max`, `min`, `maximum`, `minimum`,
+# `contains`, `count`, `index_of`, `remove`) work for every trail that
+# follows Compare, a program's trails too. The ones that add up numbers
+# start from 0 or 1, so they work for the embedded numbers.
+
+# -- the embedded trails ----------------------------------------------------
+#
+# Trails every program can follow and name in signatures. The compiler
+# knows what they mean (`echo` prints a `textualize`, `<` calls `compare`,
+# `+` calls `add`), but what they ask for is written here.
+
+# Every value follows Any.
+trail Any:
+
+# Printable: `echo` prints a value's `textualize`.
+trail Show:
+    textualize :: String
+
+# A pass for `copy`: only a value whose trail follows Copy can be copied.
+trail Copy:
+
+# Comparable: `<`, `<=`, `>`, `>=`, `==`, `!=` and `check` patterns come from
+# `a.compare b`, which is -1 if `a` comes first, 0 if they are equal, and 1
+# if `b` does. (Operators only read their operands: `other` is borrowed.)
+trail Compare:
+    compare @other :: Self -> Int
+
+# Plays like a number: `a + b` is `a.add b`, `a - b` is `a.sub b`, and so
+# on, for two values of the same trail.
+trail Numeric follow Show, Compare:
+    add @other :: Self -> Self
+    sub @other :: Self -> Self
+    mul @other :: Self -> Self
+    div @other :: Self -> Self
+
+# What a loop or a list comprehension can go through.
+trail Iterable:
+
+# The embedded values are machine values, which the compiler gives their
+# functions (`1 + 0.5` is 1.5, since ints and floats are both numbers). These
+# lines say which trails they follow. An array follows Show and Copy only
+# when its elements do.
+trail Int follow Numeric, Copy:
+trail Float follow Numeric, Copy:
+trail String follow Show, Compare, Copy, Iterable:
+trail Boolean follow Show, Copy:
+trail Void follow Show, Copy:
+trail Array follow Show, Copy, Iterable:
 
 # -- numbers -----------------------------------------------------------------
 
 # The distance from zero: `abs (-3)` is 3.
-abs x :: numeric -> numeric = check x < 0:
+abs x :: Numeric -> Numeric = check x < 0:
     true -> -x;
     false -> x
 
-# The larger of two numbers.
-max a b :: numeric, numeric -> numeric = check a < b:
+# The larger of two values that can be compared.
+max a b :: Compare, Compare -> Compare = check a < b:
     true -> b;
     false -> a
 
-# The smaller of two numbers.
-min a b :: numeric, numeric -> numeric = check b < a:
+# The smaller of two values that can be compared.
+min a b :: Compare, Compare -> Compare = check b < a:
     true -> b;
     false -> a
 
 # The sum of an array of numbers; 0 for an empty array.
-sum @a :: array -> numeric =
+sum @a :: Array -> Numeric =
     total = 0
     loop x in @a:
         total = total + x
     total
 
 # The product of an array of numbers; 1 for an empty array.
-product @a :: array -> numeric =
+product @a :: Array -> Numeric =
     total = 1
     loop x in @a:
         total = total * x
     total
 
 # The average of an array of numbers (a float), or void for an empty array.
-average @a =
+average @a :: Array =
     n = len a
     check n:
         0 -> void;
@@ -52,7 +101,7 @@ average @a =
 
 # The largest element, or void for an empty array. (It gives an element of
 # `a`, so it takes `a`.)
-maximum (x:xs) =
+maximum (x:xs) :: Array -> Any =
     best = x
     loop y in xs:
         best = check y > best:
@@ -62,7 +111,7 @@ maximum (x:xs) =
 maximum [] = void
 
 # The smallest element, or void for an empty array.
-minimum (x:xs) =
+minimum (x:xs) :: Array -> Any =
     best = x
     loop y in xs:
         best = check y < best:
@@ -72,7 +121,7 @@ minimum (x:xs) =
 minimum [] = void
 
 # Whether `a` (an array or a string) has an element equal to `x`.
-contains @a @x =
+contains @a @x :: Iterable, Any -> Boolean =
     loop y in @a:
         check y == x:
             true -> ret true;
@@ -80,7 +129,7 @@ contains @a @x =
     false
 
 # How many elements of `a` are equal to `x`.
-count @a @x =
+count @a @x :: Iterable, Any -> Int =
     n = 0
     loop y in @a:
         n = check y == x:
@@ -89,7 +138,7 @@ count @a @x =
     n
 
 # The position of the first element of `a` equal to `x`, or void.
-index_of @a @x =
+index_of @a @x :: Iterable, Any =
     loop i, y in @a:
         check y == x:
             true -> ret i;
@@ -97,27 +146,27 @@ index_of @a @x =
     void
 
 # The elements of `a` that are not equal to `x`.
-remove a @x = [y | y in a, y != x]
+remove a @x :: Iterable, Any -> Array = [y | y in a, y != x]
 
 # -- building arrays ---------------------------------------------------------
 
 # The first `n` elements (all of them if there are fewer).
-take n a :: int, array -> array = [x | i, x in a, i < n]
+take n a :: Int, Array -> Array = [x | i, x in a, i < n]
 
 # The elements after the first `n`.
-drop n a :: int, array -> array = [x | i, x in a, i >= n]
+drop n a :: Int, Array -> Array = [x | i, x in a, i >= n]
 
 # The arrays in `a` joined into one: `flatten [[1], [2, 3]]` is [1, 2, 3].
-flatten a :: array -> array = [x | part in a, x in part]
+flatten a :: Array -> Array = [x | part in a, x in part]
 
 # Whether an array or a string has no elements.
-is_empty @a = len a == 0
+is_empty @a :: Iterable -> Boolean = len a == 0
 
 # -- strings -----------------------------------------------------------------
 
 # The strings in `a` joined, with `sep` between them:
 # `join ["a", "b"] ", "` is "a, b".
-join @a @sep :: array, string -> string =
+join @a @sep :: Array, String -> String =
     out = ""
     first = true
     loop s in @a:
@@ -130,7 +179,7 @@ join @a @sep :: array, string -> string =
 
 # The parts of `s` between the occurrences of the character `sep`:
 # `split "a,b" ","` is ["a", "b"].
-split @s @sep :: string, string -> array =
+split @s @sep :: String, String -> Array =
     parts = []
     current = ""
     loop c in @s:
@@ -144,7 +193,7 @@ split @s @sep :: string, string -> array =
     parts ++ [current]
 
 # `s` repeated `n` times.
-repeat @s n :: string, int -> string =
+repeat @s n :: String, Int -> String =
     out = ""
     loop i in [0..n]:
         out = out + s

@@ -140,7 +140,7 @@ fn compile_errors() {
     let cases = [
         (
             "sum a b :: numeric, numeric -> numeric = a + b\nmain = sum \"hello\" 5",
-            "argument 1 of `sum` must be numeric",
+            "argument 1 of `sum` must be Numeric",
         ),
         ("main = echo missing", "SymbolNotFoundError"),
         ("foo = 1", "no `main` function"),
@@ -150,7 +150,7 @@ fn compile_errors() {
         ),
         (
             "main = echo (\"a\" - 1)",
-            "operator `-` cannot be applied to string and int",
+            "operator `-` cannot be applied to String and Int",
         ),
         ("main = echo 1 2", "`echo` takes one argument"),
         (
@@ -181,7 +181,7 @@ fn compile_errors() {
         ),
         (
             "f x :: int -> int =\n    ret \"s\"\nmain = echo (f 1)",
-            "the function is declared to return int",
+            "the function is declared to return Int",
         ),
         ("PI = 3\nmain = echo PI", "`PI` is a built-in constant"),
         ("main = echo (len 5)", "`len` takes an array or a string"),
@@ -243,11 +243,11 @@ fn compile_errors() {
         ),
         (
             "main =\n    loop x in [0..5]:\n        x = \"s\"",
-            "`x` is the variable of a loop and must stay an int, but this is string",
+            "`x` is the variable of a loop and must stay an int, but this is String",
         ),
         (
             "main =\n    loop x in [0..2]:\n        loop y in [0..2]:\n            x = 2.5",
-            "`x` is the variable of a loop and must stay an int, but this is float",
+            "`x` is the variable of a loop and must stay an int, but this is Float",
         ),
         // borrowing: what is borrowed cannot be given away or changed
         (
@@ -310,6 +310,186 @@ fn compile_errors() {
             "f a = a\nmain =\n    s = \"x\"\n    echo (f @s)",
             "`@` only marks a borrowed parameter",
         ),
+        // trails
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nbuy m :: Int -> Fruit = {name = 1}\nmain = echo (buy 1).peel",
+            "the field `name` of `Fruit` is String, but this is Int",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nbuy m :: Int -> Fruit = {peel = true}\nmain = echo (buy 1).peel",
+            "every `Fruit` needs a value for `name`, which has no default",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nbuy m :: Int -> Fruit = {name = \"a\", money = 5}\nmain = echo (buy 1).peel",
+            "`Fruit` has no field `money`",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = {x = \"a\"}\n    echo 1",
+            "this `{...}` needs the name of its trail",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    n = t.name\n    echo n",
+            "a field cannot be moved out of its value",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo (copy t)",
+            "`copy` needs a value whose trail follows Copy, but `Fruit` does not follow Copy",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo (t == t)",
+            "`Fruit` values cannot be compared: `Fruit` does not follow Compare",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\ntrail Shop:\n    x :: Int\nmain = echo [Fruit {name = \"a\"}, Shop {x = 1}]",
+            "give Fruit and Shop, but a value has one trail at a time",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\ntrail Fruit:\n    x :: Int\nmain = echo 1",
+            "the trail `Fruit` is defined more than once",
+        ),
+        (
+            "trail Int:\n    x :: Int\nmain = echo 1",
+            "`Int` is an embedded trail",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nFruit = 1\nmain = echo 1",
+            "names both a trail and a function",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain = echo Fruit",
+            "`Fruit` is a trail, not a value",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain = echo (Fruit {name = \"a\"}).color",
+            "`Fruit` has no field `color`",
+        ),
+        (
+            "main =\n    x = 5\n    echo x.name",
+            "`.name` reads a field of a trail's value, but this is Int",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\ntrail C follow Copy:\n    f :: Fruit\nmain = echo (copy (C {f = Fruit {name = \"a\"}}))",
+            "`C` follows Copy, so its fields must too",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo t.name 5",
+            "`name` is a field of `Fruit`, not a function",
+        ),
+        (
+            "trail Fruit:\n    name :: String\n    label = name\nmain = echo (Fruit {name = \"a\"}).label",
+            "a default cannot give it away",
+        ),
+        (
+            "trail Fruit:\n    name :: Shape\nmain = echo 1",
+            "cannot find the trail `Shape`",
+        ),
+        // following trails
+        (
+            "trail Shop follow Show:\n    name :: String\nmain = echo (Shop {name = \"a\"})",
+            "every `Shop` needs a value for `textualize`",
+        ),
+        (
+            "trail Fruit follow Show:\n    name :: String\n    textualize = copy name\ntrail Plain:\n    x :: Int\ndescribe @f :: Fruit -> String = f.name\nmain = echo (describe 5)",
+            "argument 1 of `describe` must follow Fruit, but this is Int",
+        ),
+        (
+            "trail Fruit follow Show:\n    name :: String\n    textualize = copy name\ntrail Plain:\n    x :: Int\nshow @x :: Show -> Int = 1\nmain = echo (show (Plain {x = 1}))",
+            "argument 1 of `show` must follow Show, but this is Plain",
+        ),
+        (
+            "trail A follow B:\n    x :: Int\ntrail B follow A:\n    y :: Int\nmain = echo 1",
+            "follows itself",
+        ),
+        (
+            "trail A follow Iterable:\n    x :: Int\nmain = echo 1",
+            "only the embedded values follow `Iterable`, for now",
+        ),
+        (
+            "trail Fruit follow Show:\n    name :: String\n    textualize = copy name\ntrail Plain:\n    x :: Int\ntrail A follow Fruit:\n    textualize :: Int = 5\nmain = echo 1",
+            "`textualize` is String in the trail `A` follows, so it cannot be Int here",
+        ),
+        (
+            "trail A:\n    x = y + 1\n    y = x + 1\nmain = echo (A {}).x",
+            "the defaults of `x` and `y` use each other",
+        ),
+        (
+            "trail Fruit follow Show:\n    name :: String\n    textualize = copy name\ntrail Plain:\n    x :: Int\nmain = echo (Plain {x = 1}).textualize",
+            "`Plain` has no field `textualize` (it does not follow Show)",
+        ),
+        (
+            "trail Fruit follow Show:\n    name :: String\n    textualize = copy name\ntrail Plain:\n    x :: Int\npick n :: Int -> Fruit = Plain {x = 1}\nmain = echo (pick 1)",
+            "`pick` is declared to return Fruit, but this is Plain, which does not follow it",
+        ),
+        // functions of trails
+        (
+            "trail Half follow Compare:\n    x :: Int\nmain = echo (Half {x = 1}).x",
+            "a `Half` cannot be made: it does not give the function `compare`, which `Compare` asks for",
+        ),
+        (
+            "trail Bad follow Compare:\n    x :: Int\n    compare other :: Self -> Int = 0\nmain = echo 1",
+            "`compare` must take the parameters `Compare` asks for",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain = echo ((Box {x = 1}).get 1 2)",
+            "`get` of `Box` takes 1 argument(s), but it is given 2",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain = echo ((Box {x = 1}).nope 1)",
+            "`Box` has no function `nope`",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain =\n    b = Box {x = 1}\n    echo (b.x 1)",
+            "`x` is a field of `Box`, not a function",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain =\n    b = Box {x = 1}\n    echo b.get",
+            "(it is a function: give it its arguments)",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain = echo (Plain {x = 1} < Plain {x = 2})",
+            "`Plain` values cannot be compared: `Plain` does not follow Compare",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain = echo (Box {x = 1} < Plain {x = 2})",
+            "on values of a trail it needs two of the same trail",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain = echo (Box {x = 1} + Box {x = 2})",
+            "`Box` values cannot be used as numbers: `Box` does not follow Numeric",
+        ),
+        (
+            "trail Box follow Compare:\n    x :: Int\n    compare @other :: Self -> Int = x - other.x\n    get n = x + n\ntrail Plain:\n    x :: Int\nmain = echo (check Plain {x = 1}:\n    Plain {x = 1} -> 1;\n    else -> 2)",
+            "`Plain` does not follow Compare",
+        ),
+        (
+            "f x :: Self -> Int = 1\nmain = echo 1",
+            "cannot find the trail `Self`",
+        ),
+        (
+            "trail Q:\n    x :: Int\n    show n = x + n\n    use = show 1\nmain = echo (Q {x = 1}).use",
+            "a field's default cannot call `show`",
+        ),
+        // embedded trails and trail functions
+        (
+            "trail Show:\n    x :: Int\nmain = echo 1",
+            "`Show` is an embedded trail and cannot be defined again",
+        ),
+        (
+            "main = echo (Show {textualize = \"a\"})",
+            "`Show` is an embedded trail: it has no values of its own",
+        ),
+        (
+            "trail T:\n    x :: Int\n    f @a = 1\n    f a = 2\nmain = echo 1",
+            "every definition of `f` with 1 parameter(s) must borrow (`@`) the same parameters",
+        ),
+        (
+            "trail T:\n    x :: Int\n    f @a = 1\ntrail U follow T:\n    f a = 2\nmain = echo 1",
+            "must borrow (`@`) the same parameters as in `T`",
+        ),
+        (
+            "describe @f :: Show -> Int = 1\ntrail P:\n    x :: Int\nmain = echo (describe [P {x = 1}])",
+            "argument 1 of `describe` must follow Show, but this is [P]",
+        ),
         // moving: loops, `++` and `tail` take what they are given
         (
             "main =\n    a = [1]\n    loop x in a:\n        echo x\n    echo a",
@@ -329,11 +509,11 @@ fn compile_errors() {
         ),
         (
             "f n = check n:\n    1 -> void;\n    else -> 5\ng x :: int -> int = x\nmain = echo (g (f 1))",
-            "argument 1 of `g` is int?, which may be void, but `g` does not accept void",
+            "argument 1 of `g` is Int?, which may be void, but `g` does not accept void",
         ),
         (
             "f n = check n:\n    1 -> void;\n    else -> 5\nmain =\n    loop i in [0..f 2]:\n        echo i",
-            "the end of a range must be an int, but this is int?, which may be void",
+            "the end of a range must be an int, but this is Int?, which may be void",
         ),
         (
             "f n = check n:\n    1 -> void;\n    else -> 5\nmain = check (f 1):\n    5 -> echo 1",
@@ -345,7 +525,7 @@ fn compile_errors() {
         ),
         (
             "show s = echo s\nmain =\n    x = \"s\"\n    show x\n    show x",
-            "the value of `x` (string) was moved here",
+            "the value of `x` (String) was moved here",
         ),
         (
             "both a b = a + b\ndup s = both s s\nmain = echo (dup \"x\")",
@@ -363,7 +543,7 @@ fn compile_errors() {
         ),
         (
             "f x :: int -> string = x\nmain = f 1",
-            "declared to return string",
+            "declared to return String",
         ),
     ];
     for (src, expected) in cases {
