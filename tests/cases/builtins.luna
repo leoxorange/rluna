@@ -1,0 +1,28 @@
+# The built-in functions and constants of chapter 2 of the readme.
+
+a = [1, 2, 3]
+hi = "hello"
+main =
+    echo (len a) # 3
+    echo (head a) # 1
+    echo (tail a) # [2, 3]
+    echo (len hi) # 5
+    echo (head hi) # "h"
+    echo (tail hi) # "ello"
+    echo (init a) # [1, 2]
+    echo (last a) # 3
+    echo (init hi) # "hell"
+    echo (last hi) # "o"
+    empty = [0..0]
+    echo (head empty)
+    echo (tail empty)
+    echo (len "héllo")
+    echo (last "héllo")
+    echo (init "héllo")
+    echo (head [] )
+    echo PI
+    echo infinite
+    echo (-infinite)
+    echo (5 < infinite)
+    echo (head (tail (tail a)))
+    echo (len (tail [1]))

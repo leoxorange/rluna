@@ -6,13 +6,13 @@
 //!   (or end of file); the body's last statement is its result.
 //! - Inside a body, an *indented* line of the form `name = expr` is a local
 //!   binding. Every other line is an expression statement.
-//! - `check e:` and `loop x in [a, b]:` are followed by their body on the
+//! - `check e:` and `loop x in [a..b]:` are followed by their body on the
 //!   next lines, indented further than the line they start on: the arms of
 //!   a `check` (one per line, separated by `;`), the statements of a loop.
 //!   These are the only places where the amount of indentation matters.
 //!
 //! Expression precedence, loosest to tightest:
-//!   check  <  comparison  <  + -  <  * /  <  unary -  <  application  <  atoms
+//!   check  <  comparison  <  ++  <  + -  <  * / **  <  unary -  <  !!  <  application  <  atoms
 //!
 //! `echo` is applied like a function of one argument: `echo x`, `echo (a + b)`.
 //!
@@ -122,9 +122,26 @@ impl Parser {
         if !tok.at_col0 || !matches!(tok.kind, TokenKind::Ident(_)) {
             return false;
         }
+        // Skip the parameters: names, `@` names, `(x:xs)` patterns and `[]`.
         let mut i = 1;
-        while matches!(self.peek_at(i), TokenKind::Ident(_)) {
-            i += 1;
+        loop {
+            match self.peek_at(i) {
+                TokenKind::Ident(_) => i += 1,
+                // (`param` reports an `@` before anything but a name)
+                TokenKind::At => i += 1,
+                TokenKind::LBracket if self.peek_at(i + 1) == &TokenKind::RBracket => i += 2,
+                TokenKind::LParen => {
+                    let mut k = i + 1;
+                    while matches!(self.peek_at(k), TokenKind::Ident(_) | TokenKind::Colon) {
+                        k += 1;
+                    }
+                    if self.peek_at(k) != &TokenKind::RParen {
+                        return false;
+                    }
+                    i = k + 1;
+                }
+                _ => break,
+            }
         }
         matches!(self.peek_at(i), TokenKind::Assign | TokenKind::ColonColon)
     }
@@ -152,18 +169,27 @@ impl Parser {
         let TokenKind::Ident(name) = self.bump().kind else {
             unreachable!()
         };
-        let mut params = Vec::new();
-        while let TokenKind::Ident(p) = self.peek().clone() {
-            let span = self.bump().span;
-            if let Some(prev) = params.iter().find(|q: &&Param| q.name == p) {
-                let _ = prev;
-                return Err(Diagnostic::error(
-                    ErrorKind::DefinitionError,
-                    span,
-                    format!("parameter `{p}` is declared more than once"),
-                ));
+        let mut params: Vec<Param> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        while let Some(param) = self.param()? {
+            let declared: Vec<(&String, Span)> = match &param.pattern {
+                None => vec![(&param.name, param.span)],
+                Some(Pattern::Cons { heads, rest }) => {
+                    heads.iter().chain([rest]).map(|(n, s)| (n, *s)).collect()
+                }
+                Some(Pattern::Empty) => vec![],
+            };
+            for (name, span) in declared {
+                if names.contains(name) {
+                    return Err(Diagnostic::error(
+                        ErrorKind::DefinitionError,
+                        span,
+                        format!("parameter `{name}` is declared more than once"),
+                    ));
+                }
+                names.push(name.clone());
             }
-            params.push(Param { name: p, span });
+            params.push(param);
         }
         let sig = if self.eat(&TokenKind::ColonColon) {
             Some(self.signature(params.len())?)
@@ -180,6 +206,85 @@ impl Parser {
             body,
             span: start.to(self.prev_span()),
         })
+    }
+
+    /// A parameter: a name, `@name` (borrowed), `(x:xs)` / `(x:y:xs)`, or
+    /// `[]`.
+    fn param(&mut self) -> PResult<Option<Param>> {
+        let start = self.span();
+        match self.peek().clone() {
+            TokenKind::At => {
+                self.bump();
+                let TokenKind::Ident(name) = self.peek().clone() else {
+                    return Err(Diagnostic::error(
+                        ErrorKind::SyntaxError,
+                        start.to(self.span()),
+                        "`@` borrows a parameter given by name, like `@a`; a pattern such as `(x:xs)` takes its array apart, so it must own it",
+                    ));
+                };
+                self.bump();
+                Ok(Some(Param {
+                    name,
+                    span: start.to(self.prev_span()),
+                    pattern: None,
+                    borrowed: true,
+                }))
+            }
+            TokenKind::Ident(name) => {
+                self.bump();
+                Ok(Some(Param {
+                    name,
+                    span: start,
+                    pattern: None,
+                    borrowed: false,
+                }))
+            }
+            TokenKind::LBracket => {
+                self.bump();
+                self.expect(&TokenKind::RBracket, "`]` (the pattern `[]`)")?;
+                Ok(Some(Param {
+                    name: "[]".into(),
+                    span: start.to(self.prev_span()),
+                    pattern: Some(Pattern::Empty),
+                    borrowed: false,
+                }))
+            }
+            TokenKind::LParen => {
+                self.bump();
+                let mut names = Vec::new();
+                loop {
+                    let TokenKind::Ident(n) = self.peek().clone() else {
+                        return Err(self.unexpected("a name in the pattern (`(x:xs)`)"));
+                    };
+                    names.push((n, self.bump().span));
+                    if !self.eat(&TokenKind::Colon) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen, "`:` or `)` in the pattern")?;
+                let span = start.to(self.prev_span());
+                if names.len() < 2 {
+                    return Err(Diagnostic::error(
+                        ErrorKind::SyntaxError,
+                        span,
+                        "a pattern names the first element and the rest, like `(x:xs)`",
+                    ));
+                }
+                let rest = names.pop().unwrap();
+                let text: Vec<&str> = names
+                    .iter()
+                    .chain([&rest])
+                    .map(|(n, _)| n.as_str())
+                    .collect();
+                Ok(Some(Param {
+                    name: format!("({})", text.join(":")),
+                    span,
+                    pattern: Some(Pattern::Cons { heads: names, rest }),
+                    borrowed: false,
+                }))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn type_ann(&mut self) -> PResult<TypeAnn> {
@@ -284,23 +389,50 @@ impl Parser {
         Ok(Stmt::Expr(self.expr()?))
     }
 
-    /// `loop x in [start, end]:` and the indented lines below it.
-    fn loop_stmt(&mut self) -> PResult<Stmt> {
-        let loop_tok = self.bump();
+    /// `x` or `i, x` before `in`: the element's name, and the position's.
+    #[allow(clippy::type_complexity)]
+    fn loop_names(&mut self) -> PResult<(Option<(String, Span)>, String, Span)> {
+        let TokenKind::Ident(first) = self.peek().clone() else {
+            return Err(self.unexpected("a name for the elements"));
+        };
+        let first_span = self.bump().span;
+        if !self.eat(&TokenKind::Comma) {
+            return Ok((None, first, first_span));
+        }
         let TokenKind::Ident(var) = self.peek().clone() else {
-            return Err(self.unexpected("the loop variable's name"));
+            return Err(self.unexpected("a name for the elements after the position (`i, x`)"));
         };
         let var_span = self.bump().span;
+        Ok((Some((first, first_span)), var, var_span))
+    }
+
+    /// Does a comprehension generator (`x in` or `i, x in`) start here?
+    fn at_generator(&self) -> bool {
+        matches!(
+            (
+                self.peek(),
+                self.peek_at(1),
+                self.peek_at(2),
+                self.peek_at(3)
+            ),
+            (TokenKind::Ident(_), TokenKind::In, _, _)
+                | (
+                    TokenKind::Ident(_),
+                    TokenKind::Comma,
+                    TokenKind::Ident(_),
+                    TokenKind::In
+                )
+        )
+    }
+
+    /// `loop x in [start..end]:` and the indented lines below it.
+    fn loop_stmt(&mut self) -> PResult<Stmt> {
+        let loop_tok = self.bump();
+        let (pos, var, var_span) = self.loop_names()?;
         self.expect(&TokenKind::In, "`in`")?;
-        self.expect(&TokenKind::LBracket, "`[` (a range such as `[0, 5]`)")?;
-        let start = self.comparison()?;
-        self.expect(
-            &TokenKind::Comma,
-            "`,` between the start and the end of the range",
-        )?;
-        let end = self.comparison()?;
-        self.expect(&TokenKind::RBracket, "`]`")?;
-        self.expect(&TokenKind::Colon, "`:` after the range")?;
+        let borrowed = self.eat(&TokenKind::At);
+        let source = self.comparison()?;
+        self.expect(&TokenKind::Colon, "`:` after what the loop goes through")?;
         let header = loop_tok.span.to(self.prev_span());
         if self.peek() != &TokenKind::Newline {
             return Err(Diagnostic::error(
@@ -318,10 +450,11 @@ impl Parser {
             ));
         }
         Ok(Stmt::Loop {
+            pos,
             var,
             var_span,
-            start,
-            end,
+            source,
+            borrowed,
             body,
         })
     }
@@ -329,6 +462,27 @@ impl Parser {
     fn expr(&mut self) -> PResult<Expr> {
         match self.peek() {
             TokenKind::Check => self.check(),
+            TokenKind::Ret => {
+                let start = self.bump().span;
+                // `ret` alone (end of line, `;`, `)`...) returns void.
+                let value = if matches!(
+                    self.peek(),
+                    TokenKind::Newline
+                        | TokenKind::Eof
+                        | TokenKind::Semi
+                        | TokenKind::RParen
+                        | TokenKind::RBracket
+                        | TokenKind::Comma
+                ) {
+                    None
+                } else {
+                    Some(Box::new(self.expr()?))
+                };
+                Ok(Expr {
+                    kind: ExprKind::Ret(value),
+                    span: start.to(self.prev_span()),
+                })
+            }
             _ => self.comparison(),
         }
     }
@@ -421,7 +575,7 @@ impl Parser {
     /// is rejected because it would mean `(a < b) < c`, comparing a boolean
     /// with a number, which is almost never what the programmer meant.
     fn comparison(&mut self) -> PResult<Expr> {
-        let lhs = self.additive()?;
+        let lhs = self.concat()?;
         let op = match self.peek() {
             TokenKind::EqEq => BinOp::Eq,
             TokenKind::NotEq => BinOp::Ne,
@@ -432,7 +586,7 @@ impl Parser {
             _ => return Ok(lhs),
         };
         self.bump();
-        let rhs = self.additive()?;
+        let rhs = self.concat()?;
         if matches!(
             self.peek(),
             TokenKind::EqEq
@@ -463,6 +617,24 @@ impl Parser {
     /// A loop that keeps wrapping `lhs` builds the tree leaning left. A
     /// recursive call for the right-hand side would build `a - (b - c)`,
     /// which gives a different answer.
+    /// `a ++ b`: below `+` and `-`, so `a ++ b + c` joins `a` with `b + c`.
+    fn concat(&mut self) -> PResult<Expr> {
+        let mut lhs = self.additive()?;
+        while self.eat(&TokenKind::PlusPlus) {
+            let rhs = self.additive()?;
+            let span = lhs.span.to(rhs.span);
+            lhs = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Concat,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
     fn additive(&mut self) -> PResult<Expr> {
         let mut lhs = self.multiplicative()?;
         loop {
@@ -490,6 +662,7 @@ impl Parser {
         loop {
             let op = match self.peek() {
                 TokenKind::Star => BinOp::Mul,
+                TokenKind::StarStar => BinOp::ElemMul,
                 TokenKind::Slash => BinOp::Div,
                 _ => return Ok(lhs),
             };
@@ -531,7 +704,7 @@ impl Parser {
                 },
             });
         }
-        self.application()
+        self.index()
     }
 
     /// Can the current token begin an argument? Application has no
@@ -540,6 +713,26 @@ impl Parser {
     /// newline, and so on. `-` is deliberately not in the list: `f -1` would
     /// be ambiguous, so it means `f - 1`, and a negative argument is
     /// written `f (-1)`.
+    /// `a !! i`: tighter than every operator but looser than application,
+    /// so `f a !! 2` indexes the result of `f a`, and `-a !! 2` negates the
+    /// element.
+    fn index(&mut self) -> PResult<Expr> {
+        let mut lhs = self.application()?;
+        while self.eat(&TokenKind::BangBang) {
+            let rhs = self.application()?;
+            let span = lhs.span.to(rhs.span);
+            lhs = Expr {
+                kind: ExprKind::Binary {
+                    op: BinOp::Index,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            };
+        }
+        Ok(lhs)
+    }
+
     fn starts_atom(&self) -> bool {
         matches!(
             self.peek(),
@@ -550,6 +743,9 @@ impl Parser {
                 | TokenKind::True
                 | TokenKind::False
                 | TokenKind::LParen
+                | TokenKind::LBracket
+                // not an atom, but `f @x` gets `atom`'s explanation
+                | TokenKind::At
         )
     }
 
@@ -561,7 +757,9 @@ impl Parser {
         if self.peek() == &TokenKind::Echo {
             return self.echo();
         }
-        if let TokenKind::Ident(name) = self.peek().clone() {
+        if let TokenKind::Ident(name) = self.peek().clone()
+            && name != "void"
+        {
             let callee_span = self.bump().span;
             let mut args = Vec::new();
             while self.starts_atom() {
@@ -594,7 +792,9 @@ impl Parser {
         Ok(atom)
     }
 
-    /// `echo` takes exactly one atom; anything larger goes in parentheses.
+    /// `echo` takes one argument: an atom, or a function call written
+    /// without parentheses (`echo sum xs` is `echo (sum xs)`). An operator
+    /// expression goes in parentheses: `echo 5 > 6` is `(echo 5) > 6`.
     fn echo(&mut self) -> PResult<Expr> {
         let start = self.bump().span;
         if !self.starts_atom() {
@@ -604,19 +804,83 @@ impl Parser {
                 "`echo` needs an argument, e.g. `echo x` or `echo (a + b)`",
             ));
         }
-        let inner = self.atom()?;
-        if self.starts_atom() {
-            return Err(Diagnostic::error(
-                ErrorKind::SyntaxError,
-                start.to(self.span()),
-                "`echo` takes one argument; wrap the expression in parentheses, e.g. `echo (f x)`",
-            ));
-        }
+        let inner = if matches!(self.peek(), TokenKind::Ident(n) if n != "void") {
+            // a name, or a call: `echo sum xs`
+            self.application()?
+        } else {
+            let atom = self.atom()?;
+            if self.starts_atom() {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    start.to(self.span()),
+                    "`echo` takes one argument; wrap the expression in parentheses, e.g. `echo (f x)`",
+                ));
+            }
+            atom
+        };
         let span = start.to(inner.span);
         Ok(Expr {
             kind: ExprKind::Echo(Box::new(inner)),
             span,
         })
+    }
+
+    /// `[]`, `[a, b, c]`, `[start..end]` or `[body | var in source, guard...]`.
+    fn bracket(&mut self) -> PResult<Expr> {
+        let start = self.bump().span;
+        let done = |this: &mut Self, kind| {
+            Ok(Expr {
+                kind,
+                span: start.to(this.prev_span()),
+            })
+        };
+        if self.eat(&TokenKind::RBracket) {
+            return done(self, ExprKind::Array(Vec::new()));
+        }
+        let first = self.expr()?;
+        if self.eat(&TokenKind::DotDot) {
+            let end = self.expr()?;
+            self.expect(&TokenKind::RBracket, "`]` after the range")?;
+            return done(self, ExprKind::Range(Box::new(first), Box::new(end)));
+        }
+        if self.eat(&TokenKind::Bar) {
+            // Clauses: generators (`x in a`, `i, x in a`) and conditions,
+            // starting with a generator.
+            let mut clauses = Vec::new();
+            loop {
+                if clauses.is_empty() || self.at_generator() {
+                    let (pos, var, var_span) = self.loop_names()?;
+                    self.expect(&TokenKind::In, "`in`")?;
+                    let borrowed = self.eat(&TokenKind::At);
+                    clauses.push(Clause::Gen {
+                        pos,
+                        var,
+                        var_span,
+                        source: self.expr()?,
+                        borrowed,
+                    });
+                } else {
+                    clauses.push(Clause::Guard(self.expr()?));
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBracket, "`,` or `]` in the list comprehension")?;
+            return done(
+                self,
+                ExprKind::Comprehension {
+                    body: Box::new(first),
+                    clauses,
+                },
+            );
+        }
+        let mut items = vec![first];
+        while self.eat(&TokenKind::Comma) {
+            items.push(self.expr()?);
+        }
+        self.expect(&TokenKind::RBracket, "`,` or `]` in the array")?;
+        done(self, ExprKind::Array(items))
     }
 
     fn atom(&mut self) -> PResult<Expr> {
@@ -627,6 +891,9 @@ impl Parser {
             TokenKind::Str(s) => ExprKind::Str(s),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
+            TokenKind::LBracket => return self.bracket(),
+            // `void` is a type name in signatures and the void value here.
+            TokenKind::Ident(n) if n == "void" => ExprKind::Void,
             TokenKind::Ident(n) => ExprKind::Name(n),
             TokenKind::LParen => {
                 // Parentheses restart at the loosest level (`expr`); this is
@@ -640,6 +907,13 @@ impl Parser {
                     kind: inner.kind,
                     span: span.to(self.prev_span()),
                 });
+            }
+            TokenKind::At => {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    span,
+                    "`@` only marks a borrowed parameter (`f @a = ...`) or what a loop or list comprehension borrows (`x in @a`); a call borrows an argument when the function's parameter has `@`",
+                ));
             }
             _ => return Err(self.unexpected("an expression")),
         };
@@ -684,7 +958,10 @@ mod tests {
         // Like any application, `echo` binds tighter than operators.
         let out = dump(&parse_src("main = echo 5 > 6"));
         assert!(out.contains("(> (echo 5) 6)"), "{out}");
-        let err = parse(lex("main = echo f 1").unwrap()).unwrap_err();
+        // A call needs no parentheses.
+        let out = dump(&parse_src("main = echo f 1"));
+        assert!(out.contains("(echo (f 1))"), "{out}");
+        let err = parse(lex("main = echo 1 2").unwrap()).unwrap_err();
         assert!(
             err.message.contains("wrap the expression"),
             "{}",
@@ -718,5 +995,19 @@ mod tests {
         let p = parse_src("main =\n  x = 5\n  echo x\n");
         assert!(matches!(p.defs[0].body.stmts[0], Stmt::Let { .. }));
         assert_eq!(p.defs.len(), 1);
+    }
+
+    #[test]
+    fn borrowed_parameters_and_sources() {
+        let p = parse_src(
+            "total @a n = n\nmain =\n  loop x in @a:\n    echo x\n  echo [y | y in @b, z in c]\n",
+        );
+        assert_eq!(p.defs.len(), 2);
+        let params: Vec<bool> = p.defs[0].params.iter().map(|p| p.borrowed).collect();
+        assert_eq!(params, [true, false]);
+        let dumped = crate::ast::dump(&p);
+        assert!(dumped.contains("(def total (@a n)"), "{dumped}");
+        assert!(dumped.contains("(loop x @a"), "{dumped}");
+        assert!(dumped.contains("(in y @b) (in z c)"), "{dumped}");
     }
 }

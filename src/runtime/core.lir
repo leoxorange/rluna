@@ -14,7 +14,8 @@
 ;   string: { len: i64, bytes[len] }
 ;           Storing the length up front (instead of ending with a 0 byte
 ;           like C) makes length O(1) and lets strings contain any byte.
-;   box:    { tag: i64, payload: i64 }   tags: 1 int, 2 float, 3 string, 4 boolean, 5 void
+;   box:    { tag: i64, payload: i64 }   tags: 1 int, 2 float, 3 string, 4 boolean, 5 void, 6 array
+;   array:  { len: i64, elements[len] }  8 bytes per element
 ;
 ; Objects that may be freed sit right after an allocator header (see
 ; @rt.alloc); string literals have an immortal header so they can be
@@ -26,6 +27,9 @@ data @rt.heap_end = { i64 0 }
 data @rt.free_lists = { zero 64 }
 ; number of objects allocated and not freed yet; tests use it to find leaks
 data @rt.live = { i64 0 }
+; the one void, for values of maybe types (`int?`): an immortal box
+; { header -1, tag 5, payload 0 }
+data @rt.void_box = { i64 -1, i64 5, i64 0 }
 ; output buffer: { len: i64, bytes[4096] }
 ; Every write to the terminal is a system call, which costs far more than
 ; copying a few bytes. Output is collected here and written in one go when
@@ -39,7 +43,7 @@ data @rt.s_false = { i64 5, bytes "false" }
 data @rt.s_void = { i64 4, bytes "void" }
 data @rt.s_newline = { i64 1, bytes "\n" }
 data @rt.s_nan = { i64 3, bytes "nan" }
-data @rt.s_inf = { i64 3, bytes "inf" }
+data @rt.s_inf = { i64 8, bytes "infinite" }
 data @rt.s_zero_float = { i64 3, bytes "0.0" }
 data @rt.s_zero_dot = { i64 2, bytes "0." }
 data @rt.s_dot_zero = { i64 2, bytes ".0" }
@@ -54,6 +58,7 @@ data @rt.s_float = { i64 5, bytes "float" }
 data @rt.s_string = { i64 6, bytes "string" }
 data @rt.s_boolean = { i64 7, bytes "boolean" }
 data @rt.s_unknown = { i64 7, bytes "unknown" }
+data @rt.s_array = { i64 5, bytes "array" }
 data @rt.s_no_match = { i64 29, bytes "TypeError: no definition of `" }
 data @rt.s_no_match_end = { i64 25, bytes "` accepts these arguments" }
 
@@ -774,6 +779,247 @@ equal:
   ret %zero
 }
 
+; A copy of a string. Immortal strings (literals) are shared instead.
+func @rt.str_copy(%s: i64) -> i64 {
+entry:
+  %header = load i64 %s, -8
+  %zero = iconst 0
+  %immortal = icmp slt %header, %zero
+  br %immortal, shared, copy
+shared:
+  ret %s
+copy:
+  %len = load i64 %s, 0
+  %eight = iconst 8
+  %size = iadd %len, %eight
+  %p = call i64 @rt.alloc(%size)
+  store i64 %p, 0, %len
+  %dst = iadd %p, %eight
+  %src = iadd %s, %eight
+  call void @rt.memcpy(%dst, %src, %len)
+  ret %p
+}
+
+; The bytes [from, to) of a string, as a new string.
+func @rt.str_sub(%s: i64, %from: i64, %to: i64) -> i64 {
+entry:
+  %len = isub %to, %from
+  %eight = iconst 8
+  %size = iadd %len, %eight
+  %p = call i64 @rt.alloc(%size)
+  store i64 %p, 0, %len
+  %dst = iadd %p, %eight
+  %base = iadd %s, %eight
+  %src = iadd %base, %from
+  call void @rt.memcpy(%dst, %src, %len)
+  ret %p
+}
+
+; Strings are UTF-8: a character takes 1 to 4 bytes, and its first byte
+; says how many. The bytes after the first all look like 10xxxxxx.
+
+; How many bytes the character starting at byte `pos` takes.
+func @rt.utf8_width(%s: i64, %pos: i64) -> i64 {
+entry:
+  %at = iadd %s, %pos
+  %b = load u8 %at, 8
+  %x80 = iconst 128
+  %one_byte = icmp ult %b, %x80
+  br %one_byte, w1, not1
+w1:
+  %one = iconst 1
+  ret %one
+not1:
+  %xe0 = iconst 224
+  %two_bytes = icmp ult %b, %xe0
+  br %two_bytes, w2, not2
+w2:
+  %two = iconst 2
+  ret %two
+not2:
+  %xf0 = iconst 240
+  %three_bytes = icmp ult %b, %xf0
+  br %three_bytes, w3, w4
+w3:
+  %three = iconst 3
+  ret %three
+w4:
+  %four = iconst 4
+  ret %four
+}
+
+; The number of characters in a string (not bytes).
+func @rt.str_chars(%s: i64) -> i64 {
+entry:
+  %len = load i64 %s, 0
+  %zero = iconst 0
+  %one = iconst 1
+  %mask = iconst 192
+  %continuation = iconst 128
+  jmp loop(%zero, %zero)
+loop(%i: i64, %count: i64):
+  %more = icmp slt %i, %len
+  br %more, body, done
+body:
+  %at = iadd %s, %i
+  %b = load u8 %at, 8
+  %top = and %b, %mask
+  %is_cont = icmp eq %top, %continuation
+  %starts = xor %is_cont, %one
+  %count_next = iadd %count, %starts
+  %i_next = iadd %i, %one
+  jmp loop(%i_next, %count_next)
+done:
+  ret %count
+}
+
+; The byte position where character `n` starts; the string's length in
+; bytes for n = the number of characters; -1 if n is out of range.
+func @rt.str_char_offset(%s: i64, %n: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %minus_one = iconst -1
+  %len = load i64 %s, 0
+  %negative = icmp slt %n, %zero
+  br %negative, out, walk(%zero, %zero)
+walk(%pos: i64, %k: i64):
+  %found = icmp eq %k, %n
+  br %found, at, step
+at:
+  ret %pos
+step:
+  %more = icmp slt %pos, %len
+  br %more, advance, out
+advance:
+  %w = call i64 @rt.utf8_width(%s, %pos)
+  %pos_next = iadd %pos, %w
+  %one = iconst 1
+  %k_next = iadd %k, %one
+  jmp walk(%pos_next, %k_next)
+out:
+  ret %minus_one
+}
+
+; The characters of a string in the opposite order (each character's bytes
+; stay in their order, so multi-byte characters survive).
+func @rt.str_reverse(%s: i64) -> i64 {
+entry:
+  %len = load i64 %s, 0
+  %eight = iconst 8
+  %size = iadd %len, %eight
+  %r = call i64 @rt.alloc(%size)
+  store i64 %r, 0, %len
+  %zero = iconst 0
+  %from = iadd %s, %eight
+  %into = iadd %r, %eight
+  jmp loop(%zero)
+loop(%pos: i64):
+  %more = icmp slt %pos, %len
+  br %more, body, done
+body:
+  ; the character at %pos goes to len - pos - width
+  %w = call i64 @rt.utf8_width(%s, %pos)
+  %rest = isub %len, %pos
+  %to = isub %rest, %w
+  %src = iadd %from, %pos
+  %dst = iadd %into, %to
+  call void @rt.memcpy(%dst, %src, %w)
+  %next = iadd %pos, %w
+  jmp loop(%next)
+done:
+  ret %r
+}
+
+; Character `n` of a string as a new one-character string, or 0 (void) if
+; there is no such character.
+func @rt.str_char_at(%s: i64, %n: i64) -> i64 {
+entry:
+  %from = call i64 @rt.str_char_offset(%s, %n)
+  %len = load i64 %s, 0
+  %zero = iconst 0
+  %negative = icmp slt %from, %zero
+  %at_end = icmp eq %from, %len
+  %missing = or %negative, %at_end
+  br %missing, none, some
+none:
+  ret %zero
+some:
+  %w = call i64 @rt.utf8_width(%s, %from)
+  %to = iadd %from, %w
+  %c = call i64 @rt.str_sub(%s, %from, %to)
+  ret %c
+}
+
+; ---------------------------------------------------------------------------
+; Arrays
+; ---------------------------------------------------------------------------
+;
+; array: { len: i64, elements[len] }, 8 bytes per element: an int, a float's
+; bits, or a pointer (string, array, box), depending on the element type.
+; Freeing, copying and printing arrays depend on the element type, so the
+; compiler generates those functions per type (see typefns.rs).
+
+func @rt.array_new(%n: i64) -> i64 {
+entry:
+  %three = iconst 3
+  %bytes = shl %n, %three
+  %eight = iconst 8
+  %size = iadd %bytes, %eight
+  %p = call i64 @rt.alloc(%size)
+  store i64 %p, 0, %n
+  ret %p
+}
+
+; Append the 8-byte value %v to the array being built in %cell, a cell
+; { array, len, capacity } (list comprehensions whose size is not known in
+; advance). When the array is full, it is replaced by one twice as large.
+func @rt.vec_push(%cell: i64, %v: i64) {
+entry:
+  %zero = iconst 0
+  %one = iconst 1
+  %three = iconst 3
+  %eight = iconst 8
+  %four = iconst 4
+  %array = load i64 %cell, 0
+  %len = load i64 %cell, 8
+  %cap = load i64 %cell, 16
+  %full = icmp eq %len, %cap
+  br %full, grow, put(%array)
+grow:
+  %empty = icmp eq %cap, %zero
+  br %empty, resize(%four), double
+double:
+  %twice = iadd %cap, %cap
+  jmp resize(%twice)
+resize(%new_cap: i64):
+  %bigger = call i64 @rt.array_new(%new_cap)
+  %bytes = shl %len, %three
+  %dst = iadd %bigger, %eight
+  %src = iadd %array, %eight
+  call void @rt.memcpy(%dst, %src, %bytes)
+  call void @rt.free(%array)
+  store i64 %cell, 0, %bigger
+  store i64 %cell, 16, %new_cap
+  jmp put(%bigger)
+put(%a: i64):
+  %offset = shl %len, %three
+  %at = iadd %a, %offset
+  store i64 %at, 8, %v
+  %len_next = iadd %len, %one
+  store i64 %cell, 8, %len_next
+  ret
+}
+
+; '"' string '"', for strings inside printed arrays.
+func @rt.print_quoted(%s: i64) {
+entry:
+  %quote = iconst 34
+  call void @rt.out_byte(%quote)
+  call void @rt.print_str(%s)
+  call void @rt.out_byte(%quote)
+  ret
+}
+
 ; ---------------------------------------------------------------------------
 ; Runtime type errors
 ; ---------------------------------------------------------------------------
@@ -814,7 +1060,15 @@ boolean:
 not_bool:
   %t5 = iconst 5
   %is_void = icmp eq %tag, %t5
-  br %is_void, void, unknown
+  br %is_void, void, not_void
+not_void:
+  %t6 = iconst 6
+  %is_array = icmp eq %tag, %t6
+  br %is_array, array, unknown
+array:
+  %s_array = addr @rt.s_array
+  call void @rt.err_str(%s_array)
+  ret
 void:
   %s_void = addr @rt.s_void
   call void @rt.err_str(%s_void)

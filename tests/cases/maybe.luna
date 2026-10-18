@@ -1,0 +1,36 @@
+# Maybe types: a function that can give void gives `T?`. Operators let the
+# void flow through; a `check` with a `void ->` arm handles it, and in the
+# other arms the variable has its plain type.
+
+first n = check n:
+    0 -> void;
+    else -> n * 10
+name n = check n:
+    0 -> void;
+    else -> "name"
+twice x :: int -> int = x * 2
+shout s :: string -> string = s + "!"
+main =
+    echo (first 3)
+    echo (first 0)
+    echo (first 3 + 1)
+    echo (first 0 + 1)
+    echo ((first 0) == (first 0))
+    x = first 4
+    y = check x:
+        void -> 0;
+        else -> twice x
+    echo y
+    s = name 1
+    check s:
+        void -> echo "nothing";
+        else -> echo (shout s)
+    t = name 0
+    check t:
+        void -> echo "nothing";
+        else -> echo (shout t)
+    u = name 2
+    v = check u:
+        "name" -> shout u;
+        else -> "other"
+    echo v

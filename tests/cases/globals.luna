@@ -2,11 +2,11 @@
 # the same expression computed at run time: every pair of lines must match.
 
 count n = check n:
-0 -> 0;
-else -> 1 + count (n - 1)
+    0 -> 0;
+    else -> 1 + count (n - 1)
 pick n = check n:
-1 -> "one";
-else -> 2.5
+    1 -> "one";
+    else -> 2.5
 
 g0 = 9223372036854775807 + 1
 g1 = 7 / 2

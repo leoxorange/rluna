@@ -1,0 +1,34 @@
+# The standard library (src/std.luna), one call per function.
+
+main =
+    echo abs (-3)
+    echo abs 2.5
+    echo max 3 7
+    echo min 3 7
+    echo sum [1, 2, 3, 4]
+    echo sum [0.5, 0.25]
+    echo product [1, 2, 3, 4]
+    echo average [1, 2, 3, 4]
+    echo average []
+    echo maximum [3, 9, 2]
+    echo minimum [3, 9, 2]
+    echo maximum []
+    echo maximum ["pear", "apple", "zoo"]
+    echo contains [1, 2, 3] 2
+    echo contains [1, 2, 3] 5
+    echo contains "hello" "l"
+    echo count [1, 2, 1, 1] 1
+    echo index_of [5, 6, 7] 7
+    echo index_of [5, 6, 7] 9
+    echo remove [1, 2, 1, 3] 1
+    echo reverse [1, 2, 3]
+    echo reverse "héllo"
+    echo take 2 [1, 2, 3]
+    echo take 5 [1, 2]
+    echo drop 2 [1, 2, 3, 4]
+    echo flatten [[1], [2, 3], []]
+    echo is_empty []
+    echo is_empty "x"
+    echo join ["a", "b", "c"] ", "
+    echo split "a,b,,c" ","
+    echo repeat "ab" 3

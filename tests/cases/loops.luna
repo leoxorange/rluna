@@ -1,51 +1,51 @@
-# Loops: `loop x in [a, b]:` runs its indented body for x = a, a + 1, ..., b - 1.
+# Loops: `loop x in [a..b]:` runs its indented body for x = a, a + 1, ..., b - 1.
 
 factorial n =
     acc = 1
-    loop i in [1, n + 1]:
+    loop i in [1..n + 1]:
         acc = acc * i
     acc
 
 main =
     # the readme example
-    loop x in [0, 5]: # [0, 5] means 0, 1, 2, 3, 4
+    loop x in [0..5]: # [0..5] means 0, 1, 2, 3, 4
         echo x
     # a variable from outside the loop keeps its updates
     total = 0
-    loop i in [1, 11]:
+    loop i in [1..11]:
         total = total + i
     echo total
     echo (factorial 10)
     # each new string replaces (and frees) the previous one
     s = ""
-    loop i in [0, 4]:
+    loop i in [0..4]:
         s = s + "ab"
     echo s
     # nested loops; the inner range depends on the outer variable
-    loop i in [0, 3]:
-        loop j in [0, i]:
+    loop i in [0..3]:
+        loop j in [0..i]:
             echo (i * 10 + j)
     # an empty range runs the body zero times
-    loop i in [5, 2]:
+    loop i in [5..2]:
         echo "never"
     # a variable whose type changes inside the loop
     x = 0
-    loop i in [0, 2]:
+    loop i in [0..2]:
         echo x
         x = "a string now"
     echo x
     # moving a value out is fine if the variable gets a new one
     m = "m"
-    loop i in [0, 3]:
+    loop i in [0..3]:
         y = m
         m = y + "!"
     echo m
     # the loop variable can get other ints; the next iteration still takes
     # the next value of the range
-    loop x in [0, 2]:
+    loop x in [0..2]:
         x = x + 40
         echo x
     # the body's own variables are new in every iteration
-    loop i in [0, 2]:
+    loop i in [0..2]:
         label = "item " + "#"
         echo (label == "item #")

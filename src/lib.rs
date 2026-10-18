@@ -14,4 +14,5 @@ pub mod ownership;
 pub mod parser;
 pub mod target;
 pub mod typeck;
+pub mod typefns;
 pub mod types;

@@ -42,12 +42,14 @@ the backend, the linker and the runtime's OS layer.
 | typeck   | `src/typeck.rs`         | type inference and specialization → typed IR (TIR)             |
 | ownership| `src/ownership.rs`      | move checking: no value is used after it was moved             |
 | consteval| `src/consteval.rs`      | computes constant globals at compile time                      |
-| lower    | `src/lower.rs`          | TIR → LIR, value representation, union dispatch                |
+| lower    | `src/lower.rs`          | TIR → LIR, value representation, union dispatch, drops         |
+| typefns  | `src/typefns.rs`        | per-type LIR functions: free, copy, print, compare             |
 | lir      | `src/lir/`              | IR data structures, printer, parser, verifier, optimizations   |
 | codegen  | `src/codegen/aarch64/`  | LIR → AArch64 machine code (Apple arm64 calling convention)    |
 |          | `src/codegen/x86_64/`   | LIR → x86-64 machine code (Windows x64 calling convention)     |
 | link     | `src/link/macho.rs`     | Mach-O writer: segments, dyld binding, ad-hoc code signature   |
 |          | `src/link/pe.rs`        | PE32+ writer: sections, import table, relocations              |
+| std      | `src/std.luna`          | the standard library, in Luna                                  |
 | runtime  | `src/runtime/core.lir`  | printing, strings, allocation, runtime type errors — in LIR    |
 |          | `src/runtime/<os>.lir`  | entry point, write, exit and memory for `macos` / `windows`    |
 
@@ -63,7 +65,7 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   its first value or, if `x` is visible already, a new one (freeing the old
   value), so variables are mutable. The type can change: after `x = 5` then
   `x = "s"`, `x` is a string.
-- **Loops.** `loop x in [a, b]:` runs the lines below it that are indented
+- **Loops.** `loop x in [a..b]:` runs the lines below it that are indented
   further than `loop` for `x` = a, a + 1, …, b - 1 (none if `b <= a`). The
   bounds are ints, evaluated once. The loop variable is always an int: it
   can be given other ints (`x = 40`), but giving it any other type is a
@@ -72,14 +74,25 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   body exist only inside the body, and are new in every iteration; a
   variable from outside that the body updates keeps its value across
   iterations and after the loop. Its type is the union of its types before
-  the loop and at the end of the body (and may not mix in `void`).
+  the loop and at the end of the body (and may not mix in `void`). A loop
+  over an array or a string takes it (`loop x in a:`, see Ownership), or
+  borrows it with `@` (`loop x in @a:`).
 - **Top level** holds only definitions; executable code goes in `main`
   (`main = ...`, no arguments, required).
 - **Application** binds tighter than operators (`sum a 9 + 1` is
-  `(sum a 9) + 1`). `echo` is applied the same way and takes exactly one
-  argument, so anything bigger than a name or literal goes in parentheses:
-  `echo (5 > 6)`, `echo (sum a 9)`. `echo 5 > 6` means `(echo 5) > 6`, a
-  type error, and `echo sum a 9` is a syntax error.
+  `(sum a 9) + 1`, and `x + sum xs` is `x + (sum xs)`). `echo` is applied
+  the same way and takes one argument: a name or literal, a call
+  (`echo sum xs`), or anything else in parentheses. `echo 5 > 6` means
+  `(echo 5) > 6`, a type error.
+- **Call chains.** When a call has more arguments than any definition of
+  the function takes, they are grouped by how many each function accepts,
+  reading left to right: `echo sum xs` is `echo (sum xs)`, `head tail a` is
+  `head (tail a)`, and `add double 1 3` is `add (double 1) 3`. A call whose
+  arguments already fit is never regrouped (`f g x` with a two-parameter `f`
+  passes `g` and `x`), and a call that can be grouped in more than one way
+  is an error asking for parentheses. (This is not currying: Luna has no
+  partial application, so the grouping comes from the functions' parameter
+  counts, which name resolution knows.)
 - **`check`** compares the scrutinee with each pattern using `==`, top to
   bottom. `else` is required unless the scrutinee is a `boolean` and both
   `true` and `false` are covered. Like a loop body, the arms go on the
@@ -98,20 +111,93 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   `int op int` stays `int` for `+ - *`; `/` always produces a `float`
   (`7 / 2` is `3.5`). Mixed `int`/`float` arithmetic gives `float`.
 - **Operators.** `+ - * /`, unary `-`, and `== != < <= > >=`. `+` also joins
-  two strings. Strings compare lexicographically.
+  two strings. Strings compare lexicographically. Arrays add `++` (between
+  comparisons and `+`), `!!` (just below function application) and `**`
+  (with `*` and `/`), and compare with `==` element by element.
+- **`a ** b`** multiplies two arrays of numbers element by element and
+  gives a new array as long as the longer one, whose extra elements are kept
+  as they are: `[1, 2, 3] ** [4, 5]` is `[4, 10, 3]`. Like `++`, it takes
+  both operands (`copy a ** b` keeps `a`). Each
+  element is what `*` gives for its pair (`int` with `float` gives `float`),
+  so `[1.5, 2.0] ** [2, 2, 2]` is `[3.0, 4.0, 2]`, of type `[numeric]`.
 - **`echo`** prints any value followed by a newline. Floats print in Python
-  style with up to 15 significant digits (`3.5`, `66.0`, `1e-05`, `1e+20`);
-  `void` prints as `void`.
-- **`void`** marks code that produces nothing. There is only one void and
-  it is never stored, so it never mixes with other types: a `check` whose
-  arms give void and something else is a type error, and operators reject
-  void (`void == void` too). `echo` of a void call prints `void`.
+  style with up to 15 significant digits (`3.5`, `66.0`, `1e-05`, `1e+20`,
+  `infinite`); `void` prints as `void`; arrays as `[1, 2, 3]`, with strings
+  in quotes inside them (`["a", "b"]`).
+- **`void`** is the one "nothing" value (`void` in code). A function or
+  `check` whose branches give a value or void has a *maybe* type such as
+  `int?`, found automatically (`head [] = void` with `head (x:xs) = x`).
+  Nothing flows through operators: `int? + 1` is `int?`, and `echo` prints
+  `void`. Where a real value is needed (a parameter that does not accept
+  void, a range bound, a declared return type), a maybe value is a compile
+  error until the void case is handled, with a `check` that has a
+  `void ->` arm (or `else`). In the other arms of a `check` on a variable,
+  the variable has the plain type: in `check x: void -> 0; else -> f x`,
+  `x` is an `int`. `void ->` matches only void.
+- **Constants.** `PI` and `infinite` are built-in floats and cannot be
+  redefined; `-infinite` is `-` applied to `infinite`.
 - **Constant globals.** A global without arguments (other than `main`) whose
   evaluation has no side effect is computed by the compiler, and its uses
   become constants: `foo = "he" + "llo"` is the literal `"hello"`. A global
   with a side effect, such as `banner = echo "welcome"`, stays a function
   and runs at every use. So does one that hits a runtime error, or needs
   more than 1000 nested calls or a million steps to compute.
+- **Arrays.** `[1, 2, 3]`; all elements have the same type (`[int]`), or
+  that type and void (`[int?]`, as in `[void, 2]`). `[a..b]` is the ints a … b-1 (`[0..5]`).
+  `[x * 2 | x in source]` builds an array from a range, an array or a
+  string, eagerly. Arrays are immutable: `a ++ b` builds a new array, and
+  the elements of both move into it. `a !! i` is element `i` itself, still
+  in `a` (a copy if it is a number), or void if `i` is out of range. A string is a sequence of characters
+  (Unicode code points, not bytes): `"héllo" !! 1` is `"é"`.
+- **Built-in functions** `len`, `head`, `tail`, `init`, `last` and
+  `reverse` take an array or a string; `head`, `tail`, `init` and `last`
+  give void when it is empty. `len` only reads it, `head` and `last` borrow
+  it and give the element itself, and `tail`, `init` and `reverse` take it
+  and move its elements into their result. `copy x` gives a copy of any
+  value. `reverse` is built in
+  because it needs the elements in the opposite order, which no loop or
+  comprehension gives. A program that defines a function with the
+  same name uses its own instead.
+- **Standard library.** `src/std.luna` is written in Luna and compiled
+  together with every program (only what a program uses reaches its
+  executable): `abs max min sum product average maximum minimum contains
+  count index_of remove take drop flatten is_empty join split repeat`. A program that defines a name the library defines uses its own
+  definitions instead; the library keeps calling its own (they are renamed
+  to `std.name`, which no program can write). Library functions that only
+  read an array or a string borrow it (`sum @a`); those that build their
+  result from its elements take it (`take`, `drop`, `flatten`, `remove`,
+  `maximum`, `minimum`). Errors inside the
+  library point into `std.luna`: every file gets its own range of byte
+  offsets (`diag::Sources`), so a span tells which file it is in.
+- **List comprehensions** take clauses after `|`: generators and
+  conditions, starting with a generator. `[x | x in a, x > 0]` keeps the
+  elements for which every condition (a `boolean`) is true. With several
+  generators, each runs once for every element of the ones before it and can
+  use their variables: `[y | part in a, y in part]` flattens,
+  `[x * y | x in a, y in b]` is a cross product. Like a loop, a generator
+  takes what it goes through, or borrows it with `@` (`x in @a`). The first
+  generator's source is evaluated once; a later one's once per element of
+  the generator before it, so it may only move that generator's variables
+  (`part` in `y in part`). The body may only move the
+  last generator's variables (the others are reused). With one generator the
+  result is allocated up front; otherwise it grows in a buffer that doubles
+  (`rt.vec_push`).
+- **Positions.** `loop i, x in a:` and `[… | i, x in a]` name each
+  element's position (0, 1, …) along with the element: the character
+  position for a string, the index for a range. The position is an int and
+  stays one. This is how to work with positions without `!!`, whose result is
+  a maybe value: `take n a = [x | i, x in a, i < n]`.
+- **Array patterns.** A parameter `(x:xs)` takes an array of at least one
+  element apart (`(x:y:xs)`: at least two); `[]` matches an empty array.
+  Definitions with patterns are alternatives tried top to bottom (see
+  Overloads), with the length tested at run time. The function owns the
+  array, so its elements are moved into `x` and `xs` without copying. A
+  group with `(x:xs)` but nothing for `[]` gets a warning: calling it with an
+  empty array stops the program.
+- **`ret value`** (or bare `ret`) leaves the function early, from anywhere,
+  including inside loops and `check` arms; its value joins the function's
+  result type (a bare `ret` adds void). It cannot be used inside a list
+  comprehension.
 - **Redefinition.** A later definition with the same name, arity and
   parameter types replaces the earlier one (with a warning). Definitions that
   differ in arity or parameter types are overloads.
@@ -119,28 +205,58 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
 ## Ownership
 
 Every value has exactly one owner: the local variable or parameter that
-holds it. The design follows Rust, without references:
+holds it. The design follows Rust: values move by default, borrowing is
+marked, and nothing is copied unless the program asks.
 
 - **Moves.** Binding (`y = x`), passing an argument (`f x`), returning (the
-  last expression) and the result of a `check` arm give the value away; the
-  old name is invalid afterwards and using it is an `OwnershipError`. A
-  `check` arm always moves, even inside `echo (check ...)`, as with Rust's
-  `if`.
-  `id a = a` is fine: the callee owns its parameter and returns it.
-- **Borrows.** Operators, `echo`, and the scrutinee and patterns of `check`
-  only read a value; the name stays valid.
-- **Copies.** `int`, `float` and `boolean` values are copied instead of
-  moved; `void` is not a value, so there is nothing to own. Strings and
-  mixed types (`numeric`, `any`, …) live on the heap and move.
+  last expression, `ret`), putting a value in an array (`[x]`), the result
+  of a `check` arm, and the operations that build something new out of a
+  value's parts: `a ++ b`, `a ** b`, `tail a`, `init a`, `reverse a`, and a
+  loop or list comprehension going through `a`. The old name is invalid
+  afterwards, and using it is an `OwnershipError`. Moving copies nothing:
+  the new owner gets the same object. A `check` arm always moves, even
+  inside `echo (check ...)`, as with Rust's `if`. `id a = a` is fine: the
+  callee owns its parameter and returns it, and `wrap a = [a]` gives the
+  caller one value, the array, which owns `a`.
+- **Borrows.** Operators that compute a new value (`+`, `==`, …), `echo`,
+  `len`, `copy`, the scrutinee and patterns of `check`, a parameter marked
+  `@` (`sum @a = …`), and a loop or comprehension over `@a`. The owner keeps
+  its value. Borrowing copies nothing either.
+- **Borrowed values** cannot be given away, because they still belong to
+  someone else: a `@` parameter inside its function, the variable of a loop
+  over `@a`, and the elements `head a`, `last a` and `a !! i`, which are the
+  elements themselves, still inside `a`. They can be read, and lent on to
+  another `@` parameter (`total @a = sum a`). To keep one, the program asks
+  for a copy: `copy a`, `copy (head a)`. A borrowed parameter or loop
+  variable cannot get a new value either (it is immutable).
+- **`Copy` types.** `int`, `float`, `boolean`, `void`, and unions of them
+  (`numeric`, `int?`) are copied where other values move, so the old name
+  stays valid and a borrowed one can be given away. Copying one costs no
+  more than moving it (`Ty::is_copy`). Strings and arrays (and unions with
+  them) are never copied implicitly. This is the built-in `Copy` trail;
+  user-defined types and trails are planned (`todo.md`).
+- **Overloads.** All definitions with the same name and number of
+  parameters must borrow the same ones: a call cannot tell in advance which
+  definition it reaches, yet it must know whether its arguments move.
+- **While borrowed.** An owner cannot be moved, or given a new value (which
+  frees the old one), while something borrowed from it is in use: `f (head
+  a) a` with `f @x y` is an error (the second argument would move `a` while
+  `f` reads its element), and so is `a == g a`, or `a = …` in the body of
+  `loop x in @a`. The checker keeps the owners borrowed by the operands of
+  the operation being evaluated (and by enclosing loops over `@a`) on a
+  list, which each operation truncates when it is done.
 - **New values.** `x = …` makes `x` usable again after a move, and frees
   the value `x` still held, if any.
-- **Branches.** After a `check`, a name counts as moved if any arm moved it.
+- **Branches.** After a `check`, a name counts as moved if any arm moved it
+  (arms that leave the function with `ret` do not count).
 - **Loops.** A loop body must leave every outside variable as it found it:
   moving `s` inside the body is an error unless `s` gets a new value before
   the body ends (otherwise the next iteration would find it empty), and a
   variable moved before the loop cannot get a value inside it (whether it
   held one afterwards would depend on how often the loop ran). So the state
-  after a loop never depends on the number of iterations.
+  after a loop never depends on the number of iterations. What a loop goes
+  through is evaluated once, before the loop, so `loop x in a` moves `a`
+  for good.
 - Arguments are evaluated left to right, so `f x x` moves `x` and then uses
   it: an error for strings, fine for ints.
 
@@ -153,24 +269,41 @@ counts or runtime flags:
 
 - an owner (parameter or local) that still holds its value when the
   function ends is dropped there; a moved value is dropped by its new owner;
+  a `@` parameter is never dropped by the callee;
 - a temporary that is only read (`echo (a + b)`, an operand, a `check`
-  scrutinee) is dropped right after that read; a discarded statement value
-  is dropped at once;
+  scrutinee, a borrowed argument) is dropped right after that read; a
+  discarded statement value is dropped at once;
+- a borrowed value (`TExpr::is_borrowed`) is never dropped by its reader.
+  `head a`, `last a` and `a !! i` on an array of strings or arrays give the
+  element itself (boxed on the stack if the result is a maybe type), so a
+  temporary array they come from (`echo (head (f x))`) must outlive the
+  element: its drop is *pending* until the reader is done (`release`);
+- a loop that owns what it goes through moves each element out into the
+  variable and leaves an immortal placeholder in the slot (the empty object
+  `{ len 0 }` for strings and arrays, the void box for boxes); at the end
+  only the array itself is freed;
+- `ret` drops the owners, and every pending value: a loop's source, a
+  `check`'s scrutinee, an array whose element is in use. Thanks to the
+  placeholders, dropping a half-consumed source frees exactly the elements
+  not taken yet;
 - when only some `check` arms move an owner, the other arms drop it before
   joining, so every path leaves the same owners behind;
-- unboxing a value (`numeric` → `int`) frees the box.
+- unboxing an owned value (`numeric` → `int`) frees the box; unboxing a
+  borrowed one only reads it.
 
-Dropping a string calls `rt.free`; dropping a box calls `rt.drop_box`, which
-also frees a string payload. The runtime counts live objects (`rt.live`);
-the `no_leaks` test runs every test program and checks the count is 0 at
-exit.
+Dropping a string calls `rt.free`; arrays and boxes get a drop function
+per type (`typefns`), which frees what they own and then themselves. The
+runtime counts live objects (`rt.live`); the `no_leaks` test runs every
+test program and checks the count is 0 at exit.
 
 ## Types and specialization
 
 A static type is a set of runtime kinds: `int`, `float`, `string`,
-`boolean`, `void`. `numeric` = {int, float}, `any` = all five. As a
-parameter constraint `any` accepts a void argument, but no value has a
-type that mixes `void` with other kinds.
+`boolean`, `void`, `array`, plus the element type of arrays (`[int]`,
+`[[string]]`). `numeric` = {int, float}, `iterable` = {string, array},
+`array` is any array, `any` = everything. A union with void is a maybe
+type, shown as `int?`. Element types are stored once per compilation and
+shared, so a type stays a small copyable value.
 
 Functions are specialized per call site argument types, starting from
 `main` (like C++ templates or Julia methods). `sum 1 2` and `sum 1.5 2`
@@ -186,17 +319,20 @@ right number of parameters) whose parameter types accept the arguments is
 called:
 
 ```
-head a :: numeric -> void = echo "winning"
-head _ = echo "nothing left"      # everything that is not numeric
+test a :: numeric -> void = echo "winning"
+test _ = echo "nothing left"      # everything that is not numeric
 ```
 
 Usually the argument types decide this at compile time. When an argument
 has a mixed type (`int|string`), a definition may accept only some of its
 values, and the program tests the value's kind at run time, trying the
-definitions in the same order (`TExprKind::Dispatch`). If none accepts it,
-the program stops with `TypeError: no definition of `head` accepts these
-arguments`. A definition that an earlier one always matches first gets a
-warning, since it can never run.
+definitions in the same order (`TExprKind::Dispatch`). Array patterns add a
+runtime length test; `(x:xs)` together with `[]` covers every array. If no
+definition accepts the values, the program stops with `TypeError: no
+definition of `test` accepts these arguments`. A definition that an earlier
+one always matches first gets a warning, since it can never run. A value
+that may be void must reach a definition that accepts void, or the call is
+a compile error.
 
 ## Value representation
 
@@ -205,7 +341,15 @@ warning, since it can never run.
 | `int`, `boolean`, `void`      | `i64` (`boolean` is 0/1, `void` is 0)                   |
 | `float`                       | `f64`                                                   |
 | `string`                      | pointer to `{ len: i64, bytes... }`                     |
-| unions (`numeric`, `any`, …)  | pointer to a box `{ tag: i64, payload: i64 }`           |
+| arrays (`[int]`, …)           | pointer to `{ len: i64, elements... }`, 8 bytes each    |
+| unions (`numeric`, `int?`, …) | pointer to a box `{ tag: i64, payload: i64 }`           |
+
+Box tags: 1 int, 2 float, 3 string, 4 boolean, 5 void, 6 array. Every boxed
+void is the same immortal box in the runtime's data (`rt.void_box`): there
+is one void, and it is never allocated or freed. Freeing, copying, printing
+and comparing an array or a box depend on what it holds, so the compiler
+generates those functions once per type (`src/typefns.rs`, e.g.
+`drop.[string]`), like C++ templates or Rust's `Drop`/`Clone`.
 
 Heap objects come from `rt.alloc` and can be returned with `rt.free`
 (`runtime/core.lir`). Each object follows an 8-byte header:
@@ -360,5 +504,7 @@ assemblers.
 
 - register allocation and more LIR optimizations (constant folding, inlining)
 - more of the standard library
+- lazy list comprehensions (infinite lists such as `[x | x in [0..infinite]]`)
+- writing maybe types in signatures (`-> int?`)
 - a Linux (ELF) target; most of the work is an ELF writer and a
   `runtime/linux.lir` making system calls directly

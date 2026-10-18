@@ -141,7 +141,59 @@ fn compile_errors() {
             "main = echo (\"a\" - 1)",
             "operator `-` cannot be applied to string and int",
         ),
-        ("f a = a\nmain = echo f 1", "`echo` takes one argument"),
+        ("main = echo 1 2", "`echo` takes one argument"),
+        (
+            "main =\n    loop i, x in [5, 6]:\n        i = \"s\"",
+            "`i` is the variable of a loop and must stay an int",
+        ),
+        (
+            "main =\n    echo [s | s in [\"a\"], n in [0..2]]",
+            "`s` is moved in a list comprehension",
+        ),
+        // an error inside the standard library points into std.luna
+        ("main = echo sum [\"a\", \"b\"]", "--> std.luna:"),
+        (
+            "main = echo [x | x in [1, 2], x]",
+            "a condition in a list comprehension must be a boolean",
+        ),
+        (
+            "f x = x\nf x y = x\ng x = x\ng x y = y\nmain = echo f g 1 2",
+            "the arguments of `f` can be grouped in more than one way",
+        ),
+        (
+            "main = echo ([\"a\"] ** [1])",
+            "`**` multiplies two arrays of numbers",
+        ),
+        (
+            "main = echo [ret 1 | x in [0..3]]",
+            "`ret` cannot leave the function from inside a list comprehension",
+        ),
+        (
+            "f x :: int -> int =\n    ret \"s\"\nmain = echo (f 1)",
+            "the function is declared to return int",
+        ),
+        ("PI = 3\nmain = echo PI", "`PI` is a built-in constant"),
+        ("main = echo (len 5)", "`len` takes an array or a string"),
+        (
+            "main = echo (head [1] [2])",
+            "`head` is called with 2 argument(s)",
+        ),
+        (
+            "main = echo [1, \"a\"]",
+            "the elements of an array must all have the same type",
+        ),
+        (
+            "main = echo ([1] ++ [\"a\"])",
+            "`++` joins arrays whose elements have the same type",
+        ),
+        (
+            "main =\n    s = \"x\"\n    echo [s | i in [0..3]]",
+            "`s` is moved in a list comprehension",
+        ),
+        (
+            "main = echo ([1, 2] !! \"a\")",
+            "the position in `!!` must be an int",
+        ),
         (
             "f n = check n:\n1 -> 1;\nelse -> 2\nmain = echo (f 1)",
             "the arms of a `check` go on the following lines",
@@ -159,40 +211,122 @@ fn compile_errors() {
             "the `else` branch must be the last branch",
         ),
         (
-            "main =\n    s = \"x\"\n    loop i in [0, 3]:\n        y = s\n    echo 1",
+            "main =\n    s = \"x\"\n    loop i in [0..3]:\n        y = s\n    echo 1",
             "`s` is moved in this loop",
         ),
         (
-            "main =\n    s = \"x\"\n    y = s\n    loop i in [0, 3]:\n        s = \"new\"\n    echo 1",
+            "main =\n    s = \"x\"\n    y = s\n    loop i in [0..3]:\n        s = \"new\"\n    echo 1",
             "`s` gets a value in this loop, but it was moved before the loop",
         ),
         (
-            "main =\n    loop i in [0, 2]:\n        inner = i\n    echo inner",
+            "main =\n    loop i in [0..2]:\n        inner = i\n    echo inner",
             "cannot find symbol `inner`",
         ),
         (
-            "main =\n    loop i in [0, 2]:\n    echo 1",
+            "main =\n    loop i in [0..2]:\n    echo 1",
             "this loop has no body",
         ),
         (
-            "main =\n    loop i in [0, 2.5]:\n        echo i",
-            "the end of a loop range must be an int",
+            "main =\n    loop i in [0..2.5]:\n        echo i",
+            "the end of a range must be an int",
         ),
         (
-            "main =\n    loop x in [0, 5]:\n        x = \"s\"",
+            "main =\n    loop x in [0..5]:\n        x = \"s\"",
             "`x` is the variable of a loop and must stay an int, but this is string",
         ),
         (
-            "main =\n    loop x in [0, 2]:\n        loop y in [0, 2]:\n            x = 2.5",
+            "main =\n    loop x in [0..2]:\n        loop y in [0..2]:\n            x = 2.5",
             "`x` is the variable of a loop and must stay an int, but this is float",
         ),
+        // borrowing: what is borrowed cannot be given away or changed
         (
-            "f n = check n:\n    1 -> echo \"a\";\n    else -> 5\nmain = echo (f 1)",
-            "void cannot be mixed with other types",
+            "f @a = a\nmain = echo (f \"x\")",
+            "`a` is borrowed (`@a`): its value still belongs to the caller, so it cannot be given away",
         ),
         (
-            "nothing _ :: any -> void = 5\nmain = echo ((nothing 1) == (nothing 2))",
-            "operator `==` cannot be applied to void and void",
+            "f @a = [a]\nmain = echo (f \"x\")",
+            "`a` is borrowed (`@a`)",
+        ),
+        (
+            "f @a =\n    a = \"y\"\n    a\nmain = echo (f \"x\")",
+            "`a` is borrowed, so it cannot get a new value",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    y = head a\n    echo y",
+            "this is an element still inside `a`",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    echo [a !! 0]",
+            "this is an element still inside `a`",
+        ),
+        (
+            "f @x y = x + y\nmain =\n    s = \"x\"\n    echo (f s s)",
+            "`s` is moved here while it is borrowed",
+        ),
+        (
+            "g a = a\nmain =\n    a = \"x\"\n    echo (a == g a)",
+            "`a` is moved here while it is borrowed",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    loop w in @a:\n        b = a\n    echo 1",
+            "`a` is moved here while it is borrowed",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    loop w in @a:\n        a = [\"y\"]\n    echo 1",
+            "`a` gets a new value here while it is borrowed",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    loop w in @a:\n        w = \"z\"\n    echo 1",
+            "`w` is borrowed, so it cannot get a new value",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    loop w in @a:\n        b = w\n    echo 1",
+            "`w` is an element borrowed from what the loop goes through",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    echo [w | w in @a]",
+            "`w` is an element borrowed",
+        ),
+        (
+            "f @(x:xs) = x\nmain = echo 1",
+            "`@` borrows a parameter given by name",
+        ),
+        (
+            "f @a = 1\nf a :: int = 2\nmain = echo (f 1)",
+            "every definition of `f` with 1 parameter(s) must borrow (`@`) the same parameters",
+        ),
+        (
+            "f a = a\nmain =\n    s = \"x\"\n    echo (f @s)",
+            "`@` only marks a borrowed parameter",
+        ),
+        // moving: loops, `++` and `tail` take what they are given
+        (
+            "main =\n    a = [1]\n    loop x in a:\n        echo x\n    echo a",
+            "`a` is used after its value was moved",
+        ),
+        (
+            "main =\n    a = [1]\n    b = a ++ [2]\n    echo a",
+            "`a` is used after its value was moved",
+        ),
+        (
+            "main =\n    a = [1]\n    echo (tail a)\n    echo a",
+            "`a` is used after its value was moved",
+        ),
+        (
+            "main =\n    a = [\"x\"]\n    loop i in [0..2]:\n        echo [w | w in a]",
+            "`a` is moved in this loop",
+        ),
+        (
+            "f n = check n:\n    1 -> void;\n    else -> 5\ng x :: int -> int = x\nmain = echo (g (f 1))",
+            "argument 1 of `g` is int?, which may be void, but `g` does not accept void",
+        ),
+        (
+            "f n = check n:\n    1 -> void;\n    else -> 5\nmain =\n    loop i in [0..f 2]:\n        echo i",
+            "the end of a range must be an int, but this is int?, which may be void",
+        ),
+        (
+            "f n = check n:\n    1 -> void;\n    else -> 5\nmain = check (f 1):\n    5 -> echo 1",
+            "(or a `void ->` arm for the void case)",
         ),
         (
             "main =\n    x = \"s\"\n    y = x\n    echo x",
@@ -385,6 +519,22 @@ fn unreachable_definition_warning() {
             .warnings
             .iter()
             .any(|w| w.contains("this definition of `head` is never used")),
+        "{:?}",
+        artifacts.warnings
+    );
+}
+
+/// A function that takes arrays apart but has nothing for an empty array.
+#[test]
+fn missing_empty_pattern_warning() {
+    let file = SourceFile::new("first.luna", "first (x:xs) = x\nmain = echo (first [1])");
+    let artifacts = driver::compile(Input::Luna(&file), &Options::default())
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    assert!(
+        artifacts
+            .warnings
+            .iter()
+            .any(|w| w.contains("no definition of `first` accepts an empty array")),
         "{:?}",
         artifacts.warnings
     );

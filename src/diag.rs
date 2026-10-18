@@ -149,19 +149,7 @@ impl SourceFile {
     }
 
     pub fn render(&self, d: &Diagnostic) -> String {
-        let head = match (d.severity, d.kind) {
-            (Severity::Error, Some(k)) => format!("error[{k}]"),
-            (Severity::Error, None) => "error".to_string(),
-            (Severity::Warning, _) => "warning".to_string(),
-        };
-        let Some(span) = d.span else {
-            return format!("{head}: {}\n", d.message);
-        };
-        let mut out = format!("{head}: {}\n{}", d.message, self.snippet(span));
-        for (span, note) in &d.notes {
-            out.push_str(&format!("note: {note}\n{}", self.snippet(*span)));
-        }
-        out
+        Sources::new(vec![(0, self)]).render(d)
     }
 
     /// The location line and the source line with the span underlined:
@@ -193,5 +181,60 @@ impl SourceFile {
             sp = " ".repeat(col - 1),
             carets = "^".repeat(width),
         )
+    }
+}
+
+/// Several source files sharing one range of byte offsets: each file
+/// starts at its own `base`, so a `Span` alone tells which file it is in.
+/// The program comes first (base 0), then the standard library. Nothing but
+/// rendering has to know there are several files.
+pub struct Sources<'a> {
+    files: Vec<(usize, &'a SourceFile)>,
+}
+
+impl<'a> Sources<'a> {
+    pub fn new(files: Vec<(usize, &'a SourceFile)>) -> Sources<'a> {
+        Sources { files }
+    }
+
+    /// The file containing `span`, and the span relative to that file.
+    fn locate(&self, span: Span) -> (&'a SourceFile, Span) {
+        let (base, file) = self
+            .files
+            .iter()
+            .rev()
+            .find(|(base, _)| span.start >= *base)
+            .copied()
+            .unwrap_or(self.files[0]);
+        (file, Span::new(span.start - base, span.end - base))
+    }
+
+    /// Whether `span` is in the file starting at `base`.
+    pub fn in_file(&self, span: Span, base: usize) -> bool {
+        self.files
+            .iter()
+            .rev()
+            .find(|(b, _)| span.start >= *b)
+            .is_some_and(|(b, _)| *b == base)
+    }
+
+    pub fn render(&self, d: &Diagnostic) -> String {
+        let head = match (d.severity, d.kind) {
+            (Severity::Error, Some(k)) => format!("error[{k}]"),
+            (Severity::Error, None) => "error".to_string(),
+            (Severity::Warning, _) => "warning".to_string(),
+        };
+        let Some(span) = d.span else {
+            return format!("{head}: {}\n", d.message);
+        };
+        let snippet = |span: Span| {
+            let (file, local) = self.locate(span);
+            file.snippet(local)
+        };
+        let mut out = format!("{head}: {}\n{}", d.message, snippet(span));
+        for (span, note) in &d.notes {
+            out.push_str(&format!("note: {note}\n{}", snippet(*span)));
+        }
+        out
     }
 }

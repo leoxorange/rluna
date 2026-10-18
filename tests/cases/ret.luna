@@ -1,0 +1,40 @@
+# `ret` leaves a function early, from a loop or a `check` arm, freeing what
+# the function still owns.
+
+# the first positive element, or void
+first_positive xs =
+    loop x in xs:
+        check x > 0:
+            true -> ret x;
+            false -> 0
+    void
+
+sign n = check n:
+    0 -> ret "zero";
+    else -> check n > 0:
+        true -> "positive";
+        false -> "negative"
+
+greet name =
+    msg = "hello, " + name
+    check name:
+        "" -> ret "nobody to greet";
+        else -> 0
+    msg
+
+log x :: any -> void =
+    check x:
+        0 -> ret;
+        else -> echo x
+    echo "logged"
+
+main =
+    echo (first_positive [-1, 0, 7, 9])
+    echo (first_positive [-1, -2])
+    echo (sign 0)
+    echo (sign 5)
+    echo (sign (-5))
+    echo (greet "ann")
+    echo (greet "")
+    log 0
+    log 3

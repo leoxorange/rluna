@@ -34,6 +34,7 @@ pub enum TokenKind {
     Echo,
     Loop,
     In,
+    Ret,
     // punctuation
     Assign,     // =
     EqEq,       // ==
@@ -43,6 +44,11 @@ pub enum TokenKind {
     Le,         // <=
     Ge,         // >=
     Plus,       // +
+    PlusPlus,   // ++
+    StarStar,   // **
+    BangBang,   // !!
+    DotDot,     // ..
+    Bar,        // |
     Minus,      // -
     Star,       // *
     Slash,      // /
@@ -55,6 +61,7 @@ pub enum TokenKind {
     Arrow,      // ->
     Comma,      // ,
     Semi,       // ;
+    At,         // @
     Newline,
     Eof,
 }
@@ -73,6 +80,7 @@ impl TokenKind {
             TokenKind::Echo => "`echo`".into(),
             TokenKind::Loop => "`loop`".into(),
             TokenKind::In => "`in`".into(),
+            TokenKind::Ret => "`ret`".into(),
             TokenKind::Assign => "`=`".into(),
             TokenKind::EqEq => "`==`".into(),
             TokenKind::NotEq => "`!=`".into(),
@@ -81,6 +89,11 @@ impl TokenKind {
             TokenKind::Le => "`<=`".into(),
             TokenKind::Ge => "`>=`".into(),
             TokenKind::Plus => "`+`".into(),
+            TokenKind::PlusPlus => "`++`".into(),
+            TokenKind::StarStar => "`**`".into(),
+            TokenKind::BangBang => "`!!`".into(),
+            TokenKind::DotDot => "`..`".into(),
+            TokenKind::Bar => "`|`".into(),
             TokenKind::Minus => "`-`".into(),
             TokenKind::Star => "`*`".into(),
             TokenKind::Slash => "`/`".into(),
@@ -93,6 +106,7 @@ impl TokenKind {
             TokenKind::Arrow => "`->`".into(),
             TokenKind::Comma => "`,`".into(),
             TokenKind::Semi => "`;`".into(),
+            TokenKind::At => "`@`".into(),
             TokenKind::Newline => "end of line".into(),
             TokenKind::Eof => "end of file".into(),
         }
@@ -116,6 +130,23 @@ pub struct Token {
     /// `loop`: its body is the following lines indented further than the
     /// `loop` keyword.
     pub col: usize,
+}
+
+/// Lex a file whose byte offsets start at `base` (see `diag::Sources`).
+pub fn lex_at(src: &str, base: usize) -> Result<Vec<Token>, Diagnostic> {
+    let shift = |s: Span| Span::new(s.start + base, s.end + base);
+    match lex(src) {
+        Ok(mut tokens) => {
+            for t in &mut tokens {
+                t.span = shift(t.span);
+            }
+            Ok(tokens)
+        }
+        Err(mut d) => {
+            d.span = d.span.map(shift);
+            Err(d)
+        }
+    }
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Diagnostic> {
@@ -232,6 +263,7 @@ impl<'a> Lexer<'a> {
                         "echo" => TokenKind::Echo,
                         "loop" => TokenKind::Loop,
                         "in" => TokenKind::In,
+                        "ret" => TokenKind::Ret,
                         _ => TokenKind::Ident(word.to_string()),
                     };
                     self.push(kind, start);
@@ -247,6 +279,11 @@ impl<'a> Lexer<'a> {
                         (b'>', b'=') => (TokenKind::Ge, 2),
                         (b':', b':') => (TokenKind::ColonColon, 2),
                         (b'-', b'>') => (TokenKind::Arrow, 2),
+                        (b'+', b'+') => (TokenKind::PlusPlus, 2),
+                        (b'*', b'*') => (TokenKind::StarStar, 2),
+                        (b'!', b'!') => (TokenKind::BangBang, 2),
+                        (b'.', b'.') => (TokenKind::DotDot, 2),
+                        (b'|', _) => (TokenKind::Bar, 1),
                         (b'=', _) => (TokenKind::Assign, 1),
                         (b'<', _) => (TokenKind::Lt, 1),
                         (b'>', _) => (TokenKind::Gt, 1),
@@ -261,6 +298,7 @@ impl<'a> Lexer<'a> {
                         (b':', _) => (TokenKind::Colon, 1),
                         (b',', _) => (TokenKind::Comma, 1),
                         (b';', _) => (TokenKind::Semi, 1),
+                        (b'@', _) => (TokenKind::At, 1),
                         _ => {
                             let ch = self.text[start..].chars().next().unwrap();
                             return Err(Diagnostic::error(

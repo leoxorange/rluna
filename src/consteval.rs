@@ -30,7 +30,11 @@
 use std::collections::HashMap;
 
 use crate::ast::BinOp;
-use crate::typeck::{InstId, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result, for_each_expr_mut};
+use crate::hir::{Builtin, HPattern};
+use crate::typeck::{
+    DispatchCase, InstId, LoopSource, TClause, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result,
+    for_each_expr_mut,
+};
 use crate::types::{Kind, Ty};
 
 /// How much work evaluating one global may take, in evaluated expressions.
@@ -52,6 +56,7 @@ pub enum Const {
     Str(String),
     Bool(bool),
     Void,
+    Array(Vec<Const>),
 }
 
 impl Const {
@@ -62,6 +67,7 @@ impl Const {
             Const::Str(_) => Kind::Str,
             Const::Bool(_) => Kind::Bool,
             Const::Void => Kind::Void,
+            Const::Array(_) => Kind::Array,
         }
     }
 
@@ -74,10 +80,18 @@ impl Const {
     }
 }
 
-/// Why evaluation stopped: in every case the global is not a constant.
-struct NotConstant;
+/// Why evaluation of an expression stopped early.
+enum Stop {
+    /// The global is not a constant (a side effect, a runtime error, too
+    /// much work).
+    NotConstant,
+    /// `ret`: the current call returns this value.
+    Return(Const),
+}
 
-type Eval<T> = Result<T, NotConstant>;
+use Stop::NotConstant;
+
+type Eval<T> = Result<T, Stop>;
 
 /// Evaluate every constant global and replace its calls with the value.
 pub fn fold_globals(tir: &mut Tir) {
@@ -120,31 +134,45 @@ fn evaluate_globals(tir: &Tir) -> HashMap<InstId, Const> {
     consts
 }
 
+/// An expression of type `ty` with the value `c`. The type can be wider
+/// than the value's kind (a global whose `check` gives `int|string`): then
+/// the literal is converted (boxed) to it, as the call's result would be.
+/// An array becomes an array literal; each use builds a new array.
+fn literal(c: &Const, ty: Ty, span: crate::diag::Span) -> TExpr {
+    let (kind, own) = match c {
+        Const::Int(v) => (TExprKind::Int(*v), Ty::INT),
+        Const::Float(v) => (TExprKind::Float(*v), Ty::FLOAT),
+        Const::Str(s) => (TExprKind::Str(s.clone()), Ty::STR),
+        Const::Bool(b) => (TExprKind::Bool(*b), Ty::BOOL),
+        Const::Void => (TExprKind::Void, Ty::VOID),
+        Const::Array(items) => {
+            let elem = ty.elem().unwrap_or(Ty::NEVER);
+            let items = items.iter().map(|i| literal(i, elem, span)).collect();
+            (TExprKind::Array(items), Ty::array(elem))
+        }
+    };
+    let e = TExpr {
+        kind,
+        ty: own,
+        span,
+    };
+    if own == ty {
+        e
+    } else {
+        TExpr {
+            kind: TExprKind::Convert(Box::new(e)),
+            ty,
+            span,
+        }
+    }
+}
+
 /// Replace calls of constant globals in `e` with their values.
 fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
     if let TExprKind::Call { inst, .. } = &e.kind
         && let Some(c) = consts.get(inst)
     {
-        let kind = match c.clone() {
-            Const::Int(v) => TExprKind::Int(v),
-            Const::Float(v) => TExprKind::Float(v),
-            Const::Str(s) => TExprKind::Str(s),
-            Const::Bool(b) => TExprKind::Bool(b),
-            Const::Void => unreachable!("void globals are not substituted"),
-        };
-        let literal = TExpr {
-            kind,
-            ty: Ty::of(c.kind()),
-            span: e.span,
-        };
-        // The call's static type can be wider than the value's kind (a
-        // global whose `check` gives `int|string`). Then the literal must
-        // still be boxed into that type, as the call's result would be.
-        e.kind = if literal.ty == e.ty {
-            literal.kind
-        } else {
-            TExprKind::Convert(Box::new(literal))
-        };
+        *e = literal(c, e.ty, e.span);
         return;
     }
     match &mut e.kind {
@@ -152,6 +180,7 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
         | TExprKind::Float(_)
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
+        | TExprKind::Void
         | TExprKind::Local(_) => {}
         TExprKind::Call { args, .. }
         | TExprKind::Dispatch { args, .. }
@@ -160,11 +189,31 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
             substitute(lhs, consts);
             substitute(rhs, consts);
         }
-        TExprKind::Neg(x) | TExprKind::Echo(x) | TExprKind::Convert(x) => substitute(x, consts),
+        TExprKind::Neg(x)
+        | TExprKind::Echo(x)
+        | TExprKind::Convert(x)
+        | TExprKind::Builtin(_, x) => substitute(x, consts),
+        TExprKind::Array(items) => items.iter_mut().for_each(|i| substitute(i, consts)),
+        TExprKind::Ret(value) => value.iter_mut().for_each(|v| substitute(v, consts)),
+        TExprKind::Range(a, b)
+        | TExprKind::Concat(a, b)
+        | TExprKind::Index(a, b)
+        | TExprKind::ElemMul(a, b) => {
+            substitute(a, consts);
+            substitute(b, consts);
+        }
+        TExprKind::Comprehension { body, clauses } => {
+            clauses
+                .iter_mut()
+                .flat_map(TClause::exprs_mut)
+                .for_each(|e| substitute(e, consts));
+            substitute(body, consts);
+        }
         TExprKind::Check {
             scrutinee,
             arms,
             else_arm,
+            ..
         } => {
             substitute(scrutinee, consts);
             for (p, b) in arms {
@@ -198,8 +247,22 @@ impl Interp<'_> {
         let f: &TFunc = &self.tir.funcs[inst];
         let mut locals: Vec<Option<Const>> = args.into_iter().map(Some).collect();
         locals.resize(f.local_tys.len(), None);
+        for (p, pattern) in f.patterns.iter().enumerate() {
+            if let (Some(HPattern::Cons { heads, rest }), Some(Const::Array(items))) =
+                (pattern, &locals[p])
+            {
+                let items = items.clone();
+                for (k, &h) in heads.iter().enumerate() {
+                    locals[h] = Some(items[k].clone());
+                }
+                locals[*rest] = Some(Const::Array(items[heads.len()..].to_vec()));
+            }
+        }
         let mut frame = Frame { locals };
-        let result = self.stmts(&f.body, &mut frame)?;
+        let result = match self.stmts(&f.body, &mut frame) {
+            Err(Stop::Return(v)) => v,
+            other => other?,
+        };
         self.depth -= 1;
         Ok(if f.discard { Const::Void } else { result })
     }
@@ -216,27 +279,77 @@ impl Interp<'_> {
                 }
                 TStmt::Expr(e) => result = self.expr(e, frame)?,
                 TStmt::Loop {
+                    pos,
                     var,
-                    start,
-                    end,
+                    source,
                     body,
                     ..
                 } => {
-                    let (Const::Int(from), Const::Int(to)) =
-                        (self.expr(start, frame)?, self.expr(end, frame)?)
-                    else {
-                        unreachable!("loop bounds are ints")
-                    };
-                    for i in from..to {
+                    for (i, element) in self.elements(source, frame)?.into_iter().enumerate() {
                         // Every iteration costs fuel, even an empty body.
                         self.fuel = self.fuel.checked_sub(1).ok_or(NotConstant)?;
-                        frame.locals[*var] = Some(Const::Int(i));
+                        frame.locals[*var] = Some(element);
+                        if let Some(p) = pos {
+                            frame.locals[*p] = Some(Const::Int(i as i64));
+                        }
                         self.stmts(body, frame)?;
                     }
                 }
             }
         }
         Ok(result)
+    }
+
+    /// Run the clauses of a comprehension from the first: a generator binds
+    /// each element in turn and runs the rest, a guard runs the rest only if
+    /// it is true; at the end, the body's value is added.
+    fn comprehension(
+        &mut self,
+        clauses: &[TClause],
+        body: &TExpr,
+        frame: &mut Frame,
+        out: &mut Vec<Const>,
+    ) -> Eval<()> {
+        match clauses.split_first() {
+            None => out.push(self.expr(body, frame)?),
+            Some((
+                TClause::Gen {
+                    pos, var, source, ..
+                },
+                rest,
+            )) => {
+                for (i, element) in self.elements(source, frame)?.into_iter().enumerate() {
+                    self.fuel = self.fuel.checked_sub(1).ok_or(NotConstant)?;
+                    frame.locals[*var] = Some(element);
+                    if let Some(p) = pos {
+                        frame.locals[*p] = Some(Const::Int(i as i64));
+                    }
+                    self.comprehension(rest, body, frame, out)?;
+                }
+            }
+            Some((TClause::Guard(g), rest)) => {
+                if self.expr(g, frame)? == Const::Bool(true) {
+                    self.comprehension(rest, body, frame, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The elements a loop or comprehension goes through.
+    fn elements(&mut self, source: &LoopSource, frame: &mut Frame) -> Eval<Vec<Const>> {
+        Ok(match source {
+            LoopSource::Range(start, end) => {
+                let from = self.expr(start, frame)?;
+                let to = self.expr(end, frame)?;
+                range(from, to)?
+            }
+            LoopSource::Each(e) => match self.expr(e, frame)? {
+                Const::Array(items) => items,
+                Const::Str(s) => s.chars().map(|c| Const::Str(c.to_string())).collect(),
+                _ => unreachable!("loops go through arrays and strings"),
+            },
+        })
     }
 
     fn expr(&mut self, e: &TExpr, frame: &mut Frame) -> Eval<Const> {
@@ -246,6 +359,57 @@ impl Interp<'_> {
             TExprKind::Float(v) => Const::Float(*v),
             TExprKind::Str(s) => Const::Str(s.clone()),
             TExprKind::Bool(b) => Const::Bool(*b),
+            TExprKind::Void => Const::Void,
+            TExprKind::Array(items) => Const::Array(
+                items
+                    .iter()
+                    .map(|i| self.expr(i, frame))
+                    .collect::<Eval<_>>()?,
+            ),
+            TExprKind::Range(start, end) => {
+                let from = self.expr(start, frame)?;
+                let to = self.expr(end, frame)?;
+                Const::Array(range(from, to)?)
+            }
+            TExprKind::Comprehension { body, clauses } => {
+                let mut out = Vec::new();
+                self.comprehension(clauses, body, frame, &mut out)?;
+                Const::Array(out)
+            }
+            TExprKind::Builtin(b, arg) => builtin(*b, self.expr(arg, frame)?),
+            TExprKind::Concat(a, b) => match (self.expr(a, frame)?, self.expr(b, frame)?) {
+                (Const::Array(mut x), Const::Array(y)) => {
+                    x.extend(y);
+                    Const::Array(x)
+                }
+                _ => Const::Void, // void flows through
+            },
+            TExprKind::ElemMul(a, b) => match (self.expr(a, frame)?, self.expr(b, frame)?) {
+                (Const::Array(x), Const::Array(y)) => {
+                    let n = x.len().max(y.len());
+                    let mut out = Vec::with_capacity(n);
+                    for k in 0..n {
+                        out.push(match (x.get(k), y.get(k)) {
+                            (Some(p), Some(q)) => binary(BinOp::Mul, p, q)?,
+                            (Some(p), None) | (None, Some(p)) => p.clone(),
+                            (None, None) => unreachable!(),
+                        });
+                    }
+                    Const::Array(out)
+                }
+                _ => Const::Void, // void flows through
+            },
+            TExprKind::Index(a, i) => match (self.expr(a, frame)?, self.expr(i, frame)?) {
+                (Const::Array(items), Const::Int(i)) => usize::try_from(i)
+                    .ok()
+                    .and_then(|i| items.get(i).cloned())
+                    .unwrap_or(Const::Void),
+                (Const::Str(s), Const::Int(i)) => usize::try_from(i)
+                    .ok()
+                    .and_then(|i| s.chars().nth(i))
+                    .map_or(Const::Void, |c| Const::Str(c.to_string())),
+                _ => Const::Void,
+            },
             TExprKind::Local(l) => frame.locals[*l].clone().expect("local is defined"),
             TExprKind::Call { inst, args } => {
                 let args = args
@@ -259,22 +423,38 @@ impl Interp<'_> {
                     .iter()
                     .map(|a| self.expr(a, frame))
                     .collect::<Eval<Vec<_>>>()?;
-                let fits = |tests: &[Option<Ty>]| {
-                    tests
-                        .iter()
-                        .zip(&args)
-                        .all(|(t, a)| t.is_none_or(|t| t.contains(a.kind())))
+                let fits = |c: &DispatchCase| {
+                    c.tests.iter().zip(&c.lens).zip(&args).all(|((t, len), a)| {
+                        t.is_none_or(|t| t.contains(a.kind()))
+                            && len.is_none_or(|len| match a {
+                                Const::Array(items) => len.accepts(items.len()),
+                                _ => false,
+                            })
+                    })
                 };
                 // No definition accepts the values: a runtime error.
-                let Some(case) = cases.iter().find(|c| fits(&c.tests)) else {
+                let Some(case) = cases.iter().find(|c| fits(c)) else {
                     return Err(NotConstant);
                 };
                 self.call(case.inst, args)?
             }
             // A side effect: the global must run when the program runs.
             TExprKind::Echo(_) => return Err(NotConstant),
-            // Some argument never finishes, so neither does this.
-            TExprKind::Diverge(_) => return Err(NotConstant),
+            // Some argument never finishes (it returns from the function, or
+            // never ends), so neither does this.
+            TExprKind::Diverge(args) => {
+                for a in args {
+                    self.expr(a, frame)?;
+                }
+                return Err(NotConstant);
+            }
+            TExprKind::Ret(value) => {
+                let v = match value {
+                    Some(v) => self.expr(v, frame)?,
+                    None => Const::Void,
+                };
+                return Err(Stop::Return(v));
+            }
             TExprKind::Binary { op, lhs, rhs } => {
                 let a = self.expr(lhs, frame)?;
                 let b = self.expr(rhs, frame)?;
@@ -283,6 +463,7 @@ impl Interp<'_> {
             TExprKind::Neg(x) => match self.expr(x, frame)? {
                 Const::Int(v) => Const::Int(0i64.wrapping_sub(v)),
                 Const::Float(v) => Const::Float(-0.0 - v),
+                Const::Void => Const::Void,
                 _ => return Err(NotConstant), // a runtime operator error
             },
             // A runtime type check: if the value does not fit, the program
@@ -298,11 +479,12 @@ impl Interp<'_> {
                 scrutinee,
                 arms,
                 else_arm,
+                ..
             } => {
                 let s = self.expr(scrutinee, frame)?;
                 for (pattern, body) in arms {
                     let p = self.expr(pattern, frame)?;
-                    if binary(BinOp::Eq, &s, &p)? == Const::Bool(true) {
+                    if matches(&s, &p) {
                         return self.expr(body, frame);
                     }
                 }
@@ -315,14 +497,79 @@ impl Interp<'_> {
     }
 }
 
+/// A built-in function on a value; void flows through.
+fn builtin(b: Builtin, v: Const) -> Const {
+    // Constants have no owners: a copy is the value itself.
+    if b == Builtin::Copy {
+        return v;
+    }
+    let items: Vec<Const> = match &v {
+        Const::Array(items) => items.clone(),
+        Const::Str(s) => s.chars().map(|c| Const::Str(c.to_string())).collect(),
+        _ => return Const::Void,
+    };
+    // Turn a run of characters back into one string.
+    let rebuild = |part: &[Const]| match &v {
+        Const::Str(_) => Const::Str(
+            part.iter()
+                .map(|c| match c {
+                    Const::Str(s) => s.as_str(),
+                    _ => unreachable!(),
+                })
+                .collect(),
+        ),
+        _ => Const::Array(part.to_vec()),
+    };
+    match b {
+        Builtin::Len => Const::Int(items.len() as i64),
+        Builtin::Reverse => {
+            let mut reversed = items.clone();
+            reversed.reverse();
+            rebuild(&reversed)
+        }
+        Builtin::Head => items.first().cloned().unwrap_or(Const::Void),
+        Builtin::Last => items.last().cloned().unwrap_or(Const::Void),
+        _ if items.is_empty() => Const::Void,
+        Builtin::Tail => rebuild(&items[1..]),
+        Builtin::Init => rebuild(&items[..items.len() - 1]),
+        Builtin::Copy => unreachable!("handled above"),
+    }
+}
+
+/// The ints from..to.
+fn range(from: Const, to: Const) -> Eval<Vec<Const>> {
+    let (Const::Int(from), Const::Int(to)) = (from, to) else {
+        unreachable!("range bounds are ints")
+    };
+    // A huge range would not fit in memory: not a constant.
+    if to.saturating_sub(from) > FUEL as i64 {
+        return Err(NotConstant);
+    }
+    Ok((from..to).map(Const::Int).collect())
+}
+
+/// Does a `check` pattern match? Void matches only void.
+fn matches(value: &Const, pattern: &Const) -> bool {
+    match (value, pattern) {
+        (Const::Void, Const::Void) => true,
+        (Const::Void, _) | (_, Const::Void) => false,
+        _ => binary(BinOp::Eq, value, pattern).is_ok_and(|r| r == Const::Bool(true)),
+    }
+}
+
 /// An operator on two values, exactly as the compiled code computes it.
 fn binary(op: BinOp, a: &Const, b: &Const) -> Eval<Const> {
     use Const::*;
     if binop_result(op, a.kind(), b.kind()).is_none() {
         return Err(NotConstant); // a runtime operator error
     }
+    // Nothing flows through.
+    if *a == Void || *b == Void {
+        return Ok(Void);
+    }
     let numeric = |c: &Const| matches!(c, Int(_) | Float(_));
     Ok(match op {
+        BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("evaluated separately"),
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (a, b) {
             (Str(x), Str(y)) => Str(format!("{x}{y}")),
             // Machine integers wrap around on overflow.
@@ -344,6 +591,7 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Eval<Const> {
         BinOp::Eq | BinOp::Ne => {
             let eq = match (a, b) {
                 (Int(x), Int(y)) => x == y,
+                (Array(x), Array(y)) => x == y,
                 (Bool(x), Bool(y)) => x == y,
                 (Str(x), Str(y)) => x == y,
                 _ if numeric(a) && numeric(b) => a.to_float() == b.to_float(),

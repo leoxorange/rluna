@@ -1,0 +1,20 @@
+# `a ** b` multiplies two arrays element by element; the longer array's
+# extra elements are kept. It takes both arrays: `copy` keeps them.
+
+g = [1, 2, 3] ** [10, 10]
+main =
+    a = [1, 2, 3]
+    b = [4, 5]
+    echo (copy a ** copy b)
+    echo a
+    echo b
+    echo (b ** a)
+    echo ([1.5, 2.0] ** [2, 2, 2])
+    echo ([1, 2] ** [0.5])
+    echo ([] ** [1, 2])
+    echo ([2, 3] ** [])
+    echo ([1, 2] ** [3, 4] ** [10])
+    echo ([2] ** [3] == [6])
+    echo ((tail [0..0]) ** [1])
+    echo ([head [], 2] ** [5, 5])
+    echo g

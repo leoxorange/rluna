@@ -18,7 +18,7 @@ use std::io;
 use std::path::Path;
 
 use crate::codegen;
-use crate::diag::{Diagnostic, SourceFile};
+use crate::diag::{Diagnostic, SourceFile, Sources};
 use crate::link::{Image, macho, pe};
 use crate::lir::{self, Module};
 use crate::target::Target;
@@ -61,26 +61,61 @@ pub struct CompileError {
     pub message: String,
 }
 
-fn render_all(src: &SourceFile, diags: &[Diagnostic]) -> String {
+fn render_all(sources: &Sources, diags: &[Diagnostic]) -> String {
     diags
         .iter()
-        .map(|d| src.render(d))
+        .map(|d| sources.render(d))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+/// The standard library, written in Luna. It is compiled together with
+/// every program, like the runtime; only the functions a program uses are
+/// compiled to machine code.
+pub const STD_LUNA: &str = include_str!("std.luna");
+
 /// Compile Luna source to an LIR module (without the runtime).
 pub fn frontend(src: &SourceFile, artifacts: &mut Artifacts) -> Result<Module, CompileError> {
+    // The standard library's byte offsets follow the program's, so every
+    // span says which file it is in.
+    let std = SourceFile::new("std.luna", STD_LUNA);
+    let std_base = src.text.len() + 1;
+    let sources = Sources::new(vec![(0, src), (std_base, &std)]);
     let fail = |diags: &[Diagnostic]| CompileError {
-        message: render_all(src, diags),
+        message: render_all(&sources, diags),
     };
     let tokens = lexer::lex(&src.text).map_err(|d| fail(&[d]))?;
-    let program = parser::parse(tokens).map_err(|d| fail(&[d]))?;
+    let mut program = parser::parse(tokens).map_err(|d| fail(&[d]))?;
     artifacts.ast = Some(ast::dump(&program));
+    let std_tokens = lexer::lex_at(&std.text, std_base).map_err(|d| fail(&[d]))?;
+    let mut library = parser::parse(std_tokens).map_err(|d| fail(&[d]))?;
+    // A program's own definition of a name replaces the library's (all of
+    // its definitions of that name) for the program. The library keeps
+    // using its own: those definitions get a name no program can write
+    // (`std.sum`), and the library's calls are pointed at it.
+    let own: std::collections::HashSet<&str> =
+        program.defs.iter().map(|d| d.name.as_str()).collect();
+    let renames: std::collections::HashMap<String, String> = library
+        .defs
+        .iter()
+        .filter(|d| own.contains(d.name.as_str()))
+        .map(|d| (d.name.clone(), format!("std.{}", d.name)))
+        .collect();
+    for def in &mut library.defs {
+        ast::rename_globals(def, &renames);
+        if let Some(new) = renames.get(&def.name) {
+            def.name = new.clone();
+        }
+    }
+    program.defs.extend(library.defs);
     let (hir, warnings) = hir::resolve(&program).map_err(|ds| fail(&ds))?;
-    artifacts
-        .warnings
-        .extend(warnings.iter().map(|w| src.render(w)));
+    // Warnings about the library are not the program's business.
+    artifacts.warnings.extend(
+        warnings
+            .iter()
+            .filter(|w| w.span.is_none_or(|s| !sources.in_file(s, std_base)))
+            .map(|w| sources.render(w)),
+    );
     // Each stage stops the pipeline on error: there is no point type
     // checking a program whose names do not resolve, and the later errors
     // would mostly be noise caused by the first one.

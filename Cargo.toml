@@ -1,6 +1,6 @@
 [package]
 name = "rluna"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Compiler for the Luna programming language"
 

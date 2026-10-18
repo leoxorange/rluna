@@ -31,5 +31,5 @@ main =
     echo (kind (pick 2))
     echo (kind (pick 3))
     # inside a loop, with a different value each time
-    loop i in [1, 4]:
+    loop i in [1..4]:
         echo (kind (pick i))

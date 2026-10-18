@@ -39,7 +39,7 @@ use std::collections::HashMap;
 
 use crate::ast::BinOp;
 use crate::diag::{Diagnostic, ErrorKind, Span};
-use crate::hir::{FuncId, HExpr, HExprKind, HStmt, Hir};
+use crate::hir::{Builtin, FuncId, HClause, HExpr, HExprKind, HPattern, HStmt, Hir};
 use crate::types::{Kind, Ty};
 
 pub type InstId = usize;
@@ -68,6 +68,10 @@ pub struct TFunc {
     pub local_tys: Vec<Ty>,
     /// Name of each variable, the parameters first, for error messages.
     pub local_names: Vec<String>,
+    /// For each parameter, the pattern that takes its array apart, if any.
+    pub patterns: Vec<Option<HPattern>>,
+    /// For each parameter, whether it is borrowed (`@a`).
+    pub borrowed: Vec<bool>,
 }
 
 impl TFunc {
@@ -85,11 +89,14 @@ pub enum TStmt {
         value: TExpr,
     },
     Expr(TExpr),
-    /// `loop var in [start, end]:`. The bounds are ints.
+    /// `loop var in source:` / `loop pos, var in source:`.
     Loop {
+        pos: Option<usize>,
         var: usize,
-        start: TExpr,
-        end: TExpr,
+        source: Box<LoopSource>,
+        /// `in @source`: the source is borrowed and `var` is a borrowed
+        /// element; otherwise the source moves into the loop.
+        borrowed: bool,
         body: Vec<TStmt>,
         /// Outside variables the body updates, with their type at the top of
         /// every iteration (and after the loop): the union of their type
@@ -100,17 +107,71 @@ pub enum TStmt {
     },
 }
 
+/// What a loop or a list comprehension goes through.
+#[derive(Debug)]
+pub enum LoopSource {
+    /// `[start..end]` (ints): counted directly, without building an array.
+    Range(TExpr, TExpr),
+    /// The elements of an array, or the characters of a string.
+    Each(TExpr),
+}
+
+/// A clause of a list comprehension.
+#[derive(Debug)]
+pub enum TClause {
+    /// `pos, var in source`: runs once for every element of the generators
+    /// before it.
+    Gen {
+        pos: Option<usize>,
+        var: usize,
+        source: LoopSource,
+        /// `in @source`, as for `TStmt::Loop`.
+        borrowed: bool,
+    },
+    /// Keeps only the combinations for which it is true.
+    Guard(TExpr),
+}
+
+impl TClause {
+    pub fn exprs(&self) -> Vec<&TExpr> {
+        match self {
+            TClause::Gen { source, .. } => source.exprs(),
+            TClause::Guard(g) => vec![g],
+        }
+    }
+
+    pub fn exprs_mut(&mut self) -> Vec<&mut TExpr> {
+        match self {
+            TClause::Gen { source, .. } => source.exprs_mut(),
+            TClause::Guard(g) => vec![g],
+        }
+    }
+}
+
+impl LoopSource {
+    pub fn exprs(&self) -> Vec<&TExpr> {
+        match self {
+            LoopSource::Range(a, b) => vec![a, b],
+            LoopSource::Each(e) => vec![e],
+        }
+    }
+
+    pub fn exprs_mut(&mut self) -> Vec<&mut TExpr> {
+        match self {
+            LoopSource::Range(a, b) => vec![a, b],
+            LoopSource::Each(e) => vec![e],
+        }
+    }
+}
+
 /// Call `f` on every expression of these statements that is not part of a
 /// larger expression, including those inside loop bodies.
 pub fn for_each_expr(stmts: &[TStmt], f: &mut impl FnMut(&TExpr)) {
     for s in stmts {
         match s {
             TStmt::Let { value, .. } | TStmt::Expr(value) => f(value),
-            TStmt::Loop {
-                start, end, body, ..
-            } => {
-                f(start);
-                f(end);
+            TStmt::Loop { source, body, .. } => {
+                source.exprs().into_iter().for_each(&mut *f);
                 for_each_expr(body, f);
             }
         }
@@ -122,11 +183,8 @@ pub fn for_each_expr_mut(stmts: &mut [TStmt], f: &mut impl FnMut(&mut TExpr)) {
     for s in stmts {
         match s {
             TStmt::Let { value, .. } | TStmt::Expr(value) => f(value),
-            TStmt::Loop {
-                start, end, body, ..
-            } => {
-                f(start);
-                f(end);
+            TStmt::Loop { source, body, .. } => {
+                source.exprs_mut().into_iter().for_each(&mut *f);
                 for_each_expr_mut(body, f);
             }
         }
@@ -138,6 +196,52 @@ pub struct TExpr {
     pub kind: TExprKind,
     pub ty: Ty,
     pub span: Span,
+}
+
+impl TExpr {
+    /// The value is borrowed from something else (a variable, or an array
+    /// that holds it), so whoever reads it must not free it.
+    ///
+    /// A variable's value belongs to the variable. `head a`, `last a` and
+    /// `a !! i` give the element itself, still inside `a`, rather than a
+    /// copy of it: Luna never copies a string or an array without being
+    /// asked to (`copy`). Elements of `Copy` types are copied as usual, and
+    /// so are the characters of a string, which are new strings anyway.
+    pub fn is_borrowed(&self) -> bool {
+        match &self.kind {
+            TExprKind::Local(_) | TExprKind::Str(_) => true,
+            TExprKind::Builtin(Builtin::Head | Builtin::Last, a) | TExprKind::Index(a, _) => {
+                gives_element_itself(a.ty)
+            }
+            TExprKind::Convert(inner) => inner.is_borrowed(),
+            _ => false,
+        }
+    }
+
+    /// The variable whose value this borrowed value is part of: `a` for
+    /// `a`, `head a` or `a !! 2`. Moving that variable, or giving it a new
+    /// value, while the borrowed value is in use would free it.
+    pub fn borrowed_from(&self) -> Option<usize> {
+        match &self.kind {
+            TExprKind::Local(l) => Some(*l),
+            TExprKind::Builtin(Builtin::Head | Builtin::Last, a) | TExprKind::Index(a, _)
+                if gives_element_itself(a.ty) =>
+            {
+                a.borrowed_from()
+            }
+            TExprKind::Convert(inner) => inner.borrowed_from(),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `head`, `last` and `!!` on a value of type `ty` give the element
+/// itself (borrowed) rather than a copy: for arrays of strings or arrays.
+/// A value that may be an array or a string (`[string]|string`) gets a
+/// copy, because the string case makes a new character either way and both
+/// cases must give the same kind of result.
+pub fn gives_element_itself(ty: Ty) -> bool {
+    ty.elem().is_some_and(|e| !e.is_copy()) && !ty.contains(Kind::Str)
 }
 
 #[derive(Debug)]
@@ -181,7 +285,32 @@ pub enum TExprKind {
         scrutinee: Box<TExpr>,
         arms: Vec<(TExpr, TExpr)>,
         else_arm: Option<Box<TExpr>>,
+        /// Arms where the checked variable cannot be void.
+        narrowing: Option<Narrowing>,
     },
+    /// The void value.
+    Void,
+    /// `[a, b, c]`: the elements, converted to the element type.
+    Array(Vec<TExpr>),
+    /// `[start..end]`: an array of ints.
+    Range(Box<TExpr>, Box<TExpr>),
+    /// `[body | clauses]`: generators and (boolean) guards.
+    Comprehension {
+        body: Box<TExpr>,
+        clauses: Vec<TClause>,
+    },
+    /// `ret value` / `ret`: leave the function.
+    Ret(Option<Box<TExpr>>),
+    /// A built-in function on an array or a string, which it only reads.
+    Builtin(Builtin, Box<TExpr>),
+    /// `a ++ b`: both operands are arrays (or void), which it only reads.
+    Concat(Box<TExpr>, Box<TExpr>),
+    /// `a !! i`: an element of an array or a character of a string, or void
+    /// if `i` is out of range.
+    Index(Box<TExpr>, Box<TExpr>),
+    /// `a ** b`: element by element products of two arrays, which it only
+    /// reads.
+    ElemMul(Box<TExpr>, Box<TExpr>),
     /// Change representation from the inner expression's type to `ty`.
     /// If `ty` does not contain the inner type, this is a runtime type check.
     ///
@@ -193,15 +322,56 @@ pub enum TExprKind {
     Convert(Box<TExpr>),
 }
 
+/// In a `check` on a variable of a maybe type, the arms that only run when
+/// the variable is not void see it with type `ty` (the maybe type without
+/// void).
+#[derive(Debug)]
+pub struct Narrowing {
+    pub local: usize,
+    pub ty: Ty,
+    /// For each arm, whether it sees the narrowed type.
+    pub arms: Vec<bool>,
+    pub else_arm: bool,
+}
+
 /// One definition a `Dispatch` may call.
 #[derive(Debug)]
 pub struct DispatchCase {
     /// For each argument, the type its value must have at run time, or
     /// `None` when every possible value fits.
     pub tests: Vec<Option<Ty>>,
+    /// For each argument, the length its array must have (a pattern).
+    pub lens: Vec<Option<LenTest>>,
     /// The instance's parameter types: the arguments are converted to them.
     pub params: Vec<Ty>,
     pub inst: InstId,
+}
+
+/// The length test of a pattern parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LenTest {
+    /// `(x:xs)`: at least this many elements.
+    AtLeast(usize),
+    /// `[]`.
+    Empty,
+}
+
+impl LenTest {
+    pub fn accepts(self, len: usize) -> bool {
+        match self {
+            LenTest::AtLeast(n) => len >= n,
+            LenTest::Empty => len == 0,
+        }
+    }
+}
+
+/// A definition a call may reach, while resolving the call.
+struct Case {
+    f: FuncId,
+    tests: Vec<Option<Ty>>,
+    lens: Vec<Option<LenTest>>,
+    /// The argument types it receives.
+    receives: Vec<Ty>,
 }
 
 /// Result type of applying an operator to two concrete kinds, if valid.
@@ -213,12 +383,14 @@ pub struct DispatchCase {
 pub fn binop_result(op: BinOp, a: Kind, b: Kind) -> Option<Kind> {
     use Kind::*;
     let numeric = |k: Kind| matches!(k, Int | Float);
-    // `void` marks code that produces nothing; there is nothing to compute
-    // with, not even to compare.
+    // Nothing flows through: an operation on void gives void, so
+    // `head a + 1` is void when `a` is empty.
     if a == Void || b == Void {
-        return None;
+        return Some(Void);
     }
     match op {
+        // Typed with their element types, see `Checker::concat` etc.
+        BinOp::Concat | BinOp::Index | BinOp::ElemMul => None,
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (a, b) {
             (Int, Int) if op != BinOp::Div => Some(Int),
             _ if numeric(a) && numeric(b) => Some(Float),
@@ -315,7 +487,15 @@ struct Ctx<'a> {
     names: &'a [String],
     /// The variables of the loops being checked, innermost last, with where
     /// each is named.
-    loop_vars: Vec<(usize, Span)>,
+    loop_vars: Vec<(usize, Span, Ty)>,
+    /// The types `ret` gives in this function so far.
+    ret_ty: Ty,
+    /// The declared return type, if any.
+    declared: Option<Ty>,
+    /// The function is declared `-> void`: `ret` values are discarded.
+    discard: bool,
+    /// How many list comprehensions enclose the current expression.
+    in_comprehension: usize,
 }
 
 fn err(span: Span, msg: impl Into<String>) -> Diagnostic {
@@ -362,10 +542,24 @@ impl<'a> Checker<'a> {
         // The parameters are the first variables, typed by this instance.
         let mut local_tys = params.clone();
         local_tys.resize(func.local_names.len(), Ty::NEVER);
+        // A pattern's parts: elements of the array, and the rest of it.
+        for (p, pattern) in params.iter().zip(&func.patterns) {
+            if let Some(HPattern::Cons { heads, rest }) = pattern {
+                let elem = p.elem().unwrap_or(Ty::NEVER);
+                for &h in heads {
+                    local_tys[h] = elem;
+                }
+                local_tys[*rest] = Ty::array(elem);
+            }
+        }
         let mut cx = Ctx {
             local_tys,
             names: &func.local_names,
             loop_vars: Vec::new(),
+            ret_ty: Ty::NEVER,
+            declared: func.ret,
+            discard: func.ret == Some(Ty::VOID),
+            in_comprehension: 0,
         };
         let mut body = self.stmts(&mut cx, &func.body)?;
         // The value of the last statement is the result, if it is an
@@ -386,6 +580,8 @@ impl<'a> Checker<'a> {
             }
             body.push(TStmt::Expr(v));
         }
+        // `ret` gives the function's result too.
+        result = result.union(cx.ret_ty);
         if func.ret == Some(Ty::VOID) {
             result = Ty::VOID;
         }
@@ -400,15 +596,21 @@ impl<'a> Checker<'a> {
         Ok(match stmt {
             HStmt::Let { local, value } => {
                 let v = self.expr(cx, value)?;
-                // A loop variable may get another int, never another type.
-                if let Some(&(_, declared)) = cx.loop_vars.iter().find(|(l, _)| l == local)
-                    && !v.ty.is_subset(Ty::INT)
+                // A loop variable may get another value, never another type.
+                if let Some(&(_, declared, var_ty)) =
+                    cx.loop_vars.iter().find(|(l, _, _)| l == local)
+                    && !v.ty.is_subset(var_ty)
                 {
                     let name = &cx.names[*local];
+                    let must = match var_ty {
+                        Ty::INT => "an int".to_string(),
+                        Ty::STR => "a string".to_string(),
+                        t => t.to_string(),
+                    };
                     return Err(err(
                         v.span,
                         format!(
-                            "`{name}` is the variable of a loop and must stay an int, but this is {}",
+                            "`{name}` is the variable of a loop and must stay {must}, but this is {}",
                             v.ty
                         ),
                     )
@@ -422,22 +624,16 @@ impl<'a> Checker<'a> {
             }
             HStmt::Expr(e) => TStmt::Expr(self.expr(cx, e)?),
             HStmt::Loop {
+                pos,
                 var,
                 var_span,
-                start,
-                end,
+                source,
+                borrowed,
                 body,
                 carried,
                 inner,
             } => {
-                let start = self.expr(cx, start)?;
-                let start = self.narrow(start, Ty::INT, || {
-                    "the start of a loop range must be an int".into()
-                })?;
-                let end = self.expr(cx, end)?;
-                let end = self.narrow(end, Ty::INT, || {
-                    "the end of a loop range must be an int".into()
-                })?;
+                let (source, var_ty) = self.loop_source(cx, source)?;
                 // Another fixpoint, like the one for return types: a
                 // variable the body updates may come back from an iteration
                 // with a type it did not have before (`x = 0` before the
@@ -453,9 +649,17 @@ impl<'a> Checker<'a> {
                     for &l in inner {
                         cx.local_tys[l] = Ty::NEVER;
                     }
-                    cx.local_tys[*var] = Ty::INT;
-                    cx.loop_vars.push((*var, *var_span));
+                    cx.local_tys[*var] = var_ty;
+                    cx.loop_vars.push((*var, *var_span, var_ty));
+                    // The position is an int, and stays one.
+                    if let Some((p, span)) = pos {
+                        cx.local_tys[*p] = Ty::INT;
+                        cx.loop_vars.push((*p, *span, Ty::INT));
+                    }
                     let checked = self.stmts(cx, body);
+                    if pos.is_some() {
+                        cx.loop_vars.pop();
+                    }
                     cx.loop_vars.pop();
                     let checked = checked?;
                     let widened: Vec<Ty> = carried
@@ -469,21 +673,13 @@ impl<'a> Checker<'a> {
                     }
                     // Done: after the loop, the variables have these types.
                     for (&l, &t) in carried.iter().zip(&header) {
-                        if t.is_union() && t.contains(Kind::Void) {
-                            return Err(err(
-                                start.span.to(end.span),
-                                format!(
-                                    "`{}` is {t} across this loop, but void cannot be mixed with other types",
-                                    cx.names[l]
-                                ),
-                            ));
-                        }
                         cx.local_tys[l] = t;
                     }
                     break TStmt::Loop {
+                        pos: pos.map(|(p, _)| p),
                         var: *var,
-                        start,
-                        end,
+                        source: Box::new(source),
+                        borrowed: *borrowed,
                         body: checked,
                         carried: carried.iter().copied().zip(header).collect(),
                         inner: inner.clone(),
@@ -491,6 +687,210 @@ impl<'a> Checker<'a> {
                 }
             }
         })
+    }
+
+    /// The clauses of a list comprehension, in order: each generator gives
+    /// its variables their types for the clauses after it.
+    fn clauses(&mut self, cx: &mut Ctx, clauses: &[HClause]) -> Result<Vec<TClause>, Diagnostic> {
+        let mut out = Vec::new();
+        for c in clauses {
+            out.push(match c {
+                HClause::Gen {
+                    pos,
+                    var,
+                    source,
+                    borrowed,
+                } => {
+                    let (source, var_ty) = self.loop_source(cx, source)?;
+                    cx.local_tys[*var] = var_ty;
+                    if let Some(p) = pos {
+                        cx.local_tys[*p] = Ty::INT;
+                    }
+                    TClause::Gen {
+                        pos: *pos,
+                        var: *var,
+                        source,
+                        borrowed: *borrowed,
+                    }
+                }
+                HClause::Guard(g) => {
+                    let g = self.expr(cx, g)?;
+                    TClause::Guard(self.narrow(g, Ty::BOOL, || {
+                        "a condition in a list comprehension must be a boolean".into()
+                    })?)
+                }
+            });
+        }
+        Ok(out)
+    }
+
+    /// What a loop or comprehension goes through, and the type of its
+    /// variable: an int for a range, the element type for an array, a
+    /// (one-character) string for a string.
+    fn loop_source(
+        &mut self,
+        cx: &mut Ctx,
+        source: &HExpr,
+    ) -> Result<(LoopSource, Ty), Diagnostic> {
+        if let HExprKind::Range(start, end) = &source.kind {
+            let start = self.expr(cx, start)?;
+            let start = self.narrow(start, Ty::INT, || {
+                "the start of a range must be an int".into()
+            })?;
+            let end = self.expr(cx, end)?;
+            let end = self.narrow(end, Ty::INT, || "the end of a range must be an int".into())?;
+            return Ok((LoopSource::Range(start, end), Ty::INT));
+        }
+        let e = self.expr(cx, source)?;
+        let e = self.narrow(e, Ty::ITERABLE, || {
+            "a loop goes through a range, an array or a string".into()
+        })?;
+        let var_ty = match e.ty.as_kind() {
+            Some(Kind::Array) => e.ty.elem().unwrap_or(Ty::NEVER),
+            Some(Kind::Str) => Ty::STR,
+            _ if e.ty.is_never() => Ty::NEVER,
+            _ => {
+                return Err(err(
+                    e.span,
+                    format!(
+                        "a loop goes through an array or a string, but this may be either ({})",
+                        e.ty
+                    ),
+                ));
+            }
+        };
+        Ok((LoopSource::Each(e), var_ty))
+    }
+
+    /// The type of `[items...]`: all elements have the same type (a value
+    /// that may be void counts as the same type: `[1, head a]` is `[int?]`).
+    fn array_literal(&mut self, items: Vec<TExpr>) -> Result<(TExprKind, Ty), Diagnostic> {
+        let mut elem = Ty::NEVER;
+        let mut first: Option<&TExpr> = None;
+        for item in &items {
+            elem = elem.union(item.ty);
+            // A void element fits any element type (`[void, 2]` is `[int?]`).
+            if item.ty.without(Ty::VOID).is_never() {
+                continue;
+            }
+            match first {
+                None => first = Some(item),
+                // Same type, ignoring void; an empty array `[]` fits any
+                // array type (`[[1], []]` is `[[int]]`).
+                Some(f)
+                    if !item.ty.without(Ty::VOID).is_subset(f.ty.without(Ty::VOID))
+                        && !f.ty.without(Ty::VOID).is_subset(item.ty.without(Ty::VOID)) =>
+                {
+                    return Err(err(
+                        item.span,
+                        format!(
+                            "the elements of an array must all have the same type, but this is {} and the first one is {}",
+                            item.ty, f.ty
+                        ),
+                    )
+                    .with_note(f.span, "the first element"));
+                }
+                Some(_) => {}
+            }
+        }
+        let items = items.into_iter().map(|i| convert(i, elem)).collect();
+        Ok((TExprKind::Array(items), Ty::array(elem)))
+    }
+
+    /// `a ++ b`: two arrays with elements of the same type; void flows
+    /// through.
+    fn concat(&mut self, a: TExpr, b: TExpr, span: Span) -> Result<(TExprKind, Ty), Diagnostic> {
+        for e in [&a, &b] {
+            if !e.ty.is_subset(Ty::ARRAY.union(Ty::VOID)) {
+                return Err(err(
+                    e.span,
+                    format!("`++` joins two arrays, but this is {}", e.ty),
+                ));
+            }
+        }
+        let mut ty = Ty::NEVER;
+        if a.ty.contains(Kind::Void) || b.ty.contains(Kind::Void) {
+            ty = Ty::VOID;
+        }
+        if let (Some(ea), Some(eb)) = (a.ty.elem(), b.ty.elem()) {
+            let same =
+                ea.is_never() || eb.is_never() || ea.without(Ty::VOID) == eb.without(Ty::VOID);
+            if !same {
+                return Err(err(
+                    span,
+                    format!(
+                        "`++` joins arrays whose elements have the same type, but these are {} and {}",
+                        a.ty, b.ty
+                    ),
+                ));
+            }
+            ty = ty.union(Ty::array(ea.union(eb)));
+        }
+        Ok((TExprKind::Concat(Box::new(a), Box::new(b)), ty))
+    }
+
+    /// `a ** b`: two arrays of numbers multiplied element by element; the
+    /// longer array's extra elements are kept as they are. The elements of
+    /// the result are what `*` gives for each pair, or what the longer array
+    /// holds; void flows through.
+    fn elem_mul(&mut self, a: TExpr, b: TExpr) -> Result<(TExprKind, Ty), Diagnostic> {
+        let numbers = Ty::array(Ty::NUMERIC.union(Ty::VOID)).union(Ty::VOID);
+        for e in [&a, &b] {
+            if !e.ty.is_subset(numbers) {
+                return Err(err(
+                    e.span,
+                    format!(
+                        "`**` multiplies two arrays of numbers, but this is {}",
+                        e.ty
+                    ),
+                ));
+            }
+        }
+        let mut ty = Ty::NEVER;
+        if a.ty.contains(Kind::Void) || b.ty.contains(Kind::Void) {
+            ty = Ty::VOID;
+        }
+        if let (Some(ea), Some(eb)) = (a.ty.elem(), b.ty.elem()) {
+            // pairs, then the leftovers of either array
+            let mut elem = ea.union(eb);
+            for ka in ea.kinds() {
+                for kb in eb.kinds() {
+                    if let Some(k) = binop_result(BinOp::Mul, ka, kb) {
+                        elem = elem.union(Ty::of(k));
+                    }
+                }
+            }
+            ty = ty.union(Ty::array(elem));
+        }
+        Ok((TExprKind::ElemMul(Box::new(a), Box::new(b)), ty))
+    }
+
+    /// `a !! i`: an element (or a character), or void when `i` is out of
+    /// range; void flows through.
+    fn index(&mut self, a: TExpr, i: TExpr) -> Result<(TExprKind, Ty), Diagnostic> {
+        if !a.ty.is_subset(Ty::ITERABLE.union(Ty::VOID)) {
+            return Err(err(
+                a.span,
+                format!(
+                    "`!!` takes an element of an array or a string, but this is {}",
+                    a.ty
+                ),
+            ));
+        }
+        if !i.ty.is_subset(Ty::INT.union(Ty::VOID)) {
+            return Err(err(
+                i.span,
+                format!("the position in `!!` must be an int, but this is {}", i.ty),
+            ));
+        }
+        let mut ty = Ty::VOID;
+        if let Some(elem) = a.ty.elem() {
+            ty = ty.union(elem);
+        }
+        if a.ty.contains(Kind::Str) {
+            ty = ty.union(Ty::STR);
+        }
+        Ok((TExprKind::Index(Box::new(a), Box::new(i)), ty))
     }
 
     /// Convert `e` to `e.ty ∩ target`, inserting a runtime check if needed.
@@ -508,6 +908,18 @@ impl<'a> Checker<'a> {
         if e.ty.is_subset(target) {
             return Ok(e);
         }
+        // A value that may be void cannot go where void is not accepted:
+        // the program must handle the void case first.
+        if e.ty.is_maybe() && !target.contains(Kind::Void) {
+            return Err(err(
+                e.span,
+                format!(
+                    "{}, but this is {}, which may be void: handle the void case first, e.g. with a `check` that has a `void ->` arm",
+                    what(),
+                    e.ty
+                ),
+            ));
+        }
         let narrowed = e.ty.intersect(target);
         if narrowed.is_never() {
             return Err(err(e.span, format!("{}, but this is {}", what(), e.ty)));
@@ -522,8 +934,148 @@ impl<'a> Checker<'a> {
             HExprKind::Float(v) => (TExprKind::Float(*v), Ty::FLOAT),
             HExprKind::Str(s) => (TExprKind::Str(s.clone()), Ty::STR),
             HExprKind::Bool(b) => (TExprKind::Bool(*b), Ty::BOOL),
+            HExprKind::Void => (TExprKind::Void, Ty::VOID),
             HExprKind::Local(l) => (TExprKind::Local(*l), cx.local_tys[*l]),
             HExprKind::Call { name, args } => return self.call(cx, name, args, span),
+            HExprKind::Binary {
+                op: op @ (BinOp::Concat | BinOp::Index | BinOp::ElemMul),
+                lhs,
+                rhs,
+            } => {
+                let lhs = self.expr(cx, lhs)?;
+                let rhs = self.expr(cx, rhs)?;
+                if lhs.ty.is_never() || rhs.ty.is_never() {
+                    return Ok(TExpr {
+                        kind: TExprKind::Diverge(vec![lhs, rhs]),
+                        ty: Ty::NEVER,
+                        span,
+                    });
+                }
+                if *op == BinOp::Concat {
+                    self.concat(lhs, rhs, span)?
+                } else if *op == BinOp::ElemMul {
+                    self.elem_mul(lhs, rhs)?
+                } else {
+                    self.index(lhs, rhs)?
+                }
+            }
+            HExprKind::Ret(value) => {
+                if cx.in_comprehension > 0 {
+                    return Err(err(
+                        span,
+                        "`ret` cannot leave the function from inside a list comprehension",
+                    ));
+                }
+                let value = match value {
+                    Some(v) => {
+                        let mut v = self.expr(cx, v)?;
+                        if let Some(declared) = cx.declared
+                            && declared != Ty::VOID
+                        {
+                            v = self.narrow(v, declared, || {
+                                format!("the function is declared to return {declared}")
+                            })?;
+                        }
+                        Some(v)
+                    }
+                    None => None,
+                };
+                if !cx.discard {
+                    cx.ret_ty = cx.ret_ty.union(value.as_ref().map_or(Ty::VOID, |v| v.ty));
+                }
+                // The expression itself never produces a value: control
+                // leaves the function.
+                (TExprKind::Ret(value.map(Box::new)), Ty::NEVER)
+            }
+            HExprKind::Builtin(b, arg) => {
+                let arg = self.expr(cx, arg)?;
+                if arg.ty.is_never() {
+                    return Ok(TExpr {
+                        kind: TExprKind::Diverge(vec![arg]),
+                        ty: Ty::NEVER,
+                        span,
+                    });
+                }
+                // `copy` takes a value of any type and gives one of the same.
+                if *b == Builtin::Copy {
+                    let ty = arg.ty;
+                    return Ok(TExpr {
+                        kind: TExprKind::Builtin(*b, Box::new(arg)),
+                        ty,
+                        span,
+                    });
+                }
+                if !arg.ty.is_subset(Ty::ITERABLE.union(Ty::VOID)) {
+                    return Err(err(
+                        arg.span,
+                        format!(
+                            "`{}` takes an array or a string, but this is {}",
+                            b.name(),
+                            arg.ty
+                        ),
+                    ));
+                }
+                // Void flows through; an empty array or string has no
+                // element, so `head`, `tail`, `init` and `last` may give void.
+                let mut ty = if arg.ty.contains(Kind::Void) {
+                    Ty::VOID
+                } else {
+                    Ty::NEVER
+                };
+                if let Some(elem) = arg.ty.elem() {
+                    ty = ty.union(match b {
+                        Builtin::Len => Ty::INT,
+                        Builtin::Head | Builtin::Last => elem.union(Ty::VOID),
+                        Builtin::Tail | Builtin::Init => Ty::array(elem).union(Ty::VOID),
+                        Builtin::Reverse => Ty::array(elem),
+                        Builtin::Copy => unreachable!("typed above"),
+                    });
+                }
+                if arg.ty.contains(Kind::Str) {
+                    ty = ty.union(match b {
+                        Builtin::Len => Ty::INT,
+                        Builtin::Reverse => Ty::STR,
+                        _ => Ty::STR.union(Ty::VOID),
+                    });
+                }
+                (TExprKind::Builtin(*b, Box::new(arg)), ty)
+            }
+            HExprKind::Array(items) => {
+                let items = items
+                    .iter()
+                    .map(|i| self.expr(cx, i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.array_literal(items)?
+            }
+            HExprKind::Range(start, end) => {
+                let start = self.expr(cx, start)?;
+                let start = self.narrow(start, Ty::INT, || {
+                    "the start of a range must be an int".into()
+                })?;
+                let end = self.expr(cx, end)?;
+                let end =
+                    self.narrow(end, Ty::INT, || "the end of a range must be an int".into())?;
+                (
+                    TExprKind::Range(Box::new(start), Box::new(end)),
+                    Ty::array(Ty::INT),
+                )
+            }
+            HExprKind::Comprehension { body, clauses } => {
+                cx.in_comprehension += 1;
+                let checked = self
+                    .clauses(cx, clauses)
+                    .and_then(|clauses| Ok((clauses, self.expr(cx, body)?)));
+                cx.in_comprehension -= 1;
+                let (clauses, body) = checked?;
+                let ty = Ty::array(body.ty);
+                (
+                    TExprKind::Comprehension {
+                        body: Box::new(body),
+                        clauses,
+                    },
+                    ty,
+                )
+            }
             HExprKind::Binary { op, lhs, rhs } => {
                 let lhs = self.expr(cx, lhs)?;
                 let rhs = self.expr(cx, rhs)?;
@@ -572,7 +1124,8 @@ impl<'a> Checker<'a> {
                 let ty = if inner.ty.is_never() {
                     Ty::NEVER
                 } else {
-                    let ty = inner.ty.intersect(Ty::NUMERIC);
+                    // Nothing flows through: negating void gives void.
+                    let ty = inner.ty.intersect(Ty::NUMERIC.union(Ty::VOID));
                     if ty.is_never() {
                         return Err(err(
                             span,
@@ -593,40 +1146,75 @@ impl<'a> Checker<'a> {
                 else_arm,
             } => {
                 let scrutinee = self.expr(cx, scrutinee)?;
+                // Handling the void case: when the checked value is a
+                // variable of a maybe type (`int?`), an arm whose pattern is
+                // not void only runs when the variable is not void, so in
+                // that arm it has the plain type (`int`). After a `void ->`
+                // arm, the same holds for `else`.
+                let narrow_local = match scrutinee.kind {
+                    TExprKind::Local(l) if scrutinee.ty.is_maybe() => Some(l),
+                    _ => None,
+                };
+                let narrowed_ty = scrutinee.ty.without(Ty::VOID);
+                let mut narrowed_arms = Vec::new();
                 let mut tarms = Vec::new();
                 let mut ty = Ty::NEVER;
                 let mut seen_true = false;
                 let mut seen_false = false;
+                let mut seen_void = false;
+                let arm_body = |this: &mut Self, cx: &mut Ctx, body: &HExpr, narrowed: bool| {
+                    let saved = narrow_local.map(|l| cx.local_tys[l]);
+                    if let (Some(l), true) = (narrow_local, narrowed) {
+                        cx.local_tys[l] = narrowed_ty;
+                    }
+                    let body = this.expr(cx, body);
+                    if let (Some(l), Some(t)) = (narrow_local, saved) {
+                        cx.local_tys[l] = t;
+                    }
+                    body
+                };
                 for (pat, body) in arms {
                     let pat = self.expr(cx, pat)?;
                     match pat.kind {
                         TExprKind::Bool(true) => seen_true = true,
                         TExprKind::Bool(false) => seen_false = true,
+                        TExprKind::Void => seen_void = true,
                         _ => {}
                     }
-                    let body = self.expr(cx, body)?;
+                    let narrowed = narrow_local.is_some() && !pat.ty.contains(Kind::Void);
+                    let body = arm_body(self, cx, body, narrowed)?;
                     ty = ty.union(body.ty);
+                    narrowed_arms.push(narrowed);
                     tarms.push((pat, body));
                 }
+                let else_narrowed = narrow_local.is_some() && seen_void;
                 let else_arm = match else_arm {
                     Some(e) => {
-                        let e = self.expr(cx, e)?;
+                        let e = arm_body(self, cx, e, else_narrowed)?;
                         ty = ty.union(e.ty);
                         Some(e)
                     }
                     None => {
                         // Exhaustiveness check: without `else`, some value
                         // could match no arm and the `check` would have no
-                        // result. Only booleans can be covered completely
-                        // (by both `true` and `false`), since there are
+                        // result. Only booleans (`true`, `false`) and void
+                        // can be covered completely, since there are
                         // infinitely many ints and strings.
-                        let exhaustive =
-                            scrutinee.ty.is_subset(Ty::BOOL) && seen_true && seen_false;
-                        if !exhaustive {
+                        let covered = |k: Kind| match k {
+                            Kind::Bool => seen_true && seen_false,
+                            Kind::Void => seen_void,
+                            _ => false,
+                        };
+                        if !scrutinee.ty.kinds().all(covered) {
+                            let hint = if scrutinee.ty.contains(Kind::Void) && !seen_void {
+                                " (or a `void ->` arm for the void case)"
+                            } else {
+                                ""
+                            };
                             return Err(err(
                                 span,
                                 format!(
-                                    "`check` on a value of type {} needs an `else` branch to cover all values",
+                                    "`check` on a value of type {} needs an `else` branch to cover all values{hint}",
                                     scrutinee.ty
                                 ),
                             ));
@@ -634,19 +1222,12 @@ impl<'a> Checker<'a> {
                         None
                     }
                 };
-                // `void` never mixes with other types: either every arm
-                // gives void (the `check` only does something) or none does
-                // (it computes a value). So no value can be "maybe void",
-                // and void never needs a box: there is only ever the one
-                // void, which is not stored anywhere.
-                if ty.is_union() && ty.contains(Kind::Void) {
-                    return Err(err(
-                        span,
-                        format!(
-                            "the arms of this `check` give {ty}, but void cannot be mixed with other types: every arm must give void, or none"
-                        ),
-                    ));
-                }
+                let narrowing = narrow_local.map(|local| Narrowing {
+                    local,
+                    ty: narrowed_ty,
+                    arms: narrowed_arms,
+                    else_arm: else_narrowed,
+                });
                 // All arms must produce the same representation, because
                 // after the `check` the code continues from one place with
                 // one result. Arms whose type is narrower than the union get
@@ -661,6 +1242,7 @@ impl<'a> Checker<'a> {
                         scrutinee: Box::new(scrutinee),
                         arms: tarms,
                         else_arm,
+                        narrowing,
                     },
                     ty,
                 )
@@ -706,11 +1288,15 @@ impl<'a> Checker<'a> {
         // definition that tests a single argument leaves the next ones only
         // the values it rejected.
         let mut remaining: Vec<Ty> = args.iter().map(|a| a.ty).collect();
-        // (definition, runtime test per argument, argument types it receives)
-        let mut cases: Vec<(FuncId, Vec<Option<Ty>>, Vec<Ty>)> = Vec::new();
+        // Which array lengths earlier patterns accepted, per argument: an
+        // empty array (`[]`), and arrays of at least n elements (`(x:xs)`).
+        let mut empty_covered = vec![false; args.len()];
+        let mut from_covered: Vec<Option<usize>> = vec![None; args.len()];
+        let mut cases: Vec<Case> = Vec::new();
         let mut exhaustive = false;
         for &f in &candidates {
-            let params = &hir.funcs[f].param_tys;
+            let func = &hir.funcs[f];
+            let params = &func.param_tys;
             if remaining
                 .iter()
                 .zip(params)
@@ -723,20 +1309,73 @@ impl<'a> Checker<'a> {
                 .zip(params)
                 .map(|(a, t)| (!a.is_subset(*t)).then_some(*t))
                 .collect();
-            let tested: Vec<usize> = (0..tests.len()).filter(|&j| tests[j].is_some()).collect();
+            // A pattern also tests the array's length, at run time.
+            let lens: Vec<Option<LenTest>> = func
+                .patterns
+                .iter()
+                .map(|p| match p {
+                    Some(HPattern::Cons { heads, .. }) => Some(LenTest::AtLeast(heads.len())),
+                    Some(HPattern::Empty) => Some(LenTest::Empty),
+                    None => None,
+                })
+                .collect();
+            let tested: Vec<usize> = (0..tests.len())
+                .filter(|&j| tests[j].is_some() || lens[j].is_some())
+                .collect();
             let receives = remaining
                 .iter()
                 .zip(params)
                 .map(|(a, t)| a.intersect(*t))
                 .collect();
-            cases.push((f, tests, receives));
-            match tested[..] {
-                [] => {
-                    exhaustive = true;
-                    break;
+            if let [j] = tested[..] {
+                // Only argument `j` decides whether this definition is taken,
+                // so the next definitions only see the values it rejects.
+                match lens[j] {
+                    None => remaining[j] = remaining[j].without(params[j]),
+                    Some(test) => {
+                        match test {
+                            LenTest::Empty => empty_covered[j] = true,
+                            LenTest::AtLeast(n) => {
+                                from_covered[j] = Some(from_covered[j].map_or(n, |m| m.min(n)))
+                            }
+                        }
+                        // `[]` and `(x:xs)` together accept every array.
+                        let all_arrays = from_covered[j] == Some(0)
+                            || (empty_covered[j] && from_covered[j] == Some(1));
+                        if all_arrays {
+                            remaining[j] = remaining[j].without(Ty::ARRAY);
+                        }
+                    }
                 }
-                [j] => remaining[j] = remaining[j].without(params[j]),
-                _ => {}
+            }
+            let done = tested.is_empty() || remaining.iter().any(|r| r.is_never());
+            cases.push(Case {
+                f,
+                tests,
+                lens,
+                receives,
+            });
+            if done {
+                exhaustive = true;
+                break;
+            }
+        }
+        // A value that may be void must reach a definition that accepts void
+        // (one with an unannotated or `any` parameter); otherwise the
+        // program has to handle the void case before the call.
+        for (j, a) in args.iter().enumerate() {
+            if a.ty.is_maybe()
+                && !cases.is_empty()
+                && cases.iter().all(|c| !c.receives[j].contains(Kind::Void))
+            {
+                return Err(err(
+                    a.span,
+                    format!(
+                        "argument {} of `{name}` is {}, which may be void, but `{name}` does not accept void: handle the void case first, e.g. with a `check` that has a `void ->` arm",
+                        j + 1,
+                        a.ty
+                    ),
+                ));
             }
         }
         let chosen = match cases.len() {
@@ -770,7 +1409,8 @@ impl<'a> Checker<'a> {
             // One definition: call it directly. If it accepts only some of
             // the values, the argument conversion below checks the value at
             // run time and names the expected type if it does not fit.
-            1 => cases[0].0,
+            // A pattern must be tested at run time, even with one definition.
+            1 if cases[0].lens.iter().all(Option::is_none) => cases[0].f,
             _ => return self.dispatch(name, args, cases, exhaustive, span),
         };
 
@@ -803,29 +1443,22 @@ impl<'a> Checker<'a> {
         &mut self,
         name: &str,
         args: Vec<TExpr>,
-        cases: Vec<(FuncId, Vec<Option<Ty>>, Vec<Ty>)>,
+        cases: Vec<Case>,
         exhaustive: bool,
         span: Span,
     ) -> Result<TExpr, Diagnostic> {
         let mut ty = Ty::NEVER;
         let mut tcases = Vec::new();
         // Each instance receives the arguments narrowed to what reaches it.
-        for (f, tests, params) in cases {
-            let inst = self.instantiate(f, params.clone());
+        for c in cases {
+            let inst = self.instantiate(c.f, c.receives.clone());
             ty = ty.union(self.instances[inst].ret);
             tcases.push(DispatchCase {
-                tests,
-                params,
+                tests: c.tests,
+                lens: c.lens,
+                params: c.receives,
                 inst,
             });
-        }
-        if ty.is_union() && ty.contains(Kind::Void) {
-            return Err(err(
-                span,
-                format!(
-                    "the definitions of `{name}` that this call may reach give {ty}, but void cannot be mixed with other types"
-                ),
-            ));
         }
         Ok(TExpr {
             kind: TExprKind::Dispatch {
@@ -894,6 +1527,8 @@ impl<'a> Checker<'a> {
                 body,
                 local_tys: std::mem::take(&mut inst.local_tys),
                 local_names: func.local_names.clone(),
+                patterns: func.patterns.clone(),
+                borrowed: func.borrowed.clone(),
             });
         }
         Tir { funcs, entry: 0 }
@@ -906,6 +1541,7 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
         | TExprKind::Float(_)
         | TExprKind::Str(_)
         | TExprKind::Bool(_)
+        | TExprKind::Void
         | TExprKind::Local(_) => {}
         TExprKind::Call { args, .. }
         | TExprKind::Dispatch { args, .. }
@@ -914,11 +1550,28 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
             f(lhs);
             f(rhs);
         }
-        TExprKind::Neg(x) | TExprKind::Echo(x) | TExprKind::Convert(x) => f(x),
+        TExprKind::Neg(x)
+        | TExprKind::Echo(x)
+        | TExprKind::Convert(x)
+        | TExprKind::Builtin(_, x) => f(x),
+        TExprKind::Array(items) => items.iter().for_each(f),
+        TExprKind::Ret(value) => value.iter().for_each(|v| f(v)),
+        TExprKind::Range(a, b)
+        | TExprKind::Concat(a, b)
+        | TExprKind::Index(a, b)
+        | TExprKind::ElemMul(a, b) => {
+            f(a);
+            f(b);
+        }
+        TExprKind::Comprehension { body, clauses } => {
+            clauses.iter().flat_map(TClause::exprs).for_each(&mut *f);
+            f(body);
+        }
         TExprKind::Check {
             scrutinee,
             arms,
             else_arm,
+            ..
         } => {
             f(scrutinee);
             for (p, b) in arms {
@@ -958,11 +1611,31 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
             remap_calls(lhs, index);
             remap_calls(rhs, index);
         }
-        TExprKind::Neg(x) | TExprKind::Echo(x) | TExprKind::Convert(x) => remap_calls(x, index),
+        TExprKind::Neg(x)
+        | TExprKind::Echo(x)
+        | TExprKind::Convert(x)
+        | TExprKind::Builtin(_, x) => remap_calls(x, index),
+        TExprKind::Array(items) => items.iter_mut().for_each(|i| remap_calls(i, index)),
+        TExprKind::Ret(value) => value.iter_mut().for_each(|v| remap_calls(v, index)),
+        TExprKind::Range(a, b)
+        | TExprKind::Concat(a, b)
+        | TExprKind::Index(a, b)
+        | TExprKind::ElemMul(a, b) => {
+            remap_calls(a, index);
+            remap_calls(b, index);
+        }
+        TExprKind::Comprehension { body, clauses } => {
+            clauses
+                .iter_mut()
+                .flat_map(TClause::exprs_mut)
+                .for_each(|e| remap_calls(e, index));
+            remap_calls(body, index);
+        }
         TExprKind::Check {
             scrutinee,
             arms,
             else_arm,
+            ..
         } => {
             remap_calls(scrutinee, index);
             for (p, b) in arms {

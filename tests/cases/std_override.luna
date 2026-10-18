@@ -1,0 +1,9 @@
+# A program's own definition replaces the standard library's for the
+# program; the library keeps using its own (`average` calls the library's
+# `sum`, not this one).
+
+sum a b = a + b
+
+main =
+    echo sum 1 2
+    echo average [1, 2, 3, 4]

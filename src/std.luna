@@ -1,0 +1,151 @@
+# The Luna standard library.
+#
+# It is compiled together with every program; only the functions a program
+# uses end up in its executable. A program that defines a function with the
+# same name uses its own definition instead (all of them).
+#
+# Functions that only read an array or a string borrow it (`@a`), so the
+# caller keeps it: after `sum a`, `a` is still there. Functions that build
+# their result out of the elements (`take`, `drop`, `flatten`, `remove`,
+# `maximum`, `minimum`) take it, like `tail` and `++`, and nothing is
+# copied.
+
+# -- numbers -----------------------------------------------------------------
+
+# The distance from zero: `abs (-3)` is 3.
+abs x :: numeric -> numeric = check x < 0:
+    true -> -x;
+    false -> x
+
+# The larger of two numbers.
+max a b :: numeric, numeric -> numeric = check a < b:
+    true -> b;
+    false -> a
+
+# The smaller of two numbers.
+min a b :: numeric, numeric -> numeric = check b < a:
+    true -> b;
+    false -> a
+
+# The sum of an array of numbers; 0 for an empty array.
+sum @a :: array -> numeric =
+    total = 0
+    loop x in @a:
+        total = total + x
+    total
+
+# The product of an array of numbers; 1 for an empty array.
+product @a :: array -> numeric =
+    total = 1
+    loop x in @a:
+        total = total * x
+    total
+
+# The average of an array of numbers (a float), or void for an empty array.
+average @a =
+    n = len a
+    check n:
+        0 -> void;
+        else -> sum a / n
+
+# -- searching ---------------------------------------------------------------
+
+# The largest element, or void for an empty array. (It gives an element of
+# `a`, so it takes `a`.)
+maximum (x:xs) =
+    best = x
+    loop y in xs:
+        best = check y > best:
+            true -> y;
+            false -> best
+    best
+maximum [] = void
+
+# The smallest element, or void for an empty array.
+minimum (x:xs) =
+    best = x
+    loop y in xs:
+        best = check y < best:
+            true -> y;
+            false -> best
+    best
+minimum [] = void
+
+# Whether `a` (an array or a string) has an element equal to `x`.
+contains @a @x =
+    loop y in @a:
+        check y == x:
+            true -> ret true;
+            false -> void
+    false
+
+# How many elements of `a` are equal to `x`.
+count @a @x =
+    n = 0
+    loop y in @a:
+        n = check y == x:
+            true -> n + 1;
+            false -> n
+    n
+
+# The position of the first element of `a` equal to `x`, or void.
+index_of @a @x =
+    loop i, y in @a:
+        check y == x:
+            true -> ret i;
+            false -> void
+    void
+
+# The elements of `a` that are not equal to `x`.
+remove a @x = [y | y in a, y != x]
+
+# -- building arrays ---------------------------------------------------------
+
+# The first `n` elements (all of them if there are fewer).
+take n a :: int, array -> array = [x | i, x in a, i < n]
+
+# The elements after the first `n`.
+drop n a :: int, array -> array = [x | i, x in a, i >= n]
+
+# The arrays in `a` joined into one: `flatten [[1], [2, 3]]` is [1, 2, 3].
+flatten a :: array -> array = [x | part in a, x in part]
+
+# Whether an array or a string has no elements.
+is_empty @a = len a == 0
+
+# -- strings -----------------------------------------------------------------
+
+# The strings in `a` joined, with `sep` between them:
+# `join ["a", "b"] ", "` is "a, b".
+join @a @sep :: array, string -> string =
+    out = ""
+    first = true
+    loop s in @a:
+        out = check first:
+            true -> out;
+            false -> out + sep
+        out = out + s
+        first = false
+    out
+
+# The parts of `s` between the occurrences of the character `sep`:
+# `split "a,b" ","` is ["a", "b"].
+split @s @sep :: string, string -> array =
+    parts = []
+    current = ""
+    loop c in @s:
+        at_sep = c == sep
+        parts = check at_sep:
+            true -> parts ++ [copy current];
+            false -> parts
+        current = check at_sep:
+            true -> "";
+            false -> current + c
+    parts ++ [current]
+
+# `s` repeated `n` times.
+repeat @s n :: string, int -> string =
+    out = ""
+    loop i in [0..n]:
+        out = out + s
+    out

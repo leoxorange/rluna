@@ -1,0 +1,20 @@
+# Calls without parentheses: a function takes the arguments after it, as many
+# as it accepts, so `echo sum xs` is `echo (sum xs)` and `head tail a` is
+# `head (tail a)`.
+
+sum (x:xs) = x + sum xs
+sum [] = 0
+double x = x * 2
+add a b = a + b
+both a b = [a, b]
+
+main =
+    echo sum [x | x in [1..101]]
+    a = [1, 2, 3]
+    echo head tail copy a
+    echo len tail tail copy a
+    echo double double 5
+    echo add double 1 3
+    echo both 1 2
+    echo add 1 2 + 10
+    echo sum a

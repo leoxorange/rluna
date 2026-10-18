@@ -1,0 +1,46 @@
+# Array patterns: `(x:xs)` takes an array apart, `[]` matches an empty one.
+# Definitions are tried from top to bottom, testing the length at run time.
+
+# this is an example for showing how internal function head works
+head (x:xs) = x
+head [] = void
+
+total (x:xs) = x + total xs
+total [] = 0
+
+second (x:y:xs) = y
+second other = void
+
+join (s:rest) = s + join rest
+join [] = ""
+
+count_down (x:xs) =
+    echo x
+    count_down xs
+count_down [] = echo "done"
+
+# one element: `x` is that element and `xs` is the empty array
+parts (x:xs) =
+    echo x
+    echo xs
+parts [] = echo "empty"
+
+pair (x:y:xs) =
+    echo [x, y]
+    echo xs
+pair other = echo "fewer than two"
+
+main =
+    echo (head [7, 8, 9])
+    echo (head [])
+    echo (total [1, 2, 3, 4])
+    echo (second [1, 2, 3])
+    echo (second [1])
+    echo (join ["a", "b", "c"])
+    count_down [3, 2, 1]
+    xs = [10, 20]
+    echo (head xs + 1)
+    parts [7]
+    parts []
+    pair [1, 2]
+    pair [1]

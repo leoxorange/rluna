@@ -445,6 +445,11 @@ impl FunctionBuilder {
         self.push(Op::Store(ty, ptr, offset, value), None);
     }
 
+    /// A region of `size` bytes in the stack frame.
+    pub fn alloca(&mut self, size: u32) -> Value {
+        self.push_val(Op::Alloca(size), Type::I64)
+    }
+
     pub fn addr(&mut self, symbol: &str) -> Value {
         self.push_val(Op::Addr(symbol.to_string()), Type::I64)
     }

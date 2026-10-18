@@ -29,7 +29,7 @@ main =
         true -> echo "yes";
         false -> echo "no"
     # a check nested in an arm, and one inside parentheses
-    loop a in [1, 3]:
+    loop a in [1..3]:
         echo (check a:
             1 -> check 2:
                 2 -> "a is 1, and 2 is 2";

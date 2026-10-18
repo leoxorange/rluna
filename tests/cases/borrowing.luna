@@ -1,0 +1,101 @@
+# Borrowing: `@` parameters, loops over `@a`, the elements `head`, `last` and
+# `!!` give (the elements themselves), and `copy`. Everything else moves, and
+# nothing is copied unless the program says `copy`.
+
+words n = check n:
+    1 -> ["ann", "bob", "cy"];
+    else -> ["dee", "ed"]
+greet @name = "hello " + name
+shout @name = greet name + "!"
+pick @a = copy (head a)
+both @a @b = a + b
+describe @x = check x:
+    void -> "nothing";
+    else -> x + "?"
+size @x :: string -> int = len x
+size @x :: array -> int = len x + 100
+
+# A loop that owns what it goes through, left early: the elements not
+# reached yet are freed by the `ret`.
+first_long ws =
+    loop w in ws:
+        check len w > 2:
+            true -> ret w;
+            false -> void
+    "none"
+# The same through a borrowed array: the element is copied to be kept.
+first_long_of @ws =
+    loop w in @ws:
+        check len w > 2:
+            true -> ret copy w;
+            false -> void
+    "none"
+
+main =
+    names = words 1
+    # lent, not given: `names` stays usable
+    echo (greet (head names))
+    echo (shout (last names))
+    echo (both (names !! 0) (names !! 1))
+    echo (pick names)
+    echo (describe (head names))
+    echo (describe (names !! 7))
+    echo (len names)
+    echo names
+    # elements of temporaries live until they are no longer used
+    echo (head (words 1))
+    echo (greet (words 2 !! 1))
+    echo (check head (words 2):
+        "dee" -> "found dee";
+        else -> "no dee")
+    # a copy is owned, so it can be kept
+    keep = copy (last names)
+    keep = keep + "?"
+    echo keep
+    # arrays of arrays: an element of an element
+    grid = [["a", "b"], ["c"]]
+    echo (head (head grid))
+    echo (len (grid !! 1))
+    echo grid
+    # borrowing loops and comprehensions leave the array alone
+    loop w in @names:
+        echo (greet w)
+    echo [len w | w in @names]
+    echo [w + "!" | w in @names, w != "bob"]
+    loop w in @(words 2):
+        echo w
+    s = "hey"
+    loop c in @s:
+        echo c
+    echo s
+    # moving loops and comprehensions take the array, element by element
+    acc = []
+    loop w in words 2:
+        acc = acc ++ [w]
+    echo acc
+    echo [w | w in acc, len w > 2]
+    echo [w + w | w in words 1]
+    echo (first_long (words 1))
+    echo (first_long (words 2))
+    echo (first_long_of names)
+    # tail, init and reverse take their argument
+    echo (tail (words 1))
+    echo (init (words 1))
+    echo (reverse names)
+    echo (tail "hello")
+    # `++` takes both operands; `x = x ++ ...` builds on the old value
+    more = ["x"]
+    more = more ++ ["y"]
+    echo more
+    # numbers, even boxed ones, are copied
+    n = check len more > 1:
+        true -> 1;
+        false -> 2.5
+    m = n
+    echo (n + m)
+    # a call decided at run time borrows too
+    v = check len more > 1:
+        true -> "abcd";
+        false -> [1, 2]
+    echo (size v)
+    echo v

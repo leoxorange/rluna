@@ -1,0 +1,13 @@
+# List comprehension conditions: `[x | x in a, x > 0]` keeps the elements for
+# which every condition is true.
+
+names = ["ann", "bob", "cy"]
+main =
+    echo [x | x in [0..10], x > 5]
+    echo [x * x | x in [0..10], x > 2, x < 6]
+    echo [n + "!" | n in names, n != "bob"]
+    echo [c | c in "hello", c != "l"]
+    echo [x | x in [1, 2, 3], x > 5]
+    echo len [x | x in [0..100], x > 49]
+    big = [x | x in [0..10], x > 7]
+    echo big

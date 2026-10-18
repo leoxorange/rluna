@@ -5,19 +5,19 @@ greet name = "hi, " + name
 # `b` is still owned when the function ends, so it is dropped there
 keep_first a b = a
 pick n = check n:
-1 -> "one";
-2 -> 2.5;
-else -> n
+    1 -> "one";
+    2 -> 2.5;
+    else -> n
 # narrowing a boxed value to a string frees the box
 shout s :: string -> string = s + "!"
 # only the first arm moves `s`; the else arm drops it before leaving
 choose c s = check c:
-1 -> s;
-else -> "other"
+    1 -> s;
+    else -> "other"
 # `acc + "x"` is a new string; the old `acc` is dropped when the call returns
 build n acc = check n:
-0 -> acc;
-else -> build (n - 1) (acc + "x")
+    0 -> acc;
+    else -> build (n - 1) (acc + "x")
 
 main =
     echo (greet "bob")

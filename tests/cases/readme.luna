@@ -1,4 +1,10 @@
-# Every example from readme.md, gathered into one program.
+# Every example from readme.md, gathered into one program (the examples of
+# errors are in `compile_errors`). Examples that reuse a name get their own:
+# `play` for the overloading example, `first` for the pattern example of
+# `head`, which would hide the built-in `head` used in chapter 2, `add_up`
+# for the pattern example of `sum`. Chapter 1's `sum a b` replaces the
+# library's `sum`, so `product` stands in for it, in `total_of`. The examples
+# of later chapters run in `later`, whose names would clash with `main`'s.
 
 foo = (5 + 1)*6
 pred a = a - 1
@@ -16,8 +22,19 @@ summon a = check a:
 typed_sum a b :: numeric, numeric -> numeric = a + b + 5
 discard _ :: any -> void = 5
 flag :: boolean = 5 > 6
-head a :: numeric -> void = echo "winning"
-head _ = echo "nothing left"
+play a :: numeric -> void = echo "winning"
+play _ = echo "nothing left"
+
+# chapter 1: arrays
+nums = [1, 2, 3]
+evens = [x * 2 | x in [0..5]]
+squares = [x * x| x in [0..5]]
+first (x:xs) = x
+first [] = void
+
+# chapter 2
+arr = [1, 2, 3]
+hi = "hello"
 
 main =
     echo (5 > 6)
@@ -35,7 +52,136 @@ main =
     echo (7 / 2)
     echo ("con" + "cat")
     test foo
-    loop x in [0, 5]: # [0, 5] means 0, 1, 2, 3, 4
+    loop x in [0..5]: # [0..5] means 0, 1, 2, 3, 4
         echo x
-    head 1
-    head "x"
+    play 1
+    play "x"
+    echo PI
+    echo (5 < infinite)
+    echo (-infinite < -5)
+    a = [1, 2, 3]
+    b = a ++ [4, 5]
+    echo b
+    c = [0..5]
+    echo c
+    echo [x | x in [0..5]]
+    echo evens
+    echo squares
+    echo (squares !! 4)
+    echo (first nums)
+    echo (first [])
+    echo (len arr)
+    echo (head arr)
+    echo (tail arr)
+    echo (len hi)
+    echo (head hi)
+    echo (tail hi)
+    echo (init arr)
+    echo (last arr)
+    echo (init hi)
+    echo (last hi)
+    later
+
+# chapter 1: patterns, conditions, ret, maybe types
+add_up (x:xs) = x + add_up xs
+add_up [] = 0
+sign n = check n < 0:
+    true -> "negative";
+    false -> "not negative"
+first_negative a =
+    loop x in a:
+        check x < 0:
+            true -> ret x;
+            false -> void
+    void
+first_or_zero a =
+    h = head a
+    check h:
+        void -> 0;
+        else -> h
+banner = echo "welcome"
+# chapter 3
+greet @name = "hello " + name
+total_of @a = product a
+keep @a = copy a
+
+later =
+    # chapter 1
+    echo (7 / 2)
+    echo (7 * 2)
+    echo (1 + 0.5)
+    echo ("a" < "b")
+    banner
+    echo ([1, 2, 3] ** [4, 5])
+    a = [x * x| x in [0..5]]
+    echo (a !! 9)
+    echo [x | x in [0..10], x > 5]
+    echo [x * y | x in [1..3], y in [10..12]]
+    echo [y | part in [[1, 2], [3]], y in part]
+    echo [x | i, x in [5, 6, 7, 8], i < 2]
+    echo [c | c in "héllo"]
+    echo (add_up [1, 2, 3])
+    echo (sign (-2))
+    total = 0
+    loop x in [1, 2, 3]:
+        total = total + x
+    echo total
+    loop i, c in "abc":
+        echo i
+    echo product [x | x in [1..6]]
+    echo head tail [1, 2, 3]
+    echo (first_negative [3, -1, 4])
+    echo (first_or_zero [7])
+    echo (first_or_zero [])
+    echo (head [] + 1)
+    # chapter 2
+    echo (reverse arr)
+    echo (reverse hi)
+    echo (head [])
+    echo (copy arr)
+    echo (len "héllo")
+    echo ("héllo" !! 1)
+    # chapter 3
+    s = "hello"
+    t = s
+    echo t
+    n = 5
+    m = n
+    echo (n + m)
+    s = "luna"
+    echo (greet s)
+    echo s
+    echo (total_of [1, 2])
+    echo (keep "k")
+    names = ["ann", "bob"]
+    loop n in @names:
+        echo n
+    echo names
+    echo [len w | w in @names]
+    loop n in names:
+        echo (n + "!")
+    names = ["ann", "bob"]
+    echo (head names)
+    first = copy (head names)
+    echo first
+    x = head [1, 2]
+    echo x
+    xs = [1]
+    xs = xs ++ [4]
+    echo xs
+    # chapter 4
+    echo (abs (-3))
+    echo (max 2 5)
+    echo (product [2, 3])
+    echo (average [1, 2])
+    echo (maximum [3, 9, 2])
+    echo (contains [1, 2] 2)
+    echo (index_of [1, 2] 2)
+    echo (remove [1, 2, 1] 1)
+    echo (take 2 [1, 2, 3])
+    echo (drop 2 [1, 2, 3])
+    echo (flatten [[1], [2, 3]])
+    echo (is_empty [])
+    echo (join ["a", "b"] ", ")
+    echo (split "a,b" ",")
+    echo (repeat "ab" 3)

@@ -1,0 +1,23 @@
+# Positions (`i, x in a`) and comprehensions with several generators
+# (`[y | part in a, y in part]`), plus the built-in `reverse`.
+
+names = ["ann", "bob", "cy"]
+main =
+    loop i, n in names:
+        echo [i]
+        echo n
+    loop i, c in "hé!":
+        echo i
+    echo [i * 10 + x | i, x in [5, 6, 7]]
+    echo [x | i, x in [10, 20, 30, 40], i < 2]
+    echo [x | i, x in [10, 20, 30, 40], i >= 2]
+    echo [y | part in [[1], [2, 3], []], y in part]
+    echo [x * y | x in [1, 2], y in [10, 20]]
+    echo [a + b | a in names, b in ["!", "?"], a != "bob"]
+    echo [[i, j] | i in [0..3], j in [0..i]]
+    echo len [x | x in [0..1000], y in [0..3]]
+    echo [x | x in [1.5, 2.5], y in [0..2]]
+    echo [p | p, x in "abc"]
+    echo reverse [1, 2, 3]
+    echo reverse "héllo"
+    echo reverse []

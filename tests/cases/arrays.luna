@@ -1,0 +1,45 @@
+# Arrays: literals, ranges, ++, !!, list comprehensions, printing, equality,
+# and loops over arrays and strings (a string is a sequence of characters).
+# `names` is a global, computed again wherever it is used, so moving it into
+# a loop or `++` leaves it available.
+
+names = ["ann", "bob"]
+main =
+    a = [1, 2, 3]
+    echo a
+    b = copy a ++ [4, 5]
+    echo b
+    c = [0..5]
+    echo c
+    echo [x * 2 | x in [0..5]]
+    echo [x * x | x in c]
+    sq = [x * x | x in [0..5]]
+    echo (sq !! 4)
+    echo (sq !! 9)
+    echo (sq !! 0 + 1)
+    echo names
+    echo [n + "!" | n in names]
+    echo [[1, 2], [3]]
+    echo []
+    echo ([1, 2] == [1, 2])
+    echo ([1, 2] == [1, 3])
+    echo ("héllo" !! 1)
+    echo [c | c in "héllo"]
+    loop n in names:
+        echo n
+    loop ch in "ab":
+        echo ch
+    total = 0
+    loop x in sq:
+        total = total + x
+    echo total
+    echo [0.5, 1.5]
+    echo (["a"] ++ [])
+    # `++` takes its operands (`copy a` above kept `a`); their elements
+    # move into the new array
+    echo a
+    a = a ++ [4]
+    echo a
+    more = names ++ ["cid"]
+    echo names
+    echo more
