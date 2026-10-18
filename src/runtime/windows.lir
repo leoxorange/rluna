@@ -1,20 +1,39 @@
 ; Luna runtime: operating system layer for Windows.
 ;
-; All OS access goes through kernel32.dll; no C runtime is used.
+; All OS access goes through kernel32.dll (and shell32.dll, which splits
+; the command line into arguments); no C runtime is used.
 ; See core.lir for the interface this file provides.
+;
+; Windows speaks UTF-16 ("wide" strings) and Luna strings are UTF-8, so
+; paths and arguments are converted on the way in and out. Functions that
+; C declares to return a BOOL or an int leave only the low 32 bits of rax
+; defined, so those results are masked before use.
 
 extern @kernel32.GetStdHandle(i64) -> i64
 extern @kernel32.WriteFile(i64, i64, i64, i64, i64) -> i64
+extern @kernel32.ReadFile(i64, i64, i64, i64, i64) -> i64
+extern @kernel32.CreateFileW(i64, i64, i64, i64, i64, i64, i64) -> i64
+extern @kernel32.CloseHandle(i64) -> i64
+extern @kernel32.MultiByteToWideChar(i64, i64, i64, i64, i64, i64) -> i64
+extern @kernel32.WideCharToMultiByte(i64, i64, i64, i64, i64, i64, i64, i64) -> i64
+extern @kernel32.GetCommandLineW() -> i64
+extern @kernel32.LocalFree(i64) -> i64
 extern @kernel32.ExitProcess(i64)
 extern @kernel32.VirtualAlloc(i64, i64, i64, i64) -> i64
 extern @kernel32.VirtualFree(i64, i64, i64) -> i64
+extern @shell32.CommandLineToArgvW(i64, i64) -> i64
 
+data @rt.stdin = { i64 0 }
 data @rt.stdout = { i64 0 }
 data @rt.stderr = { i64 0 }
 data @rt.written = { i64 0 }
 
 func @rt.start() {
 entry:
+  %in_id = iconst -10
+  %in = call i64 @kernel32.GetStdHandle(%in_id)
+  %in_slot = addr @rt.stdin
+  store i64 %in_slot, 0, %in
   %out_id = iconst -11
   %out = call i64 @kernel32.GetStdHandle(%out_id)
   %out_slot = addr @rt.stdout
@@ -53,6 +72,168 @@ write(%h: i64):
   %zero = iconst 0
   %ok = call i64 @kernel32.WriteFile(%h, %p, %n, %written, %zero)
   ret
+}
+
+func @rt.sys_write_file(%h: i64, %p: i64, %n: i64) -> i64 {
+entry:
+  %count = alloca 8
+  %zero = iconst 0
+  store i64 %count, 0, %zero
+  %r = call i64 @kernel32.WriteFile(%h, %p, %n, %count, %zero)
+  %mask = iconst 4294967295
+  %ok = and %r, %mask
+  %written = icmp ne %ok, %zero
+  ret %written
+}
+
+; Handle 0 means stdin. At the end of a pipe ReadFile fails (the other end
+; is closed), which is the end of the input too.
+func @rt.sys_read(%h: i64, %p: i64, %n: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %is_stdin = icmp eq %h, %zero
+  br %is_stdin, stdin, given(%h)
+stdin:
+  %in_slot = addr @rt.stdin
+  %in = load i64 %in_slot, 0
+  jmp given(%in)
+given(%handle: i64):
+  %count = alloca 8
+  store i64 %count, 0, %zero
+  %r = call i64 @kernel32.ReadFile(%handle, %p, %n, %count, %zero)
+  %mask = iconst 4294967295
+  %ok = and %r, %mask
+  %failed = icmp eq %ok, %zero
+  br %failed, fail, read
+fail:
+  %bad = iconst -1
+  ret %bad
+read:
+  %got = load i64 %count, 0
+  ret %got
+}
+
+; CreateFileW returns INVALID_HANDLE_VALUE (-1) when it fails.
+func @rt.sys_open(%path: i64, %write: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %one = iconst 1
+  %two = iconst 2
+  %eight = iconst 8
+  %len = load i64 %path, 0
+  %utf8 = iadd %path, %eight
+  ; a UTF-8 byte never becomes more than one UTF-16 unit, plus the 0
+  %units = iadd %len, %one
+  %size = imul %units, %two
+  %wide = call i64 @rt.alloc(%size)
+  %cp_utf8 = iconst 65001
+  %r = call i64 @kernel32.MultiByteToWideChar(%cp_utf8, %zero, %utf8, %len, %wide, %len)
+  %mask = iconst 4294967295
+  %converted = and %r, %mask
+  %end_off = imul %converted, %two
+  %end = iadd %wide, %end_off
+  store u8 %end, 0, %zero
+  store u8 %end, 1, %zero
+  %normal = iconst 128
+  br %write, create, open
+open:
+  %generic_read = iconst 2147483648
+  %share_read = iconst 1
+  %open_existing = iconst 3
+  %hr = call i64 @kernel32.CreateFileW(%wide, %generic_read, %share_read, %zero, %open_existing, %normal, %zero)
+  jmp done(%hr)
+create:
+  %generic_write = iconst 1073741824
+  %create_always = iconst 2
+  %hw = call i64 @kernel32.CreateFileW(%wide, %generic_write, %zero, %zero, %create_always, %normal, %zero)
+  jmp done(%hw)
+done(%h: i64):
+  call void @rt.free(%wide)
+  ret %h
+}
+
+func @rt.sys_close(%h: i64) -> i64 {
+entry:
+  %r = call i64 @kernel32.CloseHandle(%h)
+  %mask = iconst 4294967295
+  %ok = and %r, %mask
+  %zero = iconst 0
+  %closed = icmp ne %ok, %zero
+  ret %closed
+}
+
+; The command line split the way C programs split it (CommandLineToArgvW),
+; without the first part, the program itself.
+func @rt.sys_args() -> i64 {
+entry:
+  %zero = iconst 0
+  %one = iconst 1
+  %three = iconst 3
+  %line = call i64 @kernel32.GetCommandLineW()
+  %count = alloca 8
+  store i64 %count, 0, %zero
+  %argv = call i64 @shell32.CommandLineToArgvW(%line, %count)
+  %failed = icmp eq %argv, %zero
+  br %failed, nothing, split
+nothing:
+  %empty = call i64 @rt.array_new(%zero)
+  ret %empty
+split:
+  %raw = load i64 %count, 0
+  %mask = iconst 4294967295
+  %argc = and %raw, %mask
+  %n_raw = isub %argc, %one
+  %none = icmp slt %n_raw, %zero
+  br %none, sized(%zero), sized(%n_raw)
+sized(%n: i64):
+  %a = call i64 @rt.array_new(%n)
+  jmp loop(%zero)
+loop(%i: i64):
+  %more = icmp slt %i, %n
+  br %more, body, done
+body:
+  %k = iadd %i, %one
+  %k_off = shl %k, %three
+  %arg_slot = iadd %argv, %k_off
+  %arg = load i64 %arg_slot, 0
+  %s = call i64 @rt.str_from_wide(%arg)
+  %i_off = shl %i, %three
+  %elem = iadd %a, %i_off
+  store i64 %elem, 8, %s
+  %next = iadd %i, %one
+  jmp loop(%next)
+done:
+  %freed = call i64 @kernel32.LocalFree(%argv)
+  ret %a
+}
+
+; A new string with the UTF-8 form of the 0-terminated UTF-16 string at %w.
+; With a length of -1, WideCharToMultiByte converts the final 0 too and
+; counts it.
+func @rt.str_from_wide(%w: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %one = iconst 1
+  %eight = iconst 8
+  %cp_utf8 = iconst 65001
+  %to_end = iconst -1
+  %r = call i64 @kernel32.WideCharToMultiByte(%cp_utf8, %zero, %w, %to_end, %zero, %zero, %zero, %zero)
+  %mask = iconst 4294967295
+  %with_zero = and %r, %mask
+  %some = icmp sgt %with_zero, %zero
+  br %some, convert, empty
+convert:
+  %len = isub %with_zero, %one
+  %size = iadd %with_zero, %eight
+  %s = call i64 @rt.alloc(%size)
+  store i64 %s, 0, %len
+  %dst = iadd %s, %eight
+  %done = call i64 @kernel32.WideCharToMultiByte(%cp_utf8, %zero, %w, %to_end, %dst, %with_zero, %zero, %zero)
+  ret %s
+empty:
+  %e = call i64 @rt.alloc(%eight)
+  store i64 %e, 0, %zero
+  ret %e
 }
 
 func @rt.sys_alloc(%size: i64) -> i64 {

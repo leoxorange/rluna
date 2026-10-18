@@ -1,0 +1,180 @@
+# `if cond:` and its block, and maybe `else:` and its block: the last line
+# of the block that runs is the value. Without `else`, a false condition
+# gives void, so the value is a maybe (`Int?`). A block is a scope of its
+# own, like a loop body; a variable from outside that it gives a new value
+# keeps it after the `if`.
+
+sign n = if n < 0:
+    "negative"
+else if n == 0:
+    "zero"
+else:
+    "positive"
+
+half n = if n % 2 == 0:
+    n / 2
+
+describe n =
+    kind = if n > 9:
+        big = "big"
+        big + "!"
+    else:
+        "small"
+    kind + " " + n.textualize
+
+first_even a =
+    loop x in a:
+        if x % 2 == 0:
+            ret x
+    void
+
+# a constant: computed while compiling
+answer = if 6 * 7 == 42:
+    42
+else:
+    0
+
+trail Temp follow Show:
+    deg :: Int
+    feel = if deg > 25:
+        "hot"
+    else:
+        "mild"
+    textualize = feel + " " + deg.textualize
+    warmer n = if n > 0:
+        Temp {deg = deg + n}
+    else:
+        Temp {deg = deg}
+
+grade score =
+    letter = "F"
+    if score >= 90:
+        letter = "A"
+    else if score >= 80:
+        letter = "B"
+    else if score >= 70:
+        letter = "C"
+    letter
+
+until_neg a =
+    out = ""
+    loop x in a:
+        if x < 0:
+            ret out
+        else:
+            out = out + x.textualize
+    out + "."
+
+maybe_name n :: Int -> String? = check n:
+    0 -> void;
+    else -> "n" + n.textualize
+
+main =
+    echo (sign (-3))
+    echo (sign 0)
+    echo (sign 8)
+    echo (half 10)
+    echo (half 7)
+    echo (describe 12)
+    echo (describe 3)
+    echo (first_even [3, 5, 6, 7])
+    echo (first_even [1])
+    echo answer
+    # a variable from outside, given a new value in a block
+    total = 0
+    loop i in [0..10]:
+        if i % 3 == 0:
+            total = total + i
+    echo total
+    # strings: the old value is freed, the new one kept
+    word = "a"
+    if total > 10:
+        word = word + "b"
+    else:
+        word = "never"
+    echo word
+    # given a value of another type in one block only
+    v = 1
+    if len word == 2:
+        v = "two"
+    echo v
+    # moved in one block: the other block drops it
+    s = "moved"
+    t = if true:
+        s
+    else:
+        "kept"
+    echo t
+    # nested, and inside a check arm, and in brackets
+    n = 5
+    deep = if n > 0:
+        if n > 3:
+            "more than 3"
+        else:
+            "1 to 3"
+    else:
+        "not positive"
+    echo deep
+    label = check n:
+        5 -> if n == 5:
+            "five"
+        else:
+            "?"
+        else -> "other"
+    echo label
+    echo (if n > 4:
+        n * 10
+    else:
+        0)
+    # only the true case
+    if n == 5:
+        echo "n is 5"
+    if n == 6:
+        echo "not printed"
+    # a check arm that gives a new value through an if
+    count = 0
+    loop c in "a-b-c":
+        check c:
+            "-" -> if true:
+                count = count + 1
+            else -> void
+    echo count
+    echo (Temp {deg = 30})
+    echo ((Temp {deg = 20}).warmer 10)
+    echo [grade s | s in [95, 85, 75, 10]]
+    echo (until_neg [1, 2, -1, 3])
+    echo (until_neg [4, 5])
+    # strings carried around a loop through an if
+    acc = ""
+    loop i in [0..6]:
+        if i % 2 == 0:
+            acc = acc + "e"
+        else:
+            tmp = acc + "o"
+            acc = tmp
+    echo acc
+    # narrowing still works next to ifs
+    name = maybe_name 3
+    check name:
+        void -> echo "none";
+        else -> if len name > 1:
+            echo ("long " + name)
+        else:
+            echo name
+    # an array moved in one block, given a new value in the other
+    xs = [1, 2, 3]
+    ys = if len xs > 5:
+        out = xs
+        xs = [0]
+        out
+    else:
+        xs = [9]
+        copy xs
+    echo xs
+    echo ys
+    # a block of several lines inside brackets
+    echo [(if x > 1:
+        y = x * 2
+        y - 1
+    else:
+        0) | x in [1, 2, 3]]

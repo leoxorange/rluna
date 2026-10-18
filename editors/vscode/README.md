@@ -7,12 +7,14 @@ Syntax highlighting for the Luna language (`.luna` files):
 - trails (`trail Fruit follow Show, Compare:`), their fields and functions,
   and trail names (`Int`, `Fruit`, `Self`) in signatures (`:: Int -> Fruit`);
 - links to other files (`| entity > et`, `| entity#pred, next > p, n`);
+- native definitions (`native read_line :: String?`) and maybe types in
+  signatures (`-> Int?`);
 - keywords (`check`, `else`, `loop`, `in`, `ret`, `echo`), the built-in
   functions (`len`, `head`, `tail`, `init`, `last`, `reverse`, `copy`) and
   constants (`true`, `false`, `void`, `PI`, `infinite`);
 - strings with their escapes, numbers, comments, fields (`t.name`,
   `(buy 6).name`, `{name = "kiwi"}`) and operators (`++`, `**`, `!!`, `..`,
-  `->`, `::`).
+  `->`, `::`, and `:?` with the trail after it).
 
 It also sets up `#` comments (toggled with Ctrl+/ or Cmd+/), bracket
 matching and closing, and indents the line after one that ends with `:` or

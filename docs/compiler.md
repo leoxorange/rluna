@@ -19,6 +19,7 @@ lunac hello.luna                    # writes hello (hello.exe on Windows)
 lunac hello.luna -o out/hello
 lunac hello.luna --emit=ast,ir,asm  # also writes hello.ast, hello.lir, hello.asm
 lunac hello.luna --run              # compile, then run
+lunac sum.luna -r -- a.txt          # run it with the arguments after `--`
 lunac hello.lir                     # compile an IR file directly
 lunac hello.luna --target=windows-x64   # writes hello.exe from any system
 ```
@@ -107,14 +108,58 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   ```
 
   A `check` can be nested in an arm (its arms indented further still) or
-  sit inside parentheses (`echo (check n:` … `)`).
+  sit inside parentheses (`echo (check n:` … `)`). The last arm of a check
+  has no `;`, nested ones too: after an arm that ends with a nested check,
+  a line in the column of this check's arms is its next arm, with no `;`
+  needed (`ends_in_check`). A `;` after a nested check's `else` arm is
+  still accepted and left for the enclosing check, so older code parses;
+  one after any other last arm is an error that says so.
+- **`if cond:`** runs the block below it (indented further than the line
+  with `if`), or the block of `else:`, which is lined up with that line;
+  `else if` is an `else` whose block is another `if`. `hir` turns it into
+  `check cond: true -> block; else -> block (or void)` with `is_if` set,
+  so typeck requires a boolean condition and errors name the `if`. A
+  block (`HExprKind::Block`) is a scope like a loop body: its value is its
+  last expression's, which always moves out (as an arm's does), and its
+  own variables (`inner`) are dropped when it ends. A statement with a
+  block (`loop`, `if`) ends where the block does, at the start of a line.
+  In brackets the lexer gives no newline tokens, so inside a block
+  `Parser::lines` makes a token that starts a line end the expression
+  before it, and a `)` ends the block.
+- **Carried variables.** An arm of a `check` (a block, in practice) may
+  give a variable from outside a new value. `hir` lists them
+  (`Check::carried`), typeck checks every arm from the types before the
+  `check` and gives each such variable the union of what the arms leave
+  in it, and lowering passes them to the merge block as block parameters,
+  converted to that type (`carry`), like the variables a loop updates. A
+  variable checked for void is not narrowed in arms that may give it a
+  new value. An `if` in a list comprehension cannot give a variable a new
+  value: nothing carries from one element to the next.
 - **Numbers.** `5` is an `int` (64-bit), `5.0`/`1e3` are `float` (64-bit).
   `int op int` stays `int` for `+ - *`; `/` always produces a `float`
   (`7 / 2` is `3.5`). Mixed `int`/`float` arithmetic gives `float`.
-- **Operators.** `+ - * /`, unary `-`, and `== != < <= > >=`. `+` also joins
+- **Operators.** `+ - * / %`, unary `-`, `== != < <= > >=`, and `:?`. `+` also joins
   two strings. Strings compare lexicographically. Arrays add `++` (between
   comparisons and `+`), `!!` (just below function application) and `**`
   (with `*` and `/`), and compare with `==` element by element.
+- **`x :? T`** (with the comparisons, and not chained with them) is
+  true when `x` follows the trail `T`, like Java's `instanceof`. `T` is
+  written as in a signature, and `hir` resolves it the same way (a type
+  and maybe a bound, see `bound_of`). typeck splits the type of `x` into
+  its kinds and decides for each whether it passes, as an argument for a
+  parameter declared `T` would (`accepts`, `follows_bound`): an array by
+  its element type, a value of a trail by its trail's `follows`. The
+  result, `TExprKind::Is(x, passes)`, is a constant when every kind or no
+  kind passes, and otherwise a test of the box's tag (`tag_in`), since
+  only a union's kind is unknown while compiling. It reads `x` (it is not
+  moved) and does not narrow it in a `check`.
+- **`a % b`** (with `*` and `/`) takes two `int`s and gives an `int`: the
+  remainder with the sign of `b` (floored, like Haskell's `mod`), so
+  `-7 % 3` is 2. Lowering calls `rt.mod`, which stops the program on
+  `x % 0` (`ZeroDivisionError`; x86-64 would trap, and arm64 give `x`) and
+  gives 0 for `x % -1` without dividing, because x86-64 traps on
+  `i64::MIN / -1`. consteval computes the same (`floored_mod`) and leaves
+  `x % 0` to run time. A float operand is an error.
 - **`a ** b`** multiplies two arrays of numbers element by element and
   gives a new array as long as the longer one, whose extra elements are kept
   as they are: `[1, 2, 3] ** [4, 5]` is `[4, 10, 3]`. Like `++`, it takes
@@ -134,7 +179,12 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   error until the void case is handled, with a `check` that has a
   `void ->` arm (or `else`). In the other arms of a `check` on a variable,
   the variable has the plain type: in `check x: void -> 0; else -> f x`,
-  `x` is an `int`. `void ->` matches only void.
+  `x` is an `int`. `void ->` matches only void. A signature or a field
+  can write a maybe type as `T?` after an embedded trail (`-> Int?`,
+  `x :: [String]?`), which is `T ∪ void` (`hir::resolve_ty`). After a
+  trail of the program (`Fruit?`) it is an error for now: such a
+  parameter takes the trails that follow it (a bound), and bounds do not
+  include void yet.
 - **Constants.** `PI` and `infinite` are built-in floats and cannot be
   redefined; `-infinite` is `-` applied to `infinite`.
 - **Constant globals.** A global without arguments (other than `main`) whose
@@ -163,7 +213,9 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   trails too, see Trails) and compiled
   together with every program (only what a program uses reaches its
   executable): `abs max min sum product average maximum minimum contains
-  count index_of remove take drop flatten is_empty join split repeat`. A program that defines a name the library defines uses its own
+  count index_of remove take drop flatten is_empty join split repeat
+  lines to_int to_float`, and the native `read_line read_all print args
+  read_file write_file exit` (see Native functions). A program that defines a name the library defines uses its own
   definitions instead; the library keeps calling its own (they are renamed
   to `std.name`, which no program can write). Library functions that only
   read an array or a string borrow it (`sum @a`); those that build their
@@ -171,6 +223,26 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   `maximum`, `minimum`). Errors inside the
   library point into `std.luna`: every file gets its own range of byte
   offsets (`diag::Sources`), so a span tells which file it is in.
+- **Native functions.** `native read_line :: String?` declares a function
+  by its signature alone; the runtime function of the same name
+  (`rt.read_line`, in `runtime/core.lir`) gives it. Every parameter's
+  trail and the result's must be written, and the parameters cannot be
+  patterns. Only `std.luna` may declare them (the driver refuses them in
+  a program's files). `hir::Func::native` names the runtime function;
+  typeck gives an instance the declared result without checking a body,
+  and lowering writes the instance as one call of that function with the
+  parameters as they are represented (`FnLower::native`), so the runtime
+  receives a string as its pointer and returns a `String?` as a box.
+  String parameters are borrowed (`print @s`): the runtime never frees
+  them. A native call is never a constant (`consteval` stops at it), so
+  `name = read_line` stays a function that reads a line at every use.
+- **Input.** `read_line` and `read_all` read stdin through a 4 KiB buffer
+  (`rt.inbuf`, `rt.in_fill`); before reading, stdout is flushed, so a
+  prompt printed with `print` shows first. `read_line` drops the `\n` and
+  a `\r` before it, and is void only when the input ends before any byte
+  of a line. `read_file` gives void when the file cannot be opened or a
+  read fails (a folder on macOS); strings are built with `rt.sb_begin` and
+  `rt.sb_append`, which `x.textualize` uses too.
 - **List comprehensions** take clauses after `|`: generators and
   conditions, starting with a generator. `[x | x in a, x > 0]` keeps the
   elements for which every condition (a `boolean`) is true. With several
@@ -290,8 +362,9 @@ marked, and nothing is copied unless the program asks.
   list, which each operation truncates when it is done.
 - **New values.** `x = …` makes `x` usable again after a move, and frees
   the value `x` still held, if any.
-- **Branches.** After a `check`, a name counts as moved if any arm moved it
-  (arms that leave the function with `ret` do not count).
+- **Branches.** After a `check` or an `if`, a name counts as moved if any
+  arm or block moved it (those that leave the function with `ret` do not
+  count), and has a value again only if every one gave it one.
 - **Loops.** A loop body must leave every outside variable as it found it:
   moving `s` inside the body is an error unless `s` gets a new value before
   the body ends (otherwise the next iteration would find it empty), and a
@@ -440,8 +513,10 @@ trails, and the operators of `Compare` and `Numeric`.
   Self -> Self`), plus Compare and Show. The parameter must be borrowed,
   because operators only read their operands. On two values of the same
   trail, `a < b` is typed as `a.compare b < 0` and `a + b` as `a.add b`
-  (`Checker::trail_operator`); a `check` pattern that is a value of a
-  trail matches when `compare` gives 0 (`TExprKind::Check::compares`).
+  (`Checker::trail_operator`). `a % b` is `a.mod b`, which Numeric
+  does not ask for: a trail without a `mod` cannot use `%`. A `check`
+  pattern that is a value of a trail matches when `compare` gives 0
+  (`TExprKind::Check::compares`).
 - **Not yet.** `echo` prints the name of a trail that does not follow Show,
   with a warning. A `check` narrows only variables, not fields: checking
   `node.next` for void does not make it a `Node` in the other arms. The
@@ -599,19 +674,29 @@ kept).
 ## Runtime
 
 The runtime is LIR, compiled together with every program. `core.lir` is the
-same for every target; it reaches the operating system only through four
+same for every target; it reaches the operating system only through the
 functions that each `<os>.lir` provides:
 
 | Function                         | macOS (libSystem)      | Windows (kernel32)          |
 |----------------------------------|------------------------|-----------------------------|
-| `@rt.start()` — entry point      | called by dyld as `main` | PE entry point            |
+| `@rt.start()` — entry point      | called by dyld as `main(argc, argv)` | PE entry point |
 | `@rt.sys_write(stream, p, n)`    | `write`, looped         | `WriteFile` on std handles |
 | `@rt.sys_exit(code)`             | `exit`                  | `ExitProcess`              |
 | `@rt.sys_alloc(size) -> ptr/0`   | `mmap`                  | `VirtualAlloc`             |
 | `@rt.sys_free(ptr, size)`        | `munmap`                | `VirtualFree`              |
+| `@rt.sys_read(h, p, n) -> n/0/-1` | `read`                 | `ReadFile` (h 0: stdin)    |
+| `@rt.sys_open(path, write) -> h/-1` | `open` / `creat`     | `CreateFileW`, path to UTF-16 |
+| `@rt.sys_write_file(h, p, n) -> ok` | `write`, looped      | `WriteFile`                |
+| `@rt.sys_close(h) -> ok`         | `close`                 | `CloseHandle`              |
+| `@rt.sys_args() -> [string]`     | `argv` from `rt.start`  | `CommandLineToArgvW` (shell32), to UTF-8 |
 
-Stream 1 is stdout and 2 is stderr. On macOS all system calls go through
-libSystem, as Apple requires; there is no C runtime startup code.
+Stream 1 is stdout and 2 is stderr; handle 0 is stdin. On macOS all
+system calls go through libSystem, as Apple requires; there is no C
+runtime startup code. `open` is variadic in C, and Apple passes variadic
+arguments on the stack, which LIR calls do not do: reading needs only
+`open`'s two fixed arguments, and writing uses `creat`, which is not
+variadic. Results C declares as `int` or `BOOL` only define the low 32
+bits of the register, so the OS layers sign-extend or mask them.
 
 ## Code generation
 
@@ -656,7 +741,9 @@ base; no base relocations.
 `cargo test` runs unit tests and `tests/cases.rs`, which compiles every
 `tests/cases/*.luna` for the host, runs it, compares stdout (and stderr)
 with the `.out`/`.err` files, then recompiles the emitted `.lir` and checks
-it behaves the same. It also links a program for every target, so the
+it behaves the same. A case can give the program its stdin in `.in` and
+its arguments, one per line, in `.args` (`$OUT` there is a folder for the
+files it writes). It also links a program for every target, so the
 backend that cannot run on the host is still built and verified. The
 instruction encoders are unit-tested against bytes from the system
 assemblers.
@@ -666,6 +753,8 @@ assemblers.
 - register allocation and more LIR optimizations (constant folding, inlining)
 - more of the standard library
 - lazy list comprehensions (infinite lists such as `[x | x in [0..infinite]]`)
-- writing maybe types in signatures (`-> int?`)
+- maybe types of a program's trails in signatures (`-> Fruit?`)
+- running the Windows I/O layer in CI: it is only linked, not run, on
+  other systems
 - a Linux (ELF) target; most of the work is an ELF writer and a
   `runtime/linux.lir` making system calls directly

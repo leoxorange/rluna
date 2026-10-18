@@ -8,7 +8,7 @@ use rluna::driver::{self, Input};
 use rluna::target::Target;
 
 const USAGE: &str = "\
-Usage: lunac <file.luna | file.lir> [options]
+Usage: lunac <file.luna | file.lir> [options] [-- <program arguments>]
 
 Options:
   -o <path>         Write the executable to <path> (default: the input
@@ -21,7 +21,8 @@ Options:
                       ast   parsed syntax tree      (<name>.ast)
                       ir    Luna IR (LIR)           (<name>.lir)
                       asm   machine code listing    (<name>.asm)
-  -r, --run         Run the program after compiling it
+  -r, --run         Run the program after compiling it, with the
+                    arguments after `--`
   -h, --help        Show this help
   -V, --version     Show the compiler version
 ";
@@ -34,6 +35,8 @@ struct Options {
     emit_ir: bool,
     emit_asm: bool,
     run: bool,
+    /// What `--run` gives the program: everything after `--`.
+    program_args: Vec<String>,
 }
 
 fn parse_args() -> Result<Option<Options>, String> {
@@ -47,6 +50,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         emit_ir: false,
         emit_asm: false,
         run: false,
+        program_args: Vec::new(),
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -60,6 +64,14 @@ fn parse_args() -> Result<Option<Options>, String> {
             }
             "-o" => opts.output = Some(args.next().ok_or("`-o` needs a path")?.into()),
             "-r" | "--run" => opts.run = true,
+            "--" => {
+                opts.program_args = args.by_ref().collect();
+                if !opts.run {
+                    return Err(
+                        "arguments after `--` are for the program, which only `-r` runs".into(),
+                    );
+                }
+            }
             _ if arg.starts_with("--target=") => {
                 let name = &arg["--target=".len()..];
                 opts.target =
@@ -172,6 +184,7 @@ fn run() -> Result<ExitCode, String> {
         }
         let path = std::path::absolute(&output).map_err(|e| e.to_string())?;
         let status = std::process::Command::new(&path)
+            .args(&opts.program_args)
             .status()
             .map_err(|e| format!("cannot run {}: {e}", path.display()))?;
         return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));

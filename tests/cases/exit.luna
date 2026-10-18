@@ -1,0 +1,6 @@
+# `exit` ends the program at once, with its exit code; what was printed
+# before is still written
+main =
+    echo "before"
+    exit 1
+    echo "after"

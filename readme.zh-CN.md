@@ -13,6 +13,7 @@ luna 是一门类似 haskell 的语言。它的核心理念是尽可能少用关
 ```
 lunac hello.luna                       # 生成可执行文件 `hello`
 lunac hello.luna -o out -r             # 生成 `out` 并运行它
+lunac sum.luna -r -- a.txt b.txt       # 运行它，并传给它参数 a.txt 和 b.txt
 lunac hello.luna --target=windows-x64  # 生成 64 位 Windows 程序 hello.exe
 lunac hello.luna --emit=ast,ir,asm     # 同时输出语法树、中间表示（IR）和机器码
 ```
@@ -39,9 +40,13 @@ foo :: Boolean = 5 > 6 # foo 是 false
 echo (7 / 2) # 3.5，`/` 的结果总是浮点数
 echo (7 * 2) # 14，整数与整数做 + - * 仍是整数
 echo (1 + 0.5) # 1.5，整数与浮点数运算得到浮点数
+echo (7 % 3) # 1，余数：`%` 用于两个整数
+echo (-7 % 3) # 2，余数的符号与右边相同，就像 haskell 的 mod
 ```
 
 `+` 也可以连接两个字符串：`"con" + "cat"` 是 `"concat"`。字符串之间用 `<` 和 `>` 按字母顺序比较。
+
+`%` 的优先级和 `*`、`/` 一样：`1 + 10 % 4 * 3` 是 7。它的结果在 0 和右边之间，所以即使 `i` 是 0，`(i - 1) % 12` 也仍然落在钟面上。`x % 0` 会以 `ZeroDivisionError` 结束程序。
 
 ### 符号定义
 
@@ -149,7 +154,43 @@ sign n = check n < 0:
     true -> "negative";
     false -> "not negative"
 ```
-check 可以嵌套在分支里，它的分支要缩进得更深。
+check 可以嵌套在分支里，它的分支要缩进得更深。check 的最后一个分支后面没有 `;`，嵌套的 check 也一样这样结束：下一行如果和外层分支对齐，就是外层的下一个分支。
+```
+both a b = check a:
+    true -> check b:
+        true -> "both";
+        false -> "only a"
+    false -> "not a"
+```
+
+### if
+
+只有两种情况时，用 `check` 就有点重了。`if` 接受一个布尔值，运行两个块中的一个：
+```
+abs_diff a b = if a > b:
+    a - b
+else:
+    b - a
+
+main =
+    n = 7
+    if n % 2 == 1:
+        echo "odd"
+    size = if n > 5:
+        "big"
+    else if n > 2:
+        "medium"
+    else:
+        "small"
+    echo size # big
+```
+
+- 块写在 `if cond:` 下面的行，缩进要比 `if` 所在的行更深。`else:` 单独占一行，和 `if` 所在的行对齐，它的块写在下面。`else if cond:` 可以再加一个条件。
+- 条件必须是 Boolean。maybe 值（`Boolean?`）需要先用 `check` 处理 void 的情况。
+- 和 `check` 一样，运行的那个块的最后一行就是 `if` 的值。只关心真的情况时可以省略 `else`；这时条件为假会得到 void，所以 `half n = if n % 2 == 0:` 下面写 `n / 2`，得到的是 `Float?`。
+- 块是一个独立的作用域，和循环体一样：块里创建的变量只在块里存在。块给外面的变量一个新值，`if` 之后这个变量会保留这个值：`if x > 0:` 下面写 `total = total + x` 就会累加到 `total`。
+- `if` 可以嵌套在块里、`check` 的分支里，或者放进括号：`echo (if n > 4:` ... `)`。
+- 列表推导式里的 `if` 不能给变量新值：推导式的每个元素都是独立生成的。
 
 ### 循环
 
@@ -304,7 +345,7 @@ main =
 - **echo。** `echo` 用值的 `textualize` 打印它。trail 没有遵循 Show 的值会打印它的 trail 名字（`Fruit`），并给出警告。
 - **Copy。** `copy x` 只接受 trail 遵循 Copy 的值，并逐个字段地复制它，所以每个字段也必须遵循 Copy。遵循 Copy 永远不会改变程序的行为：`y = x` 仍然会移动 `x`。只有内置的 Int、Float、Boolean 和 Void 会自动复制。
 - **Compare。** 遵循 Compare 的 trail 要给出 `compare @other :: Self -> Int`，在一个值上调用：`a.compare b` 在 `a` 在前时为 -1，相等时为 0，`b` 在前时为 1。`<`、`<=`、`>`、`>=`、`==` 和 `!=` 都由它得出（`a < b` 表示 `a.compare b < 0`），所以只有遵循 Compare 的 trail 才能比较，或者用作 `check` 的模式，而且只能和同一种 trail 的值比较。运算符只读取它的操作数，所以 `other` 是借用的（`@other`）。`Self` 表示这个 trail 本身（或遵循它的 trail）。
-- **Numeric。** 遵循 Numeric 的 trail 表现得像一个数字：它要给出 `add`、`sub`、`mul` 和 `div`（每个都像 `add @other :: Self -> Self`）、`compare` 和 `textualize`，这样对同一种 trail 的两个值，`a + b` 就表示 `a.add b`。不过，只有内置的数字会自动复制。目前只有内置 trail 才能遵循 Iterable 和 Array。
+- **Numeric。** 遵循 Numeric 的 trail 表现得像一个数字：它要给出 `add`、`sub`、`mul` 和 `div`（每个都像 `add @other :: Self -> Self`）、`compare` 和 `textualize`，这样对同一种 trail 的两个值，`a + b` 就表示 `a.add b`。如果 trail 还给出了 `mod @other :: Self -> Self`，就可以使用 `%`（`a % b` 表示 `a.mod b`）；Numeric 并不要求它。不过，只有内置的数字会自动复制。目前只有内置 trail 才能遵循 Iterable 和 Array。
 - **暂不支持。** 一个 trail 只能在它自己的 `trail ... follow ...:` 这一行里遵循其他 trail；在别处给已有的 trail（比如 String）加上新的 trail，以后才会支持。
 
 trail 的名字在当前作用域中必须是唯一的，不能与任何其他外部或内部的 trail 或函数同名。
@@ -353,7 +394,41 @@ first_or_zero a =
         void -> 0;
         else -> h # 这里 h 是 Int，而不是 Int?
 ```
-`void ->` 只匹配 void。目前还不能在类型定义中写出 maybe 类型。
+`void ->` 只匹配 void。
+
+maybe 类型也可以写出来：在内置 trail 后面加 `?`。`half n :: Int -> Int?` 可能给出 void，`or_zero x :: Int? -> Int` 接受 void，字段 `nickname :: String?` 可以存放 void。你自己定义的 trail 还不能加 `?`（`Fruit?` 以后会支持）。
+
+#### 一个值是否遵循某个 trail？`:?`
+
+`value :? Trail` 在这个值遵循这个 trail 时为 true，就像 Java 里的 `instanceof`。每个值都遵循 Any，所以 `anything :? Any` 永远为 true。
+```
+trail Fruit follow Show:
+    name :: String
+    textualize = copy name
+
+trail Apple follow Fruit:
+    crisp :: Boolean = true
+
+main =
+    echo ("hello" :? String) # true
+    echo ("hello" :? Int) # false
+    echo (5 :? Numeric) # true
+    echo ([1, 2] :? [Int]) # true
+    a = Apple {name = "fuji"}
+    echo (a :? Fruit) # true：Apple 遵循 Fruit
+    echo (a :? Show) # true：Fruit 遵循 Show
+    echo (a :? Compare) # false
+    h = head [1, 2]
+    echo (h :? Int) # true：h 是一个 Int?，里面是 1
+    echo (a :? Any) # true：一切都遵循 Any
+```
+
+- 右边的 trail 和签名里的写法一样：内置 trail（`Int`、`Numeric`、`Show`、`Iterable` 等）、程序定义的 trail（`Fruit`，或来自链接文件的 `food.Fruit`）、数组（`[Int]`）或者 maybe 类型（`Int?`）。
+- 一个值遵循它自己的 trail，以及这个 trail 遵循的所有 trail，正如它的 `follow` 那一行（内置的 trail 则是 `src/std.luna`）所写的。数组在它的元素被声明为 `T` 时才遵循 `[T]`，而不是恰好都是 `T` 的时候：`[1, 2] :? [Numeric]` 为 true，但一个 `Int?` 数组即使里面没有 void，也不是 `:? [Int]`。
+- 对大多数值，编译器就知道答案。只有可能属于几种 trail 的值，比如上面的 `Int?`，或者一个给出字符串或数字的 `check`，才在程序运行时检测。
+- `:?` 只读取这个值，和 `==` 一样：`s :? String` 之后，`s` 仍然可以使用。
+- `:?` 的优先级和 `==` 相同，也不能和它连写：`x + 1 :? Int` 检测的是 `x + 1`，而 `x :? Int == true` 需要加括号。
+- 它不会改变变量的类型：在 `check x :? Int:` 的 `true -> ...` 分支里，`x` 仍是原来的类型。
 
 ### 多文件以及如何链接它们
 
@@ -553,3 +628,48 @@ main =
 “借用”表示调用者保留这个数组（`@a`）；“拿走”表示它被移动进函数，因为结果是由它的元素构成的。
 
 比较值的函数（`max`、`min`、`maximum`、`minimum`、`contains`、`count`、`index_of`、`remove`）适用于每个遵循 Compare 的 trail，包括程序自己定义的：`max (Money {cents = 150}) (Money {cents = 999})`。把数字加起来的函数（`sum`、`product`、`average`、`abs`）从 0 或 1 开始，所以它们用于内置的数字。
+
+### 输入与输出
+
+程序用下面这些函数读取输入、参数和文件，以及写入文件：
+
+| 函数 | 给出什么 |
+|---|---|
+| `read_line` | 输入（stdin）的下一行，不含行尾；输入结束时给出 void |
+| `read_all` | 剩下的全部输入，一次读完 |
+| `print s` | 打印字符串 `s`，后面不加换行（`echo` 会加） |
+| `args` | 程序启动时得到的参数，是一个字符串数组（不含程序自己的名字） |
+| `read_file path` | 文件 `path` 的内容；读不了时给出 void |
+| `write_file path text` | 让文件 `path` 的内容变成 `text`（文件不存在就创建，存在就替换原有内容）：给出是否成功 |
+| `exit code` | 立刻结束程序，退出码是 `code`（0 表示一切正常） |
+| `lines s` | `s` 的各行：`lines "a\nb\n"` 是 `["a", "b"]`（`\r\n` 行尾也可以） |
+| `to_int s`、`to_float s` | `s` 里写的数字；不是数字时给出 void：`to_int "-42"` 是 -42，`to_float "2.5"` 是 2.5 |
+
+```
+main =
+    print "what is your name? "
+    name = read_line
+    check name:
+        void -> echo "goodbye";
+        else -> echo ("hello " + name)
+```
+程序打印的内容会在它等待输入之前显示出来，所以你输入答案之前就能看到问题。`read_line`、`read_file`、`to_int` 和 `to_float` 可能给出 void，所以使用这个值之前要用 `check` 处理（见“void 与 maybe 类型”）。路径从程序运行时所在的文件夹开始。
+
+```
+# sum.luna: the total of the numbers in each file it is given, one per line
+number s =
+    n = to_int s
+    check n:
+        void -> 0;
+        else -> n
+
+main =
+    loop path in args:
+        text = read_file path
+        check text:
+            void -> echo ("cannot read " + path);
+            else -> echo (sum [number line | line in lines text])
+```
+`lunac sum.luna -r -- a.txt b.txt` 会编译它，并带着参数 `a.txt` 和 `b.txt` 运行它。
+
+`read_line`、`read_all`、`print`、`args`、`read_file`、`write_file` 和 `exit` 要接触程序之外的东西，所以由运行时提供：`src/std.luna` 在它们前面写上 `native`，只声明签名，没有函数体（`native read_line :: String?`）。只有标准库可以声明 native 函数。`lines`、`to_int` 和 `to_float` 和库里的其他函数一样，是用 luna 写的。

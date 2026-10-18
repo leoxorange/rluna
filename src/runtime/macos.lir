@@ -13,14 +13,33 @@
 ; int: the arm64 convention passes each argument in a full 64-bit
 ; register, and the callee simply reads the low 32 bits.
 
+;
+; A function C declares to return an int leaves only the low 32 bits of x0
+; defined, so such results (open, close) are sign-extended before use.
+
 extern @libSystem.write(i64, i64, i64) -> i64
+extern @libSystem.read(i64, i64, i64) -> i64
+extern @libSystem.open(i64, i64) -> i64
+extern @libSystem.creat(i64, i64) -> i64
+extern @libSystem.close(i64) -> i64
 extern @libSystem.exit(i64)
 extern @libSystem.mmap(i64, i64, i64, i64, i64, i64) -> i64
 extern @libSystem.munmap(i64, i64) -> i64
 
-; dyld calls this as `main`; the arguments are ignored.
-func @rt.start() {
+; the arguments dyld passes to `main`, for @rt.sys_args
+data @rt.argc = { i64 0 }
+data @rt.argv = { i64 0 }
+
+; dyld calls this as `main(argc, argv)`; argc is an int.
+func @rt.start(%argc_int: i64, %argv: i64) {
 entry:
+  %thirty_two = iconst 32
+  %argc_high = shl %argc_int, %thirty_two
+  %argc = sar %argc_high, %thirty_two
+  %argc_slot = addr @rt.argc
+  store i64 %argc_slot, 0, %argc
+  %argv_slot = addr @rt.argv
+  store i64 %argv_slot, 0, %argv
   call void @luna.main()
   %zero = iconst 0
   call void @rt.exit(%zero)
@@ -33,8 +52,15 @@ entry:
   unreachable
 }
 
-; write(2) may write less than asked (e.g. to a pipe), so loop until done.
+; Streams 1 and 2 are the file descriptors of stdout and stderr.
 func @rt.sys_write(%stream: i64, %p: i64, %n: i64) {
+entry:
+  %ok = call i64 @rt.sys_write_file(%stream, %p, %n)
+  ret
+}
+
+; write(2) may write less than asked (e.g. to a pipe), so loop until done.
+func @rt.sys_write_file(%fd: i64, %p: i64, %n: i64) -> i64 {
 entry:
   %zero = iconst 0
   jmp loop(%p, %n)
@@ -42,15 +68,94 @@ loop(%at: i64, %left: i64):
   %more = icmp sgt %left, %zero
   br %more, write, done
 write:
-  %written = call i64 @libSystem.write(%stream, %at, %left)
+  %written = call i64 @libSystem.write(%fd, %at, %left)
   %failed = icmp sle %written, %zero
-  br %failed, done, advance
+  br %failed, fail, advance
 advance:
   %next = iadd %at, %written
   %rest = isub %left, %written
   jmp loop(%next, %rest)
+fail:
+  ret %zero
 done:
-  ret
+  %one = iconst 1
+  ret %one
+}
+
+; Handle 0 is stdin's file descriptor already.
+func @rt.sys_read(%fd: i64, %p: i64, %n: i64) -> i64 {
+entry:
+  %got = call i64 @libSystem.read(%fd, %p, %n)
+  ret %got
+}
+
+; open(2) is variadic in C, and Apple passes variadic arguments on the
+; stack, which LIR calls do not. Opening for reading needs no mode, so it
+; passes only the fixed two; creat(2) is open with O_CREAT | O_WRONLY |
+; O_TRUNC and a mode, without the variadic part.
+func @rt.sys_open(%path: i64, %write: i64) -> i64 {
+entry:
+  %c = call i64 @rt.cstr(%path)
+  br %write, create, open
+open:
+  %read_only = iconst 0
+  %r = call i64 @libSystem.open(%c, %read_only)
+  jmp done(%r)
+create:
+  %rw_r_r = iconst 420
+  %w = call i64 @libSystem.creat(%c, %rw_r_r)
+  jmp done(%w)
+done(%result: i64):
+  call void @rt.free(%c)
+  %thirty_two = iconst 32
+  %high = shl %result, %thirty_two
+  %fd = sar %high, %thirty_two
+  ret %fd
+}
+
+func @rt.sys_close(%fd: i64) -> i64 {
+entry:
+  %r = call i64 @libSystem.close(%fd)
+  %thirty_two = iconst 32
+  %high = shl %r, %thirty_two
+  %low = sar %high, %thirty_two
+  %zero = iconst 0
+  %ok = icmp eq %low, %zero
+  ret %ok
+}
+
+; argv[1 ..] (argv[0] is the program itself), as strings.
+func @rt.sys_args() -> i64 {
+entry:
+  %argc_slot = addr @rt.argc
+  %argc = load i64 %argc_slot, 0
+  %argv_slot = addr @rt.argv
+  %argv = load i64 %argv_slot, 0
+  %zero = iconst 0
+  %one = iconst 1
+  %three = iconst 3
+  %n_raw = isub %argc, %one
+  %none = icmp slt %n_raw, %zero
+  br %none, sized(%zero), sized(%n_raw)
+sized(%n: i64):
+  %a = call i64 @rt.array_new(%n)
+  jmp loop(%zero)
+loop(%i: i64):
+  %more = icmp slt %i, %n
+  br %more, body, done
+body:
+  %k = iadd %i, %one
+  %k_off = shl %k, %three
+  %arg_slot = iadd %argv, %k_off
+  %arg = load i64 %arg_slot, 0
+  %s = call i64 @rt.str_from_cstr(%arg)
+  %i_off = shl %i, %three
+  %elem = iadd %a, %i_off
+  store i64 %elem, 8, %s
+  %next = iadd %i, %one
+  jmp loop(%next)
+done:
+  ret %a
 }
 
 func @rt.sys_alloc(%size: i64) -> i64 {

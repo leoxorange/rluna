@@ -84,6 +84,9 @@ pub struct TFunc {
     pub patterns: Vec<Option<HPattern>>,
     /// For each parameter, whether it is borrowed (`@a`).
     pub borrowed: Vec<bool>,
+    /// A `native` function: the runtime function that gives it. The body
+    /// is empty.
+    pub native: Option<String>,
 }
 
 impl TFunc {
@@ -293,6 +296,10 @@ pub enum TExprKind {
         rhs: Box<TExpr>,
     },
     Neg(Box<TExpr>),
+    /// `value :? Trail`, which only reads the value. The type is the part
+    /// of the value's type that follows the trail: the value passes when
+    /// its kind is one of these.
+    Is(Box<TExpr>, Ty),
     Echo(Box<TExpr>),
     /// Each arm compares the scrutinee to the pattern with `==`.
     /// Arm bodies are already converted to the result type.
@@ -305,6 +312,17 @@ pub enum TExprKind {
         /// For each arm whose pattern is a value of a trail, the instance of
         /// that trail's `compare`: the arm matches when it gives 0.
         compares: Vec<Option<InstId>>,
+        /// Variables from outside that the arms give new values (in the
+        /// blocks of `if`s), with their type after the `check`: the union
+        /// of what the arms leave in them.
+        carried: Vec<(usize, Ty)>,
+    },
+    /// The block of an `if` or an `else`: the value of its last statement
+    /// if that is an expression, else void.
+    Block {
+        stmts: Vec<TStmt>,
+        /// Variables that exist only inside the block.
+        inner: Vec<usize>,
     },
     /// The void value.
     Void,
@@ -427,6 +445,11 @@ pub fn binop_result(op: BinOp, a: Kind, b: Kind) -> Option<Kind> {
             (Int, Int) if op != BinOp::Div => Some(Int),
             _ if numeric(a) && numeric(b) => Some(Float),
             (Str, Str) if op == BinOp::Add => Some(Str),
+            _ => None,
+        },
+        // Only whole numbers have a remainder.
+        BinOp::Mod => match (a, b) {
+            (Int, Int) => Some(Int),
             _ => None,
         },
         BinOp::Eq | BinOp::Ne => Some(Bool),
@@ -599,6 +622,10 @@ impl<'a> Checker<'a> {
         let params = &self.instances[id].params;
         // The parameters are the first variables, typed by this instance.
         let mut local_tys = params.clone();
+        // A native function gives what it declares; the runtime does the rest.
+        if func.native.is_some() {
+            return Ok((Vec::new(), local_tys, func.ret.unwrap_or(Ty::VOID)));
+        }
         local_tys.resize(func.local_names.len(), Ty::NEVER);
         // A pattern's parts: elements of the array, and the rest of it.
         for (p, pattern) in params.iter().zip(&func.patterns) {
@@ -1049,6 +1076,7 @@ impl<'a> Checker<'a> {
             BinOp::Sub => ("sub", "Numeric"),
             BinOp::Mul => ("mul", "Numeric"),
             BinOp::Div => ("div", "Numeric"),
+            BinOp::Mod => ("mod", "Numeric"),
             BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("typed separately"),
             _ => ("compare", "Compare"),
         };
@@ -1093,6 +1121,22 @@ impl<'a> Checker<'a> {
                 span,
                 format!(
                     "`{}` values cannot be {what}: `{}` does not follow {needs}",
+                    shown_trail(trail),
+                    shown_trail(trail)
+                ),
+            ));
+        }
+        // Numeric does not ask for `mod`: a trail that has one can use `%`.
+        if op == BinOp::Mod
+            && !self.hir.trails[trail]
+                .methods
+                .iter()
+                .any(|m| m.name == "mod")
+        {
+            return Err(err(
+                span,
+                format!(
+                    "`%` on `{}` values calls its `mod @other :: Self -> Self`, which `{}` does not give",
                     shown_trail(trail),
                     shown_trail(trail)
                 ),
@@ -1610,7 +1654,7 @@ impl<'a> Checker<'a> {
                 let rhs = self.expr(cx, rhs)?;
                 // On values of trails, the operators are the trails'
                 // functions: `compare` (Compare), `add`, `sub`, `mul`,
-                // `div` (Numeric).
+                // `div` (Numeric), and `mod` when the trail gives it.
                 if !lhs.ty.trails().is_empty() || !rhs.ty.trails().is_empty() {
                     return self.trail_operator(*op, lhs, rhs, span);
                 }
@@ -1671,6 +1715,29 @@ impl<'a> Checker<'a> {
                 };
                 (TExprKind::Neg(Box::new(inner)), ty)
             }
+            HExprKind::Is { value, ty, bound } => {
+                let value = self.expr(cx, value)?;
+                // Each kind of the value's type passes or not while
+                // compiling: an array by its elements, a value of a trail
+                // by its trail. Only which kind a value of a union type
+                // holds waits for run time.
+                let accepted = crate::hir::accepts(*ty, bound, &self.hir.embedded);
+                let passes = value
+                    .ty
+                    .kinds()
+                    .map(|k| value.ty.only(k))
+                    .filter(|part| {
+                        part.is_subset(accepted)
+                            && bound.as_ref().is_none_or(|b| self.follows_bound(*part, b))
+                    })
+                    .fold(Ty::NEVER, Ty::union);
+                let ty = if value.ty.is_never() {
+                    Ty::NEVER
+                } else {
+                    Ty::BOOL
+                };
+                (TExprKind::Is(Box::new(value), passes), ty)
+            }
             HExprKind::Echo(inner) => {
                 let inner = self.expr(cx, inner)?;
                 let mut trails = inner.ty.trails();
@@ -1691,16 +1758,64 @@ impl<'a> Checker<'a> {
                 scrutinee,
                 arms,
                 else_arm,
+                carried,
+                is_if,
             } => {
                 let scrutinee = self.expr(cx, scrutinee)?;
+                if *is_if && !scrutinee.ty.is_never() && !scrutinee.ty.is_subset(Ty::BOOL) {
+                    let hint = if scrutinee.ty.is_maybe() {
+                        ": it may be void, so handle the void case first, with a `check` that has a `void ->` arm"
+                    } else {
+                        ""
+                    };
+                    return Err(err(
+                        scrutinee.span,
+                        format!(
+                            "the condition of `if` must be a Boolean, but this is {}{hint}",
+                            scrutinee.ty
+                        ),
+                    ));
+                }
+                // A comprehension makes each element on its own: nothing
+                // carries over from one element to the next.
+                if cx.in_comprehension > 0
+                    && let Some(&l) = carried.first()
+                {
+                    return Err(err(
+                        span,
+                        format!(
+                            "a list comprehension cannot give `{}` a new value: it makes each element on its own, and keeps nothing from one to the next",
+                            cx.names[l]
+                        ),
+                    ));
+                }
+                let what = if *is_if {
+                    "the blocks of this `if`"
+                } else {
+                    "the branches of this `check`"
+                };
                 // Handling the void case: when the checked value is a
                 // variable of a maybe type (`int?`), an arm whose pattern is
                 // not void only runs when the variable is not void, so in
                 // that arm it has the plain type (`int`). After a `void ->`
-                // arm, the same holds for `else`.
+                // arm, the same holds for `else`. (Not when an arm gives the
+                // variable a new value: after the `check` it would be
+                // unclear which value is meant.)
                 let narrow_local = match scrutinee.kind {
-                    TExprKind::Local(l) if scrutinee.ty.is_maybe() => Some(l),
+                    TExprKind::Local(l) if scrutinee.ty.is_maybe() && !carried.contains(&l) => {
+                        Some(l)
+                    }
                     _ => None,
+                };
+                // Every arm starts from the types before it, and the
+                // variables an arm gives new values have, after the
+                // `check`, any type an arm that gets there leaves in them.
+                let start = cx.local_tys.clone();
+                let mut ends: Vec<Vec<Ty>> = Vec::new();
+                let mut end_of = |cx: &Ctx, body: &TExpr| {
+                    if !body.ty.is_never() {
+                        ends.push(carried.iter().map(|&l| cx.local_tys[l]).collect());
+                    }
                 };
                 let narrowed_ty = scrutinee.ty.without(Ty::VOID);
                 let mut narrowed_arms = Vec::new();
@@ -1722,6 +1837,7 @@ impl<'a> Checker<'a> {
                     body
                 };
                 for (pat, body) in arms {
+                    cx.local_tys.clone_from(&start);
                     let pat = self.expr(cx, pat)?;
                     // `void ->` on a value that may be void is fine; a
                     // pattern that is a trail's value would need comparing.
@@ -1740,15 +1856,18 @@ impl<'a> Checker<'a> {
                     }
                     let narrowed = narrow_local.is_some() && !pat.ty.contains(Kind::Void);
                     let body = arm_body(self, cx, body, narrowed)?;
-                    ty = join(ty, body.ty, body.span, "the branches of this `check`")?;
+                    end_of(cx, &body);
+                    ty = join(ty, body.ty, body.span, what)?;
                     narrowed_arms.push(narrowed);
                     tarms.push((pat, body));
                 }
                 let else_narrowed = narrow_local.is_some() && seen_void;
                 let else_arm = match else_arm {
                     Some(e) => {
+                        cx.local_tys.clone_from(&start);
                         let e = arm_body(self, cx, e, else_narrowed)?;
-                        ty = join(ty, e.ty, e.span, "the branches of this `check`")?;
+                        end_of(cx, &e);
+                        ty = join(ty, e.ty, e.span, what)?;
                         Some(e)
                     }
                     None => {
@@ -1779,6 +1898,22 @@ impl<'a> Checker<'a> {
                         None
                     }
                 };
+                let mut after = start;
+                let mut carried_tys = Vec::new();
+                for (k, &l) in carried.iter().enumerate() {
+                    let mut t = if ends.is_empty() { after[l] } else { Ty::NEVER };
+                    for end in &ends {
+                        t = join(
+                            t,
+                            end[k],
+                            span,
+                            &format!("the values `{}` gets in {what}", cx.names[l]),
+                        )?;
+                    }
+                    after[l] = t;
+                    carried_tys.push((l, t));
+                }
+                cx.local_tys = after;
                 let narrowing = narrow_local.map(|local| Narrowing {
                     local,
                     ty: narrowed_ty,
@@ -1801,6 +1936,25 @@ impl<'a> Checker<'a> {
                         else_arm,
                         narrowing,
                         compares,
+                        carried: carried_tys,
+                    },
+                    ty,
+                )
+            }
+            HExprKind::Block { stmts, inner } => {
+                // The block's own variables are new every time it runs.
+                for &l in inner {
+                    cx.local_tys[l] = Ty::NEVER;
+                }
+                let stmts = self.stmts(cx, stmts)?;
+                let ty = match stmts.last() {
+                    Some(TStmt::Expr(v)) => v.ty,
+                    _ => Ty::VOID,
+                };
+                (
+                    TExprKind::Block {
+                        stmts,
+                        inner: inner.clone(),
                     },
                     ty,
                 )
@@ -2143,6 +2297,7 @@ impl<'a> Checker<'a> {
                 local_names: func.local_names.clone(),
                 patterns: func.patterns.clone(),
                 borrowed: func.borrowed.clone(),
+                native: func.native.clone(),
             });
         }
         let mut trails = HashMap::new();
@@ -2198,6 +2353,7 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
             f(rhs);
         }
         TExprKind::Neg(x)
+        | TExprKind::Is(x, _)
         | TExprKind::Echo(x)
         | TExprKind::Convert(x)
         | TExprKind::Builtin(_, x) => f(x),
@@ -2231,6 +2387,7 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
                 f(e);
             }
         }
+        TExprKind::Block { stmts, .. } => for_each_expr(stmts, f),
     }
 }
 
@@ -2262,6 +2419,7 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
             remap_calls(rhs, index);
         }
         TExprKind::Neg(x)
+        | TExprKind::Is(x, _)
         | TExprKind::Echo(x)
         | TExprKind::Convert(x)
         | TExprKind::Builtin(_, x) => remap_calls(x, index),
@@ -2303,6 +2461,9 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
             if let Some(e) = else_arm {
                 remap_calls(e, index);
             }
+        }
+        TExprKind::Block { stmts, .. } => {
+            for_each_expr_mut(stmts, &mut |e| remap_calls(e, index));
         }
         _ => {}
     }

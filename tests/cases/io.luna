@@ -1,0 +1,49 @@
+# input, output and files: the native functions of std.luna
+
+# adds up the numbers on every line until the input ends
+total t =
+    line = read_line
+    check line:
+        void -> t;
+        else -> total (t + sum [number w | w in split line " "])
+
+number w =
+    n = to_int w
+    check n:
+        void -> 0;
+        else -> n
+
+# writes a file, then reads it back
+round_trip @path =
+    echo (write_file path "one\r\ntwo\n\nthree")
+    text = read_file path
+    check text:
+        void -> echo "cannot read it back";
+        else -> echo (lines text)
+
+main =
+    print "name? "
+    name = read_line
+    check name:
+        void -> echo "no name";
+        else -> echo ("hello " + name)
+    echo (read_line == "")
+    echo (total 0)
+    echo read_line
+    echo (len read_all)
+
+    echo (len args)
+    echo (head args)
+    loop path in @args:
+        check path == "a b":
+            true -> void;
+            false -> round_trip path
+    echo (read_file "no/such/file")
+    echo (write_file "no/such/folder/file" "x")
+
+    echo [to_int s | s in ["42", "-7", "+3", "007", "", "-", "4x", "1-", " 1"]]
+    echo [to_float s | s in ["3.25", "-0.5", "12", "1.", ".5", "1.2.3", ".", ""]]
+    echo (lines "")
+    echo (lines "a")
+    echo (lines "a\n")
+    echo (lines "a\n\nb")

@@ -212,6 +212,16 @@ enum IterKind {
     Str { s: Value, len: Value },
 }
 
+/// Where a `check` arm continues to the merge block: its block, its
+/// value, and its variables there (owners, values and their types).
+struct ArmEnd {
+    block: BlockId,
+    value: Value,
+    owned: Owned,
+    locals: Vec<Option<Value>>,
+    local_tys: Vec<Ty>,
+}
+
 /// Which variables currently own a value that must be dropped.
 #[derive(Clone)]
 struct Owned {
@@ -318,6 +328,9 @@ impl<'a> FnLower<'a> {
     }
 
     fn run(mut self) -> lir::Function {
+        if let Some(symbol) = &self.f.native {
+            return self.native(symbol);
+        }
         self.take_apart_patterns();
         let returns = !self.f.discard && ret_repr(self.f.ret).is_some();
         let mut result = None;
@@ -338,6 +351,23 @@ impl<'a> FnLower<'a> {
         }
         let result = result.map(|(v, ty)| self.convert(v, ty, self.f.ret));
         // The end of the function's scope: drop everything still owned.
+        self.drop_owned(&self.owned.clone(), None);
+        self.b.ret(result);
+        self.b.finish()
+    }
+
+    /// A `native` function passes its arguments to the runtime function
+    /// that gives it, which takes them as they are represented here (a
+    /// string as its pointer, a maybe value as a box) and returns its
+    /// result the same way.
+    fn native(mut self, symbol: &str) -> lir::Function {
+        let args = (0..self.f.params.len()).map(|i| self.b.param(i)).collect();
+        let ret = if self.f.discard {
+            None
+        } else {
+            ret_repr(self.f.ret)
+        };
+        let result = self.b.call(symbol, args, ret);
         self.drop_owned(&self.owned.clone(), None);
         self.b.ret(result);
         self.b.finish()
@@ -1544,11 +1574,17 @@ impl<'a> FnLower<'a> {
 
     /// The end of a `check` arm: record where it continues to the merge
     /// block, unless it cannot get there (it returned, or stopped).
-    fn arm_end(&mut self, ends: &mut Vec<(BlockId, Value, Owned)>, v: Value) {
+    fn arm_end(&mut self, ends: &mut Vec<ArmEnd>, value: Value) {
         if std::mem::take(&mut self.dead) {
             self.b.unreachable();
         } else if !self.b.is_terminated() {
-            ends.push((self.b.current(), v, self.owned.clone()));
+            ends.push(ArmEnd {
+                block: self.b.current(),
+                value,
+                owned: self.owned.clone(),
+                locals: self.locals.clone(),
+                local_tys: self.local_tys.clone(),
+            });
         }
     }
 
@@ -1859,6 +1895,24 @@ impl<'a> FnLower<'a> {
                 self.drop_temp(rhs, r);
                 result
             }
+            TExprKind::Is(inner, passes) => {
+                let v = self.expr(inner, Use::Borrow);
+                if e.ty.is_never() {
+                    return self.dummy(e.ty);
+                }
+                // Only a union's kind is left to test: the value is a box,
+                // whose tag says which kind it holds.
+                let hit = if passes.mask() == inner.ty.mask() {
+                    self.b.iconst(1)
+                } else if passes.is_never() {
+                    self.b.iconst(0)
+                } else {
+                    let tag = self.b.load(MemTy::I64, v, 0);
+                    self.tag_in(tag, *passes)
+                };
+                self.drop_temp(inner, v);
+                hit
+            }
             TExprKind::Neg(inner) => {
                 let v = self.expr(inner, Use::Borrow);
                 if e.ty.is_never() {
@@ -1922,6 +1976,7 @@ impl<'a> FnLower<'a> {
                 else_arm,
                 narrowing,
                 compares,
+                carried,
             } => {
                 let s = self.expr(scrutinee, Use::Borrow);
                 // A temporary being checked lives until the end of the
@@ -1935,8 +1990,18 @@ impl<'a> FnLower<'a> {
                 }
                 let merge = self.b.new_block("check_end");
                 let result = self.b.block_param(merge, repr(e.ty));
-                // (block where the arm ends, its value, owners at its end)
-                let mut ends: Vec<(BlockId, Value, Owned)> = Vec::new();
+                // The variables the arms give new values (in the blocks of
+                // `if`s) come to the merge block as parameters, like the
+                // variables a loop updates.
+                let params: Vec<Value> = carried
+                    .iter()
+                    .map(|&(_, ty)| self.b.block_param(merge, repr(ty)))
+                    .collect();
+                // Every arm, and every pattern tested, starts from the
+                // variables as they are before the `check`.
+                let (start_locals, start_tys) = (self.locals.clone(), self.local_tys.clone());
+                let start_owned = self.owned.clone();
+                let mut ends: Vec<ArmEnd> = Vec::new();
                 // Lower one arm's body, seeing the narrowed variable if the
                 // arm cannot run with it void.
                 let arm_body = |this: &mut Self, body: &TExpr, narrowed: bool| {
@@ -1951,6 +2016,8 @@ impl<'a> FnLower<'a> {
                     v
                 };
                 for (k, (pat, body)) in arms.iter().enumerate() {
+                    self.locals.clone_from(&start_locals);
+                    self.local_tys.clone_from(&start_tys);
                     let p = self.expr(pat, Use::Borrow);
                     let cond = if scrutinee.ty.is_never() || pat.ty.is_never() {
                         self.b.iconst(0)
@@ -1975,6 +2042,8 @@ impl<'a> FnLower<'a> {
                     self.owned = before;
                     self.b.switch_to(next);
                 }
+                self.locals.clone_from(&start_locals);
+                self.local_tys.clone_from(&start_tys);
                 match else_arm {
                     Some(body) => {
                         let narrowed = narrowing.as_ref().is_some_and(|n| n.else_arm);
@@ -1986,19 +2055,43 @@ impl<'a> FnLower<'a> {
                     // says so (and traps if the proof were ever wrong).
                     None => self.b.unreachable(),
                 }
+                // Each arm converts the carried variables to their type
+                // after the `check` (see `carry`), which may change what
+                // it owns.
+                let mut args = Vec::new();
+                for end in &mut ends {
+                    self.b.switch_to(end.block);
+                    self.owned = end.owned.clone();
+                    self.locals = std::mem::take(&mut end.locals);
+                    self.local_tys = std::mem::take(&mut end.local_tys);
+                    let mut a = vec![end.value];
+                    a.extend(carried.iter().map(|&(l, ty)| self.carry(l, ty)));
+                    args.push(a);
+                    end.owned = self.owned.clone();
+                    end.locals = std::mem::take(&mut self.locals);
+                    end.local_tys = std::mem::take(&mut self.local_tys);
+                }
                 let after = ends
                     .iter()
-                    .map(|(_, _, owned)| owned.clone())
+                    .map(|end| end.owned.clone())
                     .reduce(|a, b| a.meet(&b))
-                    .unwrap_or_else(|| self.owned.clone());
+                    .unwrap_or(start_owned);
                 // If every arm returned, the code after the `check` is dead.
                 self.dead = ends.is_empty();
-                for (block, v, owned) in ends {
-                    self.b.switch_to(block);
-                    self.drop_owned(&owned, Some(&after));
-                    self.b.jmp(merge, vec![v]);
+                for (end, a) in ends.into_iter().zip(args) {
+                    self.b.switch_to(end.block);
+                    self.locals = end.locals;
+                    self.local_tys = end.local_tys;
+                    self.drop_owned(&end.owned, Some(&after));
+                    self.b.jmp(merge, a);
                 }
                 self.owned = after;
+                self.locals = start_locals;
+                self.local_tys = start_tys;
+                for (&(l, ty), &p) in carried.iter().zip(&params) {
+                    self.locals[l] = Some(p);
+                    self.local_tys[l] = ty;
+                }
                 self.b.switch_to(merge);
                 if scrutinee.ty.is_never() {
                     self.unpend(scrutinee);
@@ -2006,6 +2099,32 @@ impl<'a> FnLower<'a> {
                     self.drop_temp(scrutinee, s);
                 }
                 result
+            }
+            // The block of an `if`: its value is a new value, which the last
+            // statement gives up (see `ownership`). The block's own
+            // variables end with it.
+            TExprKind::Block { stmts, inner } => {
+                let n = stmts.len();
+                let mut value = None;
+                for (i, stmt) in stmts.iter().enumerate() {
+                    match stmt {
+                        TStmt::Expr(v) if i + 1 == n => value = Some(self.expr(v, Use::Move)),
+                        _ => self.stmt(stmt),
+                    }
+                }
+                let value = value.unwrap_or_else(|| self.dummy(e.ty));
+                if !self.dead {
+                    for &l in inner {
+                        if self.owned.locals[l] {
+                            let v = self.locals[l].expect("owned variable has a value");
+                            self.fns.drop(&mut self.b, v, self.local_tys[l]);
+                        }
+                    }
+                }
+                for &l in inner {
+                    self.owned.locals[l] = false;
+                }
+                value
             }
             TExprKind::Convert(inner) => {
                 let v = self.expr(inner, usage);
@@ -2345,6 +2464,9 @@ impl<'a> FnLower<'a> {
                 };
                 self.b.fbin(fop, fa, fb)
             }
+            // Two ints (see `binop_result`): the runtime stops the program
+            // on `x % 0` instead of letting the machine trap.
+            BinOp::Mod => self.b.call("rt.mod", vec![a, b], Some(Type::I64)).unwrap(),
             BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("lowered separately"),
             BinOp::Eq | BinOp::Ne => {
                 let eq = if ka == Array && kb == Array {

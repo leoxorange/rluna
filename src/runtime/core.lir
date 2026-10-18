@@ -9,6 +9,14 @@
 ;   @rt.sys_exit(%code)                 terminate the process (does not return)
 ;   @rt.sys_alloc(%size) -> i64         fresh zeroed read/write memory, 0 on failure
 ;   @rt.sys_free(%p, %size)             return memory from @rt.sys_alloc to the OS
+;   @rt.sys_read(%h, %p, %n) -> i64     read up to n bytes from handle h (0 = stdin):
+;                                       how many, 0 at the end, -1 on failure
+;   @rt.sys_open(%path, %write) -> i64  open the file at path (a string) for reading,
+;                                       or create/empty it for writing: a handle, -1 on failure
+;   @rt.sys_write_file(%h, %p, %n) -> i64  write n bytes to handle h: 1 if all were written
+;   @rt.sys_close(%h) -> i64            close a handle from @rt.sys_open: 1 if it went well
+;   @rt.sys_args() -> i64               the program's arguments, without its own name,
+;                                       as a new array of strings
 ;
 ; Object layouts:
 ;   string: { len: i64, bytes[len] }
@@ -43,6 +51,12 @@ data @rt.outbuf = { i64 0, zero 4096 }
 ; that string instead: { the string being built (0 when printing to the
 ; terminal), its capacity in bytes }.
 data @rt.capture = { i64 0, i64 0 }
+; standard input buffer: { pos: i64, len: i64, bytes[4096] }; the bytes
+; [pos, len) were read from stdin and not used yet. Reading stdin a few
+; bytes at a time would cost a system call each, as writing would.
+data @rt.inbuf = { i64 0, i64 0, zero 4096 }
+; where a file is read into, one piece at a time, on its way to a string
+data @rt.filebuf = { zero 4096 }
 
 data @rt.s_true = { i64 4, bytes "true" }
 data @rt.s_false = { i64 5, bytes "false" }
@@ -68,6 +82,7 @@ data @rt.s_array = { i64 5, bytes "Array" }
 data @rt.s_trail = { i64 5, bytes "trail" }
 data @rt.s_no_match = { i64 29, bytes "TypeError: no definition of `" }
 data @rt.s_no_match_end = { i64 25, bytes "` accepts these arguments" }
+data @rt.s_mod_zero = { i64 42, bytes "ZeroDivisionError: `%` with 0 on the right" }
 
 ; ---------------------------------------------------------------------------
 ; Process exit
@@ -361,13 +376,29 @@ copy:
   ret
 }
 
-; Append n bytes at p to the string being built, doubling its room when
-; they do not fit.
-func @rt.capture_out(%p: i64, %n: i64) {
+; A string being built is a cell { string, room }: the string holds the
+; bytes so far (its length says how many), and room is how many fit before
+; it must grow.
+
+; Start building a new, empty string in %cell.
+func @rt.sb_begin(%cell: i64) {
 entry:
-  %capture = addr @rt.capture
-  %s = load i64 %capture, 0
-  %room = load i64 %capture, 8
+  %size = iconst 64
+  %s = call i64 @rt.alloc(%size)
+  %zero = iconst 0
+  store i64 %s, 0, %zero
+  %room = iconst 56
+  store i64 %cell, 0, %s
+  store i64 %cell, 8, %room
+  ret
+}
+
+; Append n bytes at p to the string being built in %cell, doubling its
+; room when they do not fit.
+func @rt.sb_append(%cell: i64, %p: i64, %n: i64) {
+entry:
+  %s = load i64 %cell, 0
+  %room = load i64 %cell, 8
   %len = load i64 %s, 0
   %end = iadd %len, %n
   %fits = icmp sle %end, %room
@@ -386,8 +417,8 @@ regrow(%new_room: i64):
   %src = iadd %s, %eight
   call void @rt.memcpy(%dst, %src, %len)
   call void @rt.free(%s)
-  store i64 %capture, 0, %t
-  store i64 %capture, 8, %new_room
+  store i64 %cell, 0, %t
+  store i64 %cell, 8, %new_room
   jmp append(%t)
 append(%b: i64):
   %eight2 = iconst 8
@@ -395,6 +426,14 @@ append(%b: i64):
   %at = iadd %bytes, %len
   call void @rt.memcpy(%at, %p, %n)
   store i64 %b, 0, %end
+  ret
+}
+
+; Append n bytes at p to the string being printed into.
+func @rt.capture_out(%p: i64, %n: i64) {
+entry:
+  %capture = addr @rt.capture
+  call void @rt.sb_append(%capture, %p, %n)
   ret
 }
 
@@ -407,13 +446,7 @@ entry:
   %old_room = load i64 %capture, 8
   store i64 %save, 0, %old
   store i64 %save, 8, %old_room
-  %size = iconst 64
-  %s = call i64 @rt.alloc(%size)
-  %zero = iconst 0
-  store i64 %s, 0, %zero
-  %room = iconst 56
-  store i64 %capture, 0, %s
-  store i64 %capture, 8, %room
+  call void @rt.sb_begin(%capture)
   ret
 }
 
@@ -1232,4 +1265,304 @@ finish:
   %one = iconst 1
   call void @rt.sys_exit(%one)
   unreachable
+}
+
+; `a % b` on two ints: the remainder of a / b, with the sign of b (or 0),
+; so -7 % 3 is 2 and 7 % -3 is -2. The machine's remainder has the sign of
+; a, so a remainder of the other sign gets b added. b = 0 stops the
+; program; b = -1 gives 0 at once, because dividing the smallest int by -1
+; overflows (and traps on x86-64).
+func @rt.mod(%a: i64, %b: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %by_zero = icmp eq %b, %zero
+  br %by_zero, fail, nonzero
+fail:
+  %msg = addr @rt.s_mod_zero
+  call void @rt.fatal(%msg)
+  unreachable
+nonzero:
+  %minus_one = iconst -1
+  %by_minus_one = icmp eq %b, %minus_one
+  br %by_minus_one, none, divide
+none:
+  ret %zero
+divide:
+  %r = srem %a, %b
+  %signs = xor %r, %b
+  %differ = icmp slt %signs, %zero
+  %nonzero_r = icmp ne %r, %zero
+  %fix = and %differ, %nonzero_r
+  br %fix, fixed, plain
+fixed:
+  %sum = iadd %r, %b
+  ret %sum
+plain:
+  ret %r
+}
+
+; ---------------------------------------------------------------------------
+; Input, output and files: the native functions of std.luna
+; ---------------------------------------------------------------------------
+;
+; `native read_line :: String?` in std.luna is given by @rt.read_line here:
+; a native function's runtime function has its name, takes its arguments
+; and returns its result as the compiler represents them (a string as its
+; pointer, a maybe value as a box). Arguments are borrowed: these functions
+; never free them.
+
+; Make sure the stdin buffer has unused bytes, reading more if needed:
+; 1 if it has, 0 at the end of the input. Whatever was printed is written
+; out first, so that a question shows before the program waits for its
+; answer.
+func @rt.in_fill() -> i64 {
+entry:
+  %buf = addr @rt.inbuf
+  %pos = load i64 %buf, 0
+  %len = load i64 %buf, 8
+  %one = iconst 1
+  %has = icmp slt %pos, %len
+  br %has, ready, refill
+ready:
+  ret %one
+refill:
+  call void @rt.flush()
+  %zero = iconst 0
+  %sixteen = iconst 16
+  %bytes = iadd %buf, %sixteen
+  %cap = iconst 4096
+  %n = call i64 @rt.sys_read(%zero, %bytes, %cap)
+  store i64 %buf, 0, %zero
+  %got = icmp sgt %n, %zero
+  br %got, filled, ended
+filled:
+  store i64 %buf, 8, %n
+  ret %one
+ended:
+  store i64 %buf, 8, %zero
+  ret %zero
+}
+
+; read_line: the next line of stdin without its line ending ("\n", or
+; "\r\n"), as a String? box; void at the end of the input.
+func @rt.read_line() -> i64 {
+entry:
+  %cell = alloca 16
+  call void @rt.sb_begin(%cell)
+  %zero = iconst 0
+  %one = iconst 1
+  %newline = iconst 10
+  %sixteen = iconst 16
+  jmp scan(%zero)
+; %got: whether the line has anything yet (a byte, or its "\n")
+scan(%got: i64):
+  %more = call i64 @rt.in_fill()
+  %at_end = icmp eq %more, %zero
+  br %at_end, end_of_input, search
+search:
+  %buf = addr @rt.inbuf
+  %pos = load i64 %buf, 0
+  %len = load i64 %buf, 8
+  %bytes = iadd %buf, %sixteen
+  %from = iadd %bytes, %pos
+  jmp find(%pos)
+find(%i: i64):
+  %inside = icmp slt %i, %len
+  br %inside, test, no_newline
+test:
+  %p = iadd %bytes, %i
+  %c = load u8 %p, 0
+  %is_newline = icmp eq %c, %newline
+  br %is_newline, found, next
+next:
+  %i_next = iadd %i, %one
+  jmp find(%i_next)
+no_newline:
+  ; the line goes on past what was read: keep it all and read more
+  %rest = isub %len, %pos
+  call void @rt.sb_append(%cell, %from, %rest)
+  store i64 %buf, 0, %len
+  jmp scan(%one)
+found:
+  %part = isub %i, %pos
+  call void @rt.sb_append(%cell, %from, %part)
+  %after = iadd %i, %one
+  store i64 %buf, 0, %after
+  jmp line
+end_of_input:
+  %nothing = icmp eq %got, %zero
+  br %nothing, no_line, line
+no_line:
+  %unused = load i64 %cell, 0
+  call void @rt.free(%unused)
+  %void_box = addr @rt.void_box
+  %eight = iconst 8
+  %v = iadd %void_box, %eight
+  ret %v
+line:
+  %s = load i64 %cell, 0
+  %n = load i64 %s, 0
+  %empty = icmp eq %n, %zero
+  br %empty, done, last
+last:
+  %last_at = iadd %s, %n
+  %last_byte = load u8 %last_at, 7
+  %return = iconst 13
+  %cr = icmp eq %last_byte, %return
+  br %cr, strip, done
+strip:
+  %shorter = isub %n, %one
+  store i64 %s, 0, %shorter
+  jmp done
+done:
+  %tag = iconst 3
+  %boxed = call i64 @rt.box(%tag, %s)
+  ret %boxed
+}
+
+; read_all: the rest of stdin, as a new string.
+func @rt.read_all() -> i64 {
+entry:
+  %cell = alloca 16
+  call void @rt.sb_begin(%cell)
+  %zero = iconst 0
+  %sixteen = iconst 16
+  jmp more
+more:
+  %has = call i64 @rt.in_fill()
+  %done = icmp eq %has, %zero
+  br %done, finish, take
+take:
+  %buf = addr @rt.inbuf
+  %pos = load i64 %buf, 0
+  %len = load i64 %buf, 8
+  %bytes = iadd %buf, %sixteen
+  %from = iadd %bytes, %pos
+  %n = isub %len, %pos
+  call void @rt.sb_append(%cell, %from, %n)
+  store i64 %buf, 0, %len
+  jmp more
+finish:
+  %s = load i64 %cell, 0
+  ret %s
+}
+
+; print: the string, without a newline.
+func @rt.print(%s: i64) {
+entry:
+  call void @rt.print_str(%s)
+  ret
+}
+
+; args: the program's arguments, as a new array of strings.
+func @rt.args() -> i64 {
+entry:
+  %a = call i64 @rt.sys_args()
+  ret %a
+}
+
+; read_file: the contents of the file at %path, as a String? box; void if
+; it cannot be opened or read.
+func @rt.read_file(%path: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %bad = iconst -1
+  %h = call i64 @rt.sys_open(%path, %zero)
+  %failed = icmp eq %h, %bad
+  br %failed, fail, start
+start:
+  %cell = alloca 16
+  call void @rt.sb_begin(%cell)
+  %chunk = addr @rt.filebuf
+  %size = iconst 4096
+  jmp read
+read:
+  %n = call i64 @rt.sys_read(%h, %chunk, %size)
+  %end = icmp eq %n, %zero
+  br %end, done, got
+got:
+  %error = icmp slt %n, %zero
+  br %error, broken, keep
+keep:
+  call void @rt.sb_append(%cell, %chunk, %n)
+  jmp read
+broken:
+  %closed_broken = call i64 @rt.sys_close(%h)
+  %unused = load i64 %cell, 0
+  call void @rt.free(%unused)
+  jmp fail
+done:
+  %closed = call i64 @rt.sys_close(%h)
+  %text = load i64 %cell, 0
+  %tag = iconst 3
+  %boxed = call i64 @rt.box(%tag, %text)
+  ret %boxed
+fail:
+  %void_box = addr @rt.void_box
+  %eight = iconst 8
+  %v = iadd %void_box, %eight
+  ret %v
+}
+
+; write_file: make the file at %path hold the string %text (creating it, or
+; replacing what it held): 1 if that worked, 0 if not.
+func @rt.write_file(%path: i64, %text: i64) -> i64 {
+entry:
+  %one = iconst 1
+  %bad = iconst -1
+  %h = call i64 @rt.sys_open(%path, %one)
+  %failed = icmp eq %h, %bad
+  br %failed, fail, write
+write:
+  %len = load i64 %text, 0
+  %eight = iconst 8
+  %bytes = iadd %text, %eight
+  %written = call i64 @rt.sys_write_file(%h, %bytes, %len)
+  %closed = call i64 @rt.sys_close(%h)
+  %ok = and %written, %closed
+  ret %ok
+fail:
+  %zero = iconst 0
+  ret %zero
+}
+
+; A new string with the bytes of the C string at %p, which end with a 0.
+func @rt.str_from_cstr(%p: i64) -> i64 {
+entry:
+  %zero = iconst 0
+  %one = iconst 1
+  jmp measure(%zero)
+measure(%n: i64):
+  %at = iadd %p, %n
+  %c = load u8 %at, 0
+  %ended = icmp eq %c, %zero
+  br %ended, copy, next
+next:
+  %n_next = iadd %n, %one
+  jmp measure(%n_next)
+copy:
+  %eight = iconst 8
+  %size = iadd %n, %eight
+  %s = call i64 @rt.alloc(%size)
+  store i64 %s, 0, %n
+  %dst = iadd %s, %eight
+  call void @rt.memcpy(%dst, %p, %n)
+  ret %s
+}
+
+; The bytes of string %s followed by a 0, as a new object: a C string, for
+; the operating system.
+func @rt.cstr(%s: i64) -> i64 {
+entry:
+  %len = load i64 %s, 0
+  %one = iconst 1
+  %size = iadd %len, %one
+  %c = call i64 @rt.alloc(%size)
+  %eight = iconst 8
+  %src = iadd %s, %eight
+  call void @rt.memcpy(%c, %src, %len)
+  %end = iadd %c, %len
+  %zero = iconst 0
+  store u8 %end, 0, %zero
+  ret %c
 }

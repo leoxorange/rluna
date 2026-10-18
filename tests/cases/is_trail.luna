@@ -1,0 +1,66 @@
+# `value :? Trail` says whether a value follows a trail, like Java's
+# `instanceof`. The trail is written as in a signature: `[Int]`, `Int?`, a
+# trail of the program, or one of a linked file. Every value follows Any.
+# `:?` only reads the value, so it is still usable after.
+| links/shop
+| links/shop#Item > Thing
+
+trail Fruit follow Show:
+    name :: String
+    textualize = copy name
+
+trail Apple follow Fruit:
+    crisp :: Boolean = true
+
+trail Rock:
+    weight :: Int
+
+# a parameter of any trail: compiled for each one it is given
+shows @x :: Any -> Boolean = x :? Show
+
+describe x = if x :? Numeric:
+    "a number"
+else if x :? String:
+    "a string"
+else:
+    "something else"
+
+# gives a String, a Float or an Int: which one is known only at run time
+pick n = check n:
+    0 -> "zero";
+    1 -> 1.5;
+    else -> n
+
+yes = "hello" :? String
+
+main =
+    echo ("hello" :? String)
+    echo ("hello" :? Int)
+    echo (5 :? Numeric)
+    echo (5 :? Float)
+    echo (1.5 :? Any)
+    echo (void :? Void)
+    echo yes
+    echo [[1, 2] :? [Int], [1, 2] :? [String], [1, 2] :? Iterable, [1, 2] :? Show]
+    echo ("abc" :? Iterable)
+    echo (1 + 2 :? Int)
+    h = head [1, 2]
+    echo [h :? Int, h :? Int?, h :? Void]
+    v = head (tail [3])
+    echo [v :? Int, v :? Int?, v :? Void]
+    loop i in [0..3]:
+        p = pick i
+        echo [p :? String, p :? Int, p :? Numeric, p :? Show, p :? Any]
+    a = Apple {name = "fuji"}
+    echo [a :? Apple, a :? Fruit, a :? Show, a :? Any, a :? Compare, a :? Rock]
+    r = Rock {weight = 3}
+    echo [r :? Show, r :? Fruit, r :? Any]
+    echo [shows a, shows r, shows 1]
+    echo describe 4
+    echo describe "x"
+    echo describe a
+    t = Thing {label = "pen"}
+    echo [t :? shop.Item, t :? Thing, t :? Fruit]
+    s = "kept"
+    echo (s :? String)
+    echo s

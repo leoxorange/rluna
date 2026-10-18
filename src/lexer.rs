@@ -28,6 +28,7 @@ pub enum TokenKind {
     Ident(String),
     // keywords
     Check,
+    If,
     Else,
     True,
     False,
@@ -36,6 +37,7 @@ pub enum TokenKind {
     In,
     Ret,
     Trail,
+    Native,
     // punctuation
     Assign,   // =
     EqEq,     // ==
@@ -53,6 +55,7 @@ pub enum TokenKind {
     Minus,    // -
     Star,     // *
     Slash,    // /
+    Percent,  // %
     LParen,   // (
     RParen,   // )
     LBracket, // [
@@ -64,11 +67,14 @@ pub enum TokenKind {
     FieldName(String),
     ColonColon, // ::
     Colon,      // :
-    Arrow,      // ->
-    Comma,      // ,
-    Semi,       // ;
-    At,         // @
-    Hash,       // # right after a path in a link line: `| entity#pred`
+    /// `:?`: whether a value follows a trail, `"hi" :? String`.
+    ColonQuestion,
+    Arrow,    // ->
+    Comma,    // ,
+    Semi,     // ;
+    At,       // @
+    Question, // ? after a trail: `String?`, a maybe type
+    Hash,     // # right after a path in a link line: `| entity#pred`
     Newline,
     Eof,
 }
@@ -81,6 +87,7 @@ impl TokenKind {
             TokenKind::Str(_) => "string literal".to_string(),
             TokenKind::Ident(n) => format!("identifier `{n}`"),
             TokenKind::Check => "`check`".into(),
+            TokenKind::If => "`if`".into(),
             TokenKind::Else => "`else`".into(),
             TokenKind::True => "`true`".into(),
             TokenKind::False => "`false`".into(),
@@ -89,6 +96,7 @@ impl TokenKind {
             TokenKind::In => "`in`".into(),
             TokenKind::Ret => "`ret`".into(),
             TokenKind::Trail => "`trail`".into(),
+            TokenKind::Native => "`native`".into(),
             TokenKind::LBrace => "`{`".into(),
             TokenKind::RBrace => "`}`".into(),
             TokenKind::FieldName(n) => format!("`.{n}`"),
@@ -108,16 +116,19 @@ impl TokenKind {
             TokenKind::Minus => "`-`".into(),
             TokenKind::Star => "`*`".into(),
             TokenKind::Slash => "`/`".into(),
+            TokenKind::Percent => "`%`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::LBracket => "`[`".into(),
             TokenKind::RBracket => "`]`".into(),
             TokenKind::ColonColon => "`::`".into(),
             TokenKind::Colon => "`:`".into(),
+            TokenKind::ColonQuestion => "`:?`".into(),
             TokenKind::Arrow => "`->`".into(),
             TokenKind::Comma => "`,`".into(),
             TokenKind::Semi => "`;`".into(),
             TokenKind::At => "`@`".into(),
+            TokenKind::Question => "`?`".into(),
             TokenKind::Hash => "`#`".into(),
             TokenKind::Newline => "end of line".into(),
             TokenKind::Eof => "end of file".into(),
@@ -304,6 +315,7 @@ impl<'a> Lexer<'a> {
                     // as a variable name: it never becomes an `Ident`.
                     let kind = match word {
                         "check" => TokenKind::Check,
+                        "if" => TokenKind::If,
                         "else" => TokenKind::Else,
                         "true" => TokenKind::True,
                         "false" => TokenKind::False,
@@ -312,6 +324,7 @@ impl<'a> Lexer<'a> {
                         "in" => TokenKind::In,
                         "ret" => TokenKind::Ret,
                         "trail" => TokenKind::Trail,
+                        "native" => TokenKind::Native,
                         _ => TokenKind::Ident(word.to_string()),
                     };
                     self.push(kind, start);
@@ -326,6 +339,7 @@ impl<'a> Lexer<'a> {
                         (b'<', b'=') => (TokenKind::Le, 2),
                         (b'>', b'=') => (TokenKind::Ge, 2),
                         (b':', b':') => (TokenKind::ColonColon, 2),
+                        (b':', b'?') => (TokenKind::ColonQuestion, 2),
                         (b'-', b'>') => (TokenKind::Arrow, 2),
                         (b'+', b'+') => (TokenKind::PlusPlus, 2),
                         (b'*', b'*') => (TokenKind::StarStar, 2),
@@ -339,6 +353,7 @@ impl<'a> Lexer<'a> {
                         (b'-', _) => (TokenKind::Minus, 1),
                         (b'*', _) => (TokenKind::Star, 1),
                         (b'/', _) => (TokenKind::Slash, 1),
+                        (b'%', _) => (TokenKind::Percent, 1),
                         (b'(', _) => (TokenKind::LParen, 1),
                         (b')', _) => (TokenKind::RParen, 1),
                         (b'[', _) => (TokenKind::LBracket, 1),
@@ -360,6 +375,7 @@ impl<'a> Lexer<'a> {
                         (b',', _) => (TokenKind::Comma, 1),
                         (b';', _) => (TokenKind::Semi, 1),
                         (b'@', _) => (TokenKind::At, 1),
+                        (b'?', _) => (TokenKind::Question, 1),
                         _ => {
                             let ch = self.text[start..].chars().next().unwrap();
                             return Err(Diagnostic::error(

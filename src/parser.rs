@@ -12,7 +12,7 @@
 //!   These are the only places where the amount of indentation matters.
 //!
 //! Expression precedence, loosest to tightest:
-//!   check  <  comparison  <  ++  <  + -  <  * / **  <  unary -  <  !!  <  application  <  atoms
+//!   check  <  comparison, :?  <  ++  <  + -  <  * / **  <  unary -  <  !!  <  application  <  atoms
 //!
 //! `echo` is applied like a function of one argument: `echo x`, `echo (a + b)`.
 //!
@@ -36,6 +36,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, Diagnostic> {
     Parser {
         toks: tokens,
         pos: 0,
+        lines: false,
     }
     .program()
 }
@@ -46,6 +47,12 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, Diagnostic> {
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    /// The innermost thing being parsed is a block (of a `loop` or an
+    /// `if`), not brackets: each of its lines is a statement, so a token
+    /// that starts a line ends the expression before it. Outside brackets
+    /// the newline token does that already; inside them (`echo (if c:`
+    /// ... `)`) there are no newline tokens, and only this says so.
+    lines: bool,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -53,6 +60,21 @@ type PResult<T> = Result<T, Diagnostic>;
 impl Parser {
     fn peek(&self) -> &TokenKind {
         &self.toks[self.pos].kind
+    }
+
+    /// The expression being parsed ends here: the current token starts
+    /// another line of a block (see `lines`).
+    fn line_ends(&self) -> bool {
+        self.lines && self.toks[self.pos].line_first
+    }
+
+    /// Parse what is inside brackets, where an expression may go on over
+    /// several lines.
+    fn bracketed<T>(&mut self, f: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        let lines = std::mem::replace(&mut self.lines, false);
+        let r = f(self);
+        self.lines = lines;
+        r
     }
 
     fn peek_at(&self, n: usize) -> &TokenKind {
@@ -168,6 +190,11 @@ impl Parser {
                 self.skip_newlines();
                 continue;
             }
+            if self.at_native() {
+                defs.push(self.native()?);
+                self.skip_newlines();
+                continue;
+            }
             if !self.at_def_start() {
                 let msg = if self.toks[self.pos].at_col0 {
                     "expected a definition (`name args = body`); top-level code must live inside a function such as `main`"
@@ -184,6 +211,24 @@ impl Parser {
             trails,
             defs,
         })
+    }
+
+    /// A line starting with `native` in column 1.
+    fn at_native(&self) -> bool {
+        let tok = &self.toks[self.pos];
+        tok.at_col0 && tok.kind == TokenKind::Native
+    }
+
+    /// `native name params :: signature`: a function the runtime gives,
+    /// so it has a signature and no body.
+    fn native(&mut self) -> PResult<Def> {
+        let start = self.bump().span;
+        if !matches!(self.peek(), TokenKind::Ident(_)) {
+            return Err(self.unexpected("the name of the native function"));
+        }
+        let mut def = self.def_after_name(true)?;
+        def.span = start.to(def.span);
+        Ok(def)
     }
 
     /// A line starting with `trail` in column 1.
@@ -268,7 +313,10 @@ impl Parser {
             if ty.is_none() && default.is_none() {
                 return Err(self.unexpected("`::` and the field's trail, or `=` and its value"));
             }
-            if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+            // (A default with a block, an `if`, ends where the block ends.)
+            if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof)
+                && !self.toks[self.pos].line_first
+            {
                 return Err(self.unexpected("end of line after the field"));
             }
             fields.push(Field {
@@ -315,7 +363,10 @@ impl Parser {
                 self.stmts(Some(col))?
             } else {
                 let e = self.expr()?;
-                if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+                // (A body with a block, an `if`, ends where the block ends.)
+                if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof)
+                    && !self.toks[self.pos].line_first
+                {
                     return Err(self.unexpected("end of line after the function"));
                 }
                 vec![Stmt::Expr(e)]
@@ -427,6 +478,12 @@ impl Parser {
     }
 
     fn def(&mut self) -> PResult<Def> {
+        self.def_after_name(false)
+    }
+
+    /// A definition from its name on; a `native` one ends after its
+    /// signature.
+    fn def_after_name(&mut self, native: bool) -> PResult<Def> {
         let start = self.span();
         let TokenKind::Ident(name) = self.bump().kind else {
             unreachable!()
@@ -459,8 +516,20 @@ impl Parser {
         } else {
             None
         };
-        self.expect(&TokenKind::Assign, "`=`")?;
-        let body = self.body()?;
+        let body = if native {
+            if sig.is_none() {
+                return Err(self.unexpected("`::` and the native function's signature"));
+            }
+            if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+                return Err(self.unexpected(
+                    "end of line: a native function has only a signature, the runtime gives its body",
+                ));
+            }
+            Block { stmts: Vec::new() }
+        } else {
+            self.expect(&TokenKind::Assign, "`=`")?;
+            self.body()?
+        };
         Ok(Def {
             name,
             name_span: start,
@@ -469,6 +538,7 @@ impl Parser {
             body,
             span: start.to(self.prev_span()),
             file: 0,
+            native,
         })
     }
 
@@ -553,9 +623,21 @@ impl Parser {
         }
     }
 
-    /// A trail in a signature or a field: `Int`, `Fruit`, `food.Fruit`, or
-    /// `[T]` for an array of `T`.
+    /// A trail in a signature or a field: `Int`, `Fruit`, `food.Fruit`,
+    /// `[T]` for an array of `T`, and `T?` for `T` or void.
     fn type_ann(&mut self) -> PResult<TypeAnn> {
+        let ann = self.plain_type_ann()?;
+        if !self.eat(&TokenKind::Question) {
+            return Ok(ann);
+        }
+        let span = ann.span.to(self.prev_span());
+        Ok(TypeAnn {
+            kind: TypeAnnKind::Maybe(Box::new(ann)),
+            span,
+        })
+    }
+
+    fn plain_type_ann(&mut self) -> PResult<TypeAnn> {
         let span = self.span();
         match self.peek().clone() {
             TokenKind::Ident(n) => {
@@ -628,9 +710,25 @@ impl Parser {
 
     /// Statements, one per line, up to the next definition or the end of the
     /// file. With `deeper_than`, only lines whose first token is indented
-    /// further than that column: the body of a `loop`.
+    /// further than that column: the body of a `loop`, or a block of an
+    /// `if`. Such a block also ends at a `)`, which closes the brackets
+    /// an `if` is in (`echo (if c:` ... `)`).
     fn stmts(&mut self, deeper_than: Option<usize>) -> PResult<Vec<Stmt>> {
         let mut stmts = Vec::new();
+        let closes = |kind: &TokenKind| deeper_than.is_some() && *kind == TokenKind::RParen;
+        let nested = self.lines || deeper_than.is_some();
+        let lines = std::mem::replace(&mut self.lines, nested);
+        let r = self.stmts_loop(deeper_than, &mut stmts, closes);
+        self.lines = lines;
+        r.map(|()| stmts)
+    }
+
+    fn stmts_loop(
+        &mut self,
+        deeper_than: Option<usize>,
+        stmts: &mut Vec<Stmt>,
+        closes: impl Fn(&TokenKind) -> bool,
+    ) -> PResult<()> {
         loop {
             self.skip_newlines();
             let tok = &self.toks[self.pos];
@@ -638,15 +736,19 @@ impl Parser {
                 || self.at_def_start()
                 || self.at_link()
                 || self.at_trail()
+                || self.at_native()
                 || deeper_than.is_some_and(|col| tok.col <= col)
+                || closes(&tok.kind)
             {
-                return Ok(stmts);
+                return Ok(());
             }
             let stmt = self.stmt()?;
-            // A loop ends where its body ends, at the start of a line;
-            // every other statement must end with its line.
-            if !matches!(stmt, Stmt::Loop { .. })
+            // Every statement ends with its line. One with a block (a
+            // `loop`, an `if`) ends where its block ends, at the start of
+            // a line.
+            if !self.toks[self.pos].line_first
                 && !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof)
+                && !closes(self.peek())
             {
                 return Err(self.unexpected("end of line"));
             }
@@ -660,6 +762,15 @@ impl Parser {
     fn stmt(&mut self) -> PResult<Stmt> {
         if self.peek() == &TokenKind::Loop {
             return self.loop_stmt();
+        }
+        if self.peek() == &TokenKind::Else
+            && matches!(self.peek_at(1), TokenKind::Colon | TokenKind::If)
+        {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                self.span(),
+                "this `else` belongs to no `if`: it goes on its own line, lined up with the line with its `if`",
+            ));
         }
         if let (TokenKind::Ident(name), TokenKind::Assign) = (self.peek().clone(), self.peek_at(1))
         {
@@ -747,6 +858,7 @@ impl Parser {
     fn expr(&mut self) -> PResult<Expr> {
         match self.peek() {
             TokenKind::Check => self.check(),
+            TokenKind::If => self.if_expr(),
             TokenKind::Ret => {
                 let start = self.bump().span;
                 // `ret` alone (end of line, `;`, `)`...) returns void.
@@ -807,6 +919,17 @@ impl Parser {
                         header,
                         "the arms of a `check` go on the following lines, each on its own line, indented further than the line with `check`",
                     )
+                } else if tok.line_first && tok.kind != TokenKind::Eof {
+                    // The line after the `;` is outside this check: the
+                    // arm before it was the last one.
+                    let mut k = self.pos - 1;
+                    while self.toks[k].kind == TokenKind::Newline {
+                        k -= 1;
+                    }
+                    (
+                        self.toks[k].span,
+                        "the last arm of a `check` has no `;` after it (a nested `check` ends without one too)",
+                    )
                 } else {
                     (
                         tok.span,
@@ -841,8 +964,27 @@ impl Parser {
             let pattern = self.comparison()?;
             self.expect(&TokenKind::Arrow, "`->`")?;
             let body = self.expr()?;
+            // An arm that ends with a nested `check` needs no `;`: that
+            // check's last arm has none, and the next line lined up with
+            // this check's arms is another arm of this check.
+            let nested = ends_in_check(&body);
             arms.push(Arm { pattern, body });
             if !self.eat(&TokenKind::Semi) {
+                let mut k = self.pos;
+                while self.toks[k].kind == TokenKind::Newline {
+                    k += 1;
+                }
+                let next = &self.toks[k];
+                if next.line_first && next.col == col && next.kind != TokenKind::Eof {
+                    if nested {
+                        continue;
+                    }
+                    return Err(Diagnostic::error(
+                        ErrorKind::SyntaxError,
+                        self.prev_span(),
+                        "expected `;` after this arm: the next line is another arm of the `check`",
+                    ));
+                }
                 break;
             }
         }
@@ -856,11 +998,106 @@ impl Parser {
         })
     }
 
+    /// `if cond:` and its block, the lines below indented further than the
+    /// line with `if`; then maybe `else:` and its block, with `else` lined
+    /// up with that line. `else if cond:` is an `else` whose block is
+    /// another `if`.
+    fn if_expr(&mut self) -> PResult<Expr> {
+        let indent = self.line_indent(self.pos);
+        let start = self.bump().span;
+        let cond = self.comparison()?;
+        self.expect(&TokenKind::Colon, "`:` after the condition of `if`")?;
+        let header = start.to(self.prev_span());
+        let then = self.if_block(indent, header, "`if`")?;
+        let tok = &self.toks[self.pos];
+        let has_else = tok.line_first
+            && tok.kind == TokenKind::Else
+            && tok.col == indent
+            && matches!(self.peek_at(1), TokenKind::Colon | TokenKind::If);
+        let else_block = if has_else {
+            let else_span = self.bump().span;
+            if self.peek() == &TokenKind::If {
+                Some(vec![Stmt::Expr(self.if_expr()?)])
+            } else {
+                self.bump(); // `:`
+                let header = else_span.to(self.prev_span());
+                Some(self.if_block(indent, header, "`else`")?)
+            }
+        } else {
+            None
+        };
+        Ok(Expr {
+            kind: ExprKind::If {
+                cond: Box::new(cond),
+                then,
+                else_block,
+            },
+            span: start.to(self.prev_span()),
+        })
+    }
+
+    /// The block after `if cond:` or `else:`: its lines are indented
+    /// further than `indent`, the line with `if`.
+    fn if_block(&mut self, indent: usize, header: Span, what: &str) -> PResult<Vec<Stmt>> {
+        // (In brackets there are no newline tokens: the next token starts
+        // a line.)
+        if self.peek() != &TokenKind::Newline && !self.toks[self.pos].line_first {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                self.span(),
+                format!(
+                    "the block of {what} goes on the following lines, indented further than the line with `if`"
+                ),
+            ));
+        }
+        let block = self.stmts(Some(indent))?;
+        if block.is_empty() {
+            return Err(Diagnostic::error(
+                ErrorKind::SyntaxError,
+                header,
+                format!(
+                    "{what} has no block: indent the lines below it further than the line with `if`"
+                ),
+            ));
+        }
+        Ok(block)
+    }
+
     /// Comparisons are *non-associative*: at most one per level. `a < b < c`
     /// is rejected because it would mean `(a < b) < c`, comparing a boolean
     /// with a number, which is almost never what the programmer meant.
+    ///
+    /// `value :? Trail` sits on the same level, and takes a trail on its
+    /// right, written as in a signature: `x + 1 :? Int` tests `x + 1`.
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.concat()?;
+        if self.line_ends() {
+            return Ok(lhs);
+        }
+        if self.eat(&TokenKind::ColonQuestion) {
+            let trail = self.type_ann()?;
+            if matches!(
+                self.peek(),
+                TokenKind::ColonQuestion
+                    | TokenKind::EqEq
+                    | TokenKind::NotEq
+                    | TokenKind::Lt
+                    | TokenKind::Le
+                    | TokenKind::Gt
+                    | TokenKind::Ge
+            ) {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    self.span(),
+                    "`:?` cannot be chained with another comparison; use parentheses",
+                ));
+            }
+            let span = lhs.span.to(trail.span);
+            return Ok(Expr {
+                kind: ExprKind::Is(Box::new(lhs), trail),
+                span,
+            });
+        }
         let op = match self.peek() {
             TokenKind::EqEq => BinOp::Eq,
             TokenKind::NotEq => BinOp::Ne,
@@ -874,7 +1111,8 @@ impl Parser {
         let rhs = self.concat()?;
         if matches!(
             self.peek(),
-            TokenKind::EqEq
+            TokenKind::ColonQuestion
+                | TokenKind::EqEq
                 | TokenKind::NotEq
                 | TokenKind::Lt
                 | TokenKind::Le
@@ -905,7 +1143,7 @@ impl Parser {
     /// `a ++ b`: below `+` and `-`, so `a ++ b + c` joins `a` with `b + c`.
     fn concat(&mut self) -> PResult<Expr> {
         let mut lhs = self.additive()?;
-        while self.eat(&TokenKind::PlusPlus) {
+        while !self.line_ends() && self.eat(&TokenKind::PlusPlus) {
             let rhs = self.additive()?;
             let span = lhs.span.to(rhs.span);
             lhs = Expr {
@@ -923,6 +1161,9 @@ impl Parser {
     fn additive(&mut self) -> PResult<Expr> {
         let mut lhs = self.multiplicative()?;
         loop {
+            if self.line_ends() {
+                return Ok(lhs);
+            }
             let op = match self.peek() {
                 TokenKind::Plus => BinOp::Add,
                 TokenKind::Minus => BinOp::Sub,
@@ -945,10 +1186,14 @@ impl Parser {
     fn multiplicative(&mut self) -> PResult<Expr> {
         let mut lhs = self.unary()?;
         loop {
+            if self.line_ends() {
+                return Ok(lhs);
+            }
             let op = match self.peek() {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::StarStar => BinOp::ElemMul,
                 TokenKind::Slash => BinOp::Div,
+                TokenKind::Percent => BinOp::Mod,
                 _ => return Ok(lhs),
             };
             self.bump();
@@ -1003,7 +1248,7 @@ impl Parser {
     /// element.
     fn index(&mut self) -> PResult<Expr> {
         let mut lhs = self.application()?;
-        while self.eat(&TokenKind::BangBang) {
+        while !self.line_ends() && self.eat(&TokenKind::BangBang) {
             let rhs = self.application()?;
             let span = lhs.span.to(rhs.span);
             lhs = Expr {
@@ -1019,9 +1264,10 @@ impl Parser {
     }
 
     fn starts_atom(&self) -> bool {
-        matches!(
-            self.peek(),
-            TokenKind::Int(_)
+        !self.line_ends()
+            && matches!(
+                self.peek(),
+                TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Str(_)
                 | TokenKind::Ident(_)
@@ -1032,7 +1278,7 @@ impl Parser {
                 | TokenKind::LBrace
                 // not an atom, but `f @x` gets `atom`'s explanation
                 | TokenKind::At
-        )
+            )
     }
 
     /// `f a b c`: a name followed by atoms. Arguments are parsed with
@@ -1238,13 +1484,13 @@ impl Parser {
     fn primary(&mut self) -> PResult<Expr> {
         let span = self.span();
         let kind = match self.peek().clone() {
-            TokenKind::LBrace => return self.record(),
+            TokenKind::LBrace => return self.bracketed(Self::record),
             TokenKind::Int(v) => ExprKind::Int(v),
             TokenKind::Float(v) => ExprKind::Float(v),
             TokenKind::Str(s) => ExprKind::Str(s),
             TokenKind::True => ExprKind::Bool(true),
             TokenKind::False => ExprKind::Bool(false),
-            TokenKind::LBracket => return self.bracket(),
+            TokenKind::LBracket => return self.bracketed(Self::bracket),
             // `void` is a type name in signatures and the void value here.
             TokenKind::Ident(n) if n == "void" => ExprKind::Void,
             TokenKind::Ident(n) => ExprKind::Name(n),
@@ -1254,7 +1500,7 @@ impl Parser {
                 // tree: `(1 + 2)` is just the `+` node, with a span widened
                 // to cover the parentheses for error messages.
                 self.bump();
-                let inner = self.expr()?;
+                let inner = self.bracketed(Self::expr)?;
                 self.expect(&TokenKind::RParen, "`)`")?;
                 return Ok(Expr {
                     kind: inner.kind,
@@ -1290,6 +1536,16 @@ fn plain(name: &str, span: Span) -> PResult<()> {
     Ok(())
 }
 
+/// Whether an arm body ends with a `check` or an `if` of its own (`ret
+/// check ...` too), whose arms or blocks are the last lines of the arm.
+fn ends_in_check(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Check { .. } | ExprKind::If { .. } => true,
+        ExprKind::Ret(Some(value)) => ends_in_check(value),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1320,6 +1576,20 @@ mod tests {
     }
 
     #[test]
+    fn if_else_blocks() {
+        // `else if` is an `else` whose block is another `if`; each `else`
+        // belongs to the `if` on the line it is lined up with.
+        let out = dump(&parse_src(
+            "f n = if n < 0:\n    1\nelse if n == 0:\n    if true:\n        2\n    else:\n        3\nelse:\n    x = 4\n    x\n",
+        ));
+        let want = "  (if (< n 0)\n    1\n  else\n    (if (== n 0)\n      (if true\n        2\n      else\n        3\n      )\n    else\n      (let x 4)\n      x\n    )\n  )";
+        assert!(out.contains(want), "{out}");
+        // without `else`, the statement after the block is the function's
+        let p = parse_src("main =\n    if true:\n        echo 1\n    echo 2\n");
+        assert_eq!(p.defs[0].body.stmts.len(), 2);
+    }
+
+    #[test]
     fn echo_takes_one_argument() {
         let out = dump(&parse_src("main = echo (5 > 6)"));
         assert!(out.contains("(echo (> 5 6))"), "{out}");
@@ -1345,6 +1615,13 @@ mod tests {
     }
 
     #[test]
+    fn is_trail() {
+        let p = parse_src("main = x + 1 :? [Int]?");
+        let out = dump(&p);
+        assert!(out.contains("(:? (+ x 1) [Int]?)"), "{out}");
+    }
+
+    #[test]
     fn signatures() {
         let p = parse_src(
             "sum a b :: numeric, numeric -> numeric = a + b + 5\nfoo :: boolean = 5 > 6\n",
@@ -1363,6 +1640,42 @@ mod tests {
                 .to_string(),
             "boolean"
         );
+    }
+
+    #[test]
+    fn native_definitions() {
+        let p = parse_src(
+            "f = 1\nnative read_line :: String?\nnative print @s :: String -> Void\ng = 2\n",
+        );
+        let names: Vec<(&str, bool)> = p.defs.iter().map(|d| (d.name.as_str(), d.native)).collect();
+        assert_eq!(
+            names,
+            [
+                ("f", false),
+                ("read_line", true),
+                ("print", true),
+                ("g", false)
+            ]
+        );
+        let ret = |i: usize| {
+            p.defs[i]
+                .sig
+                .as_ref()
+                .unwrap()
+                .ret
+                .as_ref()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(ret(1), "String?");
+        assert_eq!(ret(2), "Void");
+        assert!(p.defs[1].body.stmts.is_empty());
+        assert!(p.defs[2].params[0].borrowed);
+        // only a signature: no body, and no definition without one
+        for src in ["native f :: Int = 1\n", "native f x\n"] {
+            let tokens = crate::lexer::lex(src).unwrap();
+            assert!(parse(tokens).is_err(), "{src}");
+        }
     }
 
     #[test]

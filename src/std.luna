@@ -198,3 +198,131 @@ repeat @s n :: String, Int -> String =
     loop i in [0..n]:
         out = out + s
     out
+
+# -- input and output --------------------------------------------------------
+#
+# `native` functions have only a signature here: the runtime gives them
+# (`src/runtime/core.lir`, each through a function of the same name, such as
+# `rt.read_line`), since they reach outside the program. Like the rest of
+# the library, they borrow what they only read.
+
+# The next line of the input (stdin), without its line ending, or void
+# when the input has ended.
+native read_line :: String?
+
+# The rest of the input, all at once ("" when it has ended).
+native read_all :: String
+
+# Prints `s` as it is, without a newline after it (`echo` adds one).
+native print @s :: String -> Void
+
+# The arguments the program was started with (not the program's own name).
+native args :: [String]
+
+# What the file at `path` holds, or void if it cannot be read.
+native read_file @path :: String -> String?
+
+# Makes the file at `path` hold `text`, creating it or replacing what it
+# held: whether that worked.
+native write_file @path @text :: String, String -> Boolean
+
+# Ends the program right away, with `code` as its exit code (0 means it
+# went well).
+native exit code :: Int -> Void
+
+# The lines of `s`: the parts between the "\n"s, without a last empty one
+# when `s` ends with "\n". A "\r" is left out, so "\r\n" line endings work
+# too.
+lines @s :: String -> Array =
+    parts = []
+    current = ""
+    loop c in @s:
+        ends = c == "\n"
+        parts = check ends:
+            true -> parts ++ [copy current];
+            false -> parts
+        current = check ends:
+            true -> "";
+            false -> check c == "\r":
+                true -> current;
+                false -> current + c
+    check current == "":
+        true -> parts;
+        false -> parts ++ [current]
+
+# The whole number written in `s`, like "42", "-7" or "+3", or void if `s`
+# is not one.
+to_int @s :: String -> Int? =
+    n = 0
+    negative = false
+    digits = 0
+    loop i, c in @s:
+        d = index_of "0123456789" c
+        sign = check i:
+            0 -> index_of "+-" c;
+            else -> void
+        check d:
+            void -> check sign:
+                void -> ret void;
+                else -> void
+            else -> void
+        negative = check sign:
+            1 -> true;
+            else -> negative
+        n = check d:
+            void -> n;
+            else -> n * 10 + d
+        digits = check d:
+            void -> digits;
+            else -> digits + 1
+    check digits:
+        0 -> void;
+        else -> check negative:
+            true -> -n;
+            false -> n
+
+# The number written in `s`, like "3.25", "-0.5" or "42", as a float, or
+# void if `s` is not one.
+to_float @s :: String -> Float? =
+    m = 0
+    scale = 1.0
+    negative = false
+    digits = 0
+    dot = false
+    loop i, c in @s:
+        d = index_of "0123456789" c
+        sign = check i:
+            0 -> index_of "+-" c;
+            else -> void
+        point = check dot:
+            true -> false;
+            false -> c == "."
+        check d:
+            void -> check sign:
+                void -> check point:
+                    true -> void;
+                    else -> ret void
+                else -> void
+            else -> void
+        negative = check sign:
+            1 -> true;
+            else -> negative
+        m = check d:
+            void -> m;
+            else -> m * 10 + d
+        scale = check dot:
+            true -> check d:
+                void -> scale;
+                else -> scale * 10
+            false -> scale
+        digits = check d:
+            void -> digits;
+            else -> digits + 1
+        dot = check point:
+            true -> true;
+            false -> dot
+    check digits:
+        0 -> void;
+        else -> check negative:
+            true -> -(m / scale);
+            false -> m / scale

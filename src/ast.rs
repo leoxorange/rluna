@@ -84,7 +84,8 @@ pub struct Link {
     pub span: Span,
 }
 
-/// A top-level definition: `name params [:: signature] = body`.
+/// A top-level definition: `name params [:: signature] = body`, or
+/// `native name params :: signature`.
 #[derive(Debug, Clone)]
 pub struct Def {
     pub name: String,
@@ -93,6 +94,9 @@ pub struct Def {
     pub sig: Option<Signature>,
     pub body: Block,
     pub span: Span,
+    /// `native`: only a signature; the runtime gives the function (only
+    /// the standard library declares these). The body is empty.
+    pub native: bool,
     /// Which file it is in, when a program has several (see `driver`): an
     /// index into the per-file name tables given to `hir::resolve_files`.
     pub file: usize,
@@ -175,7 +179,8 @@ impl TypeName {
 }
 
 /// A trail written in a signature or a field: a name (`Int`, `Fruit`,
-/// `food.Fruit`), or an array of something (`[Fruit]`).
+/// `food.Fruit`), an array of something (`[Fruit]`), or either one or void
+/// (`String?`).
 #[derive(Debug, Clone)]
 pub struct TypeAnn {
     pub kind: TypeAnnKind,
@@ -186,6 +191,7 @@ pub struct TypeAnn {
 pub enum TypeAnnKind {
     Name(String),
     Array(Box<TypeAnn>),
+    Maybe(Box<TypeAnn>),
 }
 
 impl std::fmt::Display for TypeAnn {
@@ -193,6 +199,7 @@ impl std::fmt::Display for TypeAnn {
         match &self.kind {
             TypeAnnKind::Name(n) => f.write_str(n),
             TypeAnnKind::Array(inner) => write!(f, "[{inner}]"),
+            TypeAnnKind::Maybe(inner) => write!(f, "{inner}?"),
         }
     }
 }
@@ -251,6 +258,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// `a % b`: the remainder of `a / b`, with the sign of `b`.
+    Mod,
     Eq,
     Ne,
     Lt,
@@ -273,6 +282,7 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::Mod => "%",
             BinOp::Eq => "==",
             BinOp::Ne => "!=",
             BinOp::Lt => "<",
@@ -286,7 +296,10 @@ impl BinOp {
     }
 
     pub fn is_arith(self) -> bool {
-        matches!(self, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
+        matches!(
+            self,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+        )
     }
 }
 
@@ -320,6 +333,9 @@ pub enum ExprKind {
         rhs: Box<Expr>,
     },
     Neg(Box<Expr>),
+    /// `value :? Trail`: whether `value` follows the trail, like Java's
+    /// `instanceof`: `"hi" :? String` is true, and so is anything `:? Any`.
+    Is(Box<Expr>, TypeAnn),
     /// `ret value` / `ret`: leave the function now with `value` (or void).
     Ret(Option<Box<Expr>>),
     /// `[a, b, c]`.
@@ -355,6 +371,14 @@ pub enum ExprKind {
         scrutinee: Box<Expr>,
         arms: Vec<Arm>,
         else_arm: Option<Box<Expr>>,
+    },
+    /// `if cond:` with its indented block, and maybe `else:` with its
+    /// own. The last line of the block that runs is the value; without
+    /// `else`, a false condition gives void.
+    If {
+        cond: Box<Expr>,
+        then: Vec<Stmt>,
+        else_block: Option<Vec<Stmt>>,
     },
 }
 
@@ -495,6 +519,11 @@ fn dump_expr(out: &mut String, e: &Expr, indent: usize) {
             dump_expr(out, inner, indent);
             out.push(')');
         }
+        ExprKind::Is(value, trail) => {
+            out.push_str("(:? ");
+            dump_expr(out, value, indent);
+            write!(out, " {trail})").unwrap();
+        }
         ExprKind::Ret(value) => {
             out.push_str("(ret");
             if let Some(v) = value {
@@ -604,6 +633,22 @@ fn dump_expr(out: &mut String, e: &Expr, indent: usize) {
             }
             out.push(')');
         }
+        ExprKind::If {
+            cond,
+            then,
+            else_block,
+        } => {
+            out.push_str("(if ");
+            dump_expr(out, cond, indent);
+            out.push('\n');
+            dump_stmts(out, then, indent + 2);
+            if let Some(block) = else_block {
+                writeln!(out, "{}else", " ".repeat(indent)).unwrap();
+                dump_stmts(out, block, indent + 2);
+            }
+            out.push_str(&" ".repeat(indent));
+            out.push(')');
+        }
     }
 }
 
@@ -636,13 +681,84 @@ pub fn rename_globals(def: &mut Def, renames: &std::collections::HashMap<String,
 fn collect_variables(stmts: &[Stmt], out: &mut Vec<String>) {
     for stmt in stmts {
         match stmt {
-            Stmt::Let { name, .. } => out.push(name.clone()),
-            Stmt::Loop { pos, var, body, .. } => {
+            Stmt::Let { name, value, .. } => {
+                out.push(name.clone());
+                collect_block_variables(value, out);
+            }
+            Stmt::Loop {
+                pos,
+                var,
+                source,
+                body,
+                ..
+            } => {
                 out.extend(pos.iter().map(|(p, _)| p.clone()));
                 out.push(var.clone());
+                collect_block_variables(source, out);
                 collect_variables(body, out);
             }
-            Stmt::Expr(_) => {}
+            Stmt::Expr(e) => collect_block_variables(e, out),
+        }
+    }
+}
+
+/// The variables made in the blocks of the `if`s in `e`.
+fn collect_block_variables(e: &Expr, out: &mut Vec<String>) {
+    let mut go = |e: &Expr| collect_block_variables(e, out);
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Void
+        | ExprKind::Name(_) => {}
+        ExprKind::Call { args, .. } | ExprKind::Array(args) => args.iter().for_each(go),
+        ExprKind::Binary { lhs, rhs, .. } | ExprKind::Range(lhs, rhs) => {
+            go(lhs);
+            go(rhs);
+        }
+        ExprKind::Neg(x) | ExprKind::Echo(x) | ExprKind::Field(x, _, _) | ExprKind::Is(x, _) => {
+            go(x)
+        }
+        ExprKind::Ret(x) => x.iter().for_each(|x| go(x)),
+        ExprKind::Record(fields) => fields.iter().for_each(|(_, _, v)| go(v)),
+        ExprKind::Method { receiver, args, .. } => {
+            go(receiver);
+            args.iter().for_each(go);
+        }
+        ExprKind::Comprehension { body, clauses } => {
+            go(body);
+            for c in clauses {
+                match c {
+                    Clause::Gen { source, .. } => go(source),
+                    Clause::Guard(g) => go(g),
+                }
+            }
+        }
+        ExprKind::Check {
+            scrutinee,
+            arms,
+            else_arm,
+        } => {
+            go(scrutinee);
+            for arm in arms {
+                go(&arm.pattern);
+                go(&arm.body);
+            }
+            if let Some(e) = else_arm {
+                go(e);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then,
+            else_block,
+        } => {
+            go(cond);
+            collect_variables(then, out);
+            if let Some(block) = else_block {
+                collect_variables(block, out);
+            }
         }
     }
 }
@@ -692,7 +808,9 @@ fn rename_expr(e: &mut Expr, renames: &std::collections::HashMap<String, String>
             go(a);
             go(b);
         }
-        ExprKind::Neg(x) | ExprKind::Echo(x) | ExprKind::Field(x, _, _) => go(x),
+        ExprKind::Neg(x) | ExprKind::Echo(x) | ExprKind::Field(x, _, _) | ExprKind::Is(x, _) => {
+            go(x)
+        }
         ExprKind::Record(fields) => fields.iter_mut().for_each(|(_, _, v)| go(v)),
         ExprKind::Method { receiver, args, .. } => {
             go(receiver);
@@ -721,6 +839,16 @@ fn rename_expr(e: &mut Expr, renames: &std::collections::HashMap<String, String>
             }
             if let Some(e) = else_arm {
                 go(e);
+            }
+        }
+        ExprKind::If {
+            cond,
+            then,
+            else_block,
+        } => {
+            go(cond);
+            for s in then.iter_mut().chain(else_block.iter_mut().flatten()) {
+                rename_stmt(s, renames, vars);
             }
         }
     }

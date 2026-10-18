@@ -83,6 +83,7 @@ main =
     echo (last hi)
     later
     trails_chapter
+    is_trail_chapter
 
 # chapter 1: patterns, conditions, ret, maybe types
 add_up (x:xs) = x + add_up xs
@@ -96,6 +97,12 @@ first_negative a =
             true -> ret x;
             false -> void
     void
+abs_diff a b = if a > b:
+    a - b
+else:
+    b - a
+half n = if n % 2 == 0:
+    n / 2
 first_or_zero a =
     h = head a
     check h:
@@ -112,6 +119,9 @@ later =
     echo (7 / 2)
     echo (7 * 2)
     echo (1 + 0.5)
+    echo (7 % 3)
+    echo (-7 % 3)
+    echo (1 + 10 % 4 * 3)
     echo ("a" < "b")
     banner
     echo ([1, 2, 3] ** [4, 5])
@@ -124,6 +134,18 @@ later =
     echo [c | c in "héllo"]
     echo (add_up [1, 2, 3])
     echo (sign (-2))
+    n = 7
+    if n % 2 == 1:
+        echo "odd"
+    size = if n > 5:
+        "big"
+    else if n > 2:
+        "medium"
+    else:
+        "small"
+    echo size # big
+    echo (abs_diff 3 10)
+    echo (half 7)
     total = 0
     loop x in [1, 2, 3]:
         total = total + x
@@ -220,3 +242,21 @@ trails_chapter =
     echo Warehouse {rack = [buy 6, buy 1]}
     t = Test {}
     t.print "printed by a function of a trail"
+
+# chapter 1: `:?`, whether a value follows a trail
+trail Apple follow Fruit:
+    crisp :: Boolean = true
+
+is_trail_chapter =
+    echo ("hello" :? String)
+    echo ("hello" :? Int)
+    echo (5 :? Numeric)
+    echo ([1, 2] :? [Int])
+    a = Apple {name = "fuji"}
+    echo (a :? Fruit)
+    echo (a :? Show)
+    echo (a :? Compare)
+    h = head [1, 2]
+    echo (h :? Int)
+    echo (a :? Any)
+    echo ([1, 2] :? [Numeric])

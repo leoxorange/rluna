@@ -1,0 +1,36 @@
+# `a % b` on two ints: the remainder of `a / b`, with the sign of `b` (or
+# 0), like Haskell's `mod`. It binds like `*` and `/`. A trail gets `%` by
+# giving `mod`. `x % 0` stops the program.
+
+trail Clock follow Numeric:
+    h :: Int
+    add @other :: Self -> Self = Clock {h = (h + other.h) % 12}
+    sub @other :: Self -> Self = Clock {h = (h - other.h) % 12}
+    mul @other :: Self -> Self = Clock {h = (h * other.h) % 12}
+    div @other :: Self -> Self = Clock {h = h}
+    mod @other :: Self -> Self = Clock {h = h % other.h}
+    compare @other :: Self -> Int = h - other.h
+    textualize = h.textualize
+
+smallest = 0 - 9223372036854775807 - 1
+
+main =
+    # computed while compiling
+    echo (7 % 3)
+    echo (-7 % 3)
+    echo (7 % -3)
+    echo (-7 % -3)
+    echo (1 + 10 % 4 * 3)
+    # computed at run time
+    loop x in [7, -7, 6, -6]:
+        loop y in [3, -3]:
+            print ((x % y).textualize + " ")
+    echo ""
+    loop y in [1, -1]:
+        echo (smallest % y)
+    echo [i % 3 | i in [0..7]]
+    echo (Clock {h = 3} - Clock {h = 5})
+    echo (Clock {h = 11} % Clock {h = 4})
+    loop d in [2, 0]:
+        echo (5 % d)
+    echo "not reached"

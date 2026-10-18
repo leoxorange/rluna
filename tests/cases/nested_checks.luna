@@ -1,0 +1,44 @@
+# A check nested in an arm ends like any check: its last arm has no `;`,
+# and the next line lined up with the outer arms is another outer arm.
+
+f a b = check a:
+    true -> check b:
+        true -> "both";
+        false -> "only a"
+    false -> check b:
+        true -> "only b";
+        false -> "neither"
+
+# three levels, ending with else and with a plain arm
+g x y z = check x:
+    0 -> check y:
+        0 -> check z:
+            0 -> "000";
+            else -> "00z"
+        else -> "0y"
+    1 -> ret check y:
+        0 -> "10";
+        else -> "1y"
+    else -> "x"
+
+# the old style still works
+h n m = check n:
+    0 -> check m:
+        0 -> "00";
+        else -> "0m";
+    else -> "n"
+
+main =
+    echo (f true true)
+    echo (f true false)
+    echo (f false true)
+    echo (f false false)
+    echo (g 0 0 0)
+    echo (g 0 0 1)
+    echo (g 0 1 0)
+    echo (g 1 0 0)
+    echo (g 1 1 0)
+    echo (g 2 0 0)
+    echo (h 0 0)
+    echo (h 0 1)
+    echo (h 1 0)

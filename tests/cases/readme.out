@@ -44,6 +44,9 @@ o
 3.5
 14
 1.5
+1
+2
+7
 true
 welcome
 [4, 10, 3]
@@ -55,6 +58,10 @@ void
 ["h", "é", "l", "l", "o"]
 6
 negative
+odd
+big
+7
+void
 6
 0
 1
@@ -109,3 +116,13 @@ orange
 orange
 count:[[pineapple, grape]]
 printed by a function of a trail
+true
+false
+true
+true
+true
+true
+false
+true
+true
+true

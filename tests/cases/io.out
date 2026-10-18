@@ -1,0 +1,17 @@
+name? hello luna
+true
+15
+void
+0
+2
+a b
+true
+["one", "two", "", "three"]
+void
+false
+[42, -7, 3, 7, void, void, void, void, void]
+[3.25, -0.5, 12.0, 1.0, 0.5, void, void, void]
+[]
+["a"]
+["a"]
+["a", "", "b"]

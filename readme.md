@@ -13,6 +13,7 @@ luna is a haskell-like language. The key concept of luna is to use as few keywor
 ```
 lunac hello.luna                       # builds the executable `hello`
 lunac hello.luna -o out -r             # builds `out` and runs it
+lunac sum.luna -r -- a.txt b.txt       # runs it with the arguments a.txt and b.txt
 lunac hello.luna --target=windows-x64  # builds hello.exe for 64-bit Windows
 lunac hello.luna --emit=ast,ir,asm     # also writes the syntax tree, the IR and the machine code
 ```
@@ -39,9 +40,13 @@ foo :: Boolean = 5 > 6 # foo is false
 echo (7 / 2) # 3.5, `/` always gives a float
 echo (7 * 2) # 14, int with int stays an int for + - *
 echo (1 + 0.5) # 1.5, an int with a float gives a float
+echo (7 % 3) # 1, the remainder: `%` is for two ints
+echo (-7 % 3) # 2, the remainder has the sign of the right side, like haskell's mod
 ```
 
 `+` also joins two strings: `"con" + "cat"` is `"concat"`. Strings compare with `<` and `>` in alphabetical order.
+
+`%` binds like `*` and `/`: `1 + 10 % 4 * 3` is 7. Its result is between 0 and the right side, so `(i - 1) % 12` stays on a clock face even when `i` is 0. `x % 0` stops the program with a `ZeroDivisionError`.
 
 ### symbol definition
 
@@ -149,7 +154,43 @@ sign n = check n < 0:
     true -> "negative";
     false -> "not negative"
 ```
-A check can be nested inside a branch, with its branches indented further.
+A check can be nested inside a branch, with its branches indented further. The last branch of a check has no `;`, and a nested check ends the same way: the next line lined up with the outer branches is the next outer branch.
+```
+both a b = check a:
+    true -> check b:
+        true -> "both";
+        false -> "only a"
+    false -> "not a"
+```
+
+### if
+
+When there are only two situations, `check` is more than you need. `if` takes a boolean and runs one of two blocks:
+```
+abs_diff a b = if a > b:
+    a - b
+else:
+    b - a
+
+main =
+    n = 7
+    if n % 2 == 1:
+        echo "odd"
+    size = if n > 5:
+        "big"
+    else if n > 2:
+        "medium"
+    else:
+        "small"
+    echo size # big
+```
+
+- the block goes on the lines below `if cond:`, indented further than the line with `if`. `else:` goes on its own line, lined up with the line with `if`, and its block below it. `else if cond:` adds another condition.
+- the condition must be a Boolean. A maybe value (`Boolean?`) needs its void case handled by a `check` first.
+- like `check`, the last line of the block that runs is the value of the `if`. `else` can be left out when only the true case matters; then a false condition gives void, so `half n = if n % 2 == 0:` with `n / 2` below it gives a `Float?`.
+- a block is a scope of its own, like a loop body: the variables it creates exist only inside it. A variable from outside that it gives a new value keeps that value after the `if`: `if x > 0:` with `total = total + x` below it adds to `total`.
+- an `if` can be nested in a block, in a `check` arm, or put in brackets: `echo (if n > 4:` ... `)`.
+- an `if` in a list comprehension cannot give a variable a new value: a comprehension makes each element on its own.
 
 ### loop
 
@@ -304,7 +345,7 @@ this defines a trail Fruit, and the return type will be Fruit.
 - **echo.** `echo` prints a value with its `textualize`. A value whose trail does not follow Show prints its trail name (`Fruit`), with a warning.
 - **Copy.** `copy x` only accepts a value whose trail follows Copy, and copies it field by field, so every field must follow Copy too. Following Copy never changes what a program does: `y = x` still moves `x`. Only the embedded Int, Float, Boolean and Void are copied by themselves.
 - **Compare.** A trail that follows Compare gives `compare @other :: Self -> Int`, called on a value: `a.compare b` is -1 if `a` comes first, 0 if they are equal, 1 if `b` comes first. `<`, `<=`, `>`, `>=`, `==` and `!=` all come from it (`a < b` means `a.compare b < 0`), so only trails that follow Compare can be compared, or used as `check` patterns, and only with values of the same trail. An operator only reads its operands, which is why `other` is borrowed (`@other`). `Self` means the trail itself (or one that follows it).
-- **Numeric.** A trail that follows Numeric plays like a number: it gives `add`, `sub`, `mul` and `div` (each like `add @other :: Self -> Self`), `compare` and `textualize`, and then `a + b` means `a.add b`, for two values of the same trail. Still, only the embedded numbers are copied by themselves. For now, only the embedded trails follow Iterable and Array.
+- **Numeric.** A trail that follows Numeric plays like a number: it gives `add`, `sub`, `mul` and `div` (each like `add @other :: Self -> Self`), `compare` and `textualize`, and then `a + b` means `a.add b`, for two values of the same trail. A trail that also gives `mod @other :: Self -> Self` can use `%` (`a % b` means `a.mod b`); Numeric does not ask for it. Still, only the embedded numbers are copied by themselves. For now, only the embedded trails follow Iterable and Array.
 - **not yet.** A trail follows others only in its own `trail ... follow ...:` line; giving an existing trail (like String) a new trail elsewhere will come later.
 
 the trail name must be unique in current scope, can not have same identical name with any other external or internal trail or functions.
@@ -353,7 +394,41 @@ first_or_zero a =
         void -> 0;
         else -> h # here h is an Int, not an Int?
 ```
-`void ->` only matches void. Maybe types cannot be written in type definitions yet.
+`void ->` only matches void.
+
+A maybe type can be written too, with `?` after an embedded trail: `half n :: Int -> Int?` may give void, `or_zero x :: Int? -> Int` accepts void, and a field `nickname :: String?` may hold void. A trail of your own cannot take a `?` yet (`Fruit?` will come later).
+
+#### does a value follow a trail? `:?`
+
+`value :? Trail` is true when the value follows the trail, like `instanceof` in Java. Every value follows Any, so `anything :? Any` is always true.
+```
+trail Fruit follow Show:
+    name :: String
+    textualize = copy name
+
+trail Apple follow Fruit:
+    crisp :: Boolean = true
+
+main =
+    echo ("hello" :? String) # true
+    echo ("hello" :? Int) # false
+    echo (5 :? Numeric) # true
+    echo ([1, 2] :? [Int]) # true
+    a = Apple {name = "fuji"}
+    echo (a :? Fruit) # true: Apple follows Fruit
+    echo (a :? Show) # true: Fruit follows Show
+    echo (a :? Compare) # false
+    h = head [1, 2]
+    echo (h :? Int) # true: h is an Int? that holds 1
+    echo (a :? Any) # true: everything follows Any
+```
+
+- the trail on the right is written as in a signature: an embedded trail (`Int`, `Numeric`, `Show`, `Iterable`, ...), a trail of the program (`Fruit`, or `food.Fruit` from a linked file), an array (`[Int]`) or a maybe type (`Int?`).
+- a value follows its own trail and every trail that trail follows, as its `follow` line (or `src/std.luna`, for the embedded ones) says. An array follows `[T]` when its elements are declared as `T`s, not when they only happen to be: `[1, 2] :? [Numeric]` is true, but an array of `Int?` is not `:? [Int]`, even with no void in it.
+- the compiler knows the answer for most values. Only a value that may be of several trails, like the `Int?` above or a `check` that gives a string or a number, is tested while the program runs.
+- `:?` only reads the value, like `==`: after `s :? String`, `s` is still usable.
+- `:?` binds like `==`, and cannot be chained with it: `x + 1 :? Int` tests `x + 1`, and `x :? Int == true` needs parentheses.
+- it does not change what a variable is: after `check x :? Int:` with `true -> ...`, `x` keeps its type in that branch.
 
 ### multiple files and how to link them
 
@@ -553,3 +628,48 @@ These functions are written in luna itself (`src/std.luna`) and come with every 
 "borrowed" means the caller keeps the array (`@a`); "taken" means it moves in, because the result is made of its elements.
 
 The functions that compare values (`max`, `min`, `maximum`, `minimum`, `contains`, `count`, `index_of`, `remove`) work for every trail that follows Compare, the ones a program defines too: `max (Money {cents = 150}) (Money {cents = 999})`. The ones that add up numbers (`sum`, `product`, `average`, `abs`) start from 0 or 1, so they are for the embedded numbers.
+
+### input and output
+
+A program reads its input, its arguments and files, and writes files, with these functions:
+
+| function | what it gives |
+|---|---|
+| `read_line` | the next line of the input (stdin), without its line ending, or void when the input has ended |
+| `read_all` | the rest of the input, all at once |
+| `print s` | prints the string `s` without a newline after it (`echo` adds one) |
+| `args` | the arguments the program was started with, as an array of strings (not the program's own name) |
+| `read_file path` | what the file at `path` holds, or void if it cannot be read |
+| `write_file path text` | makes the file at `path` hold `text`, creating it or replacing what it held: whether that worked |
+| `exit code` | ends the program right away, with `code` as its exit code (0 means it went well) |
+| `lines s` | the lines of `s`: `lines "a\nb\n"` is `["a", "b"]` (`\r\n` line endings work too) |
+| `to_int s`, `to_float s` | the number written in `s`, or void if it is not one: `to_int "-42"` is -42, `to_float "2.5"` is 2.5 |
+
+```
+main =
+    print "what is your name? "
+    name = read_line
+    check name:
+        void -> echo "goodbye";
+        else -> echo ("hello " + name)
+```
+What the program printed shows before it waits for input, so the question is there before you type the answer. `read_line`, `read_file`, `to_int` and `to_float` may give void, so a `check` handles that before the value is used (see "void and maybe types"). Paths start at the folder the program runs in.
+
+```
+# sum.luna: the total of the numbers in each file it is given, one per line
+number s =
+    n = to_int s
+    check n:
+        void -> 0;
+        else -> n
+
+main =
+    loop path in args:
+        text = read_file path
+        check text:
+            void -> echo ("cannot read " + path);
+            else -> echo (sum [number line | line in lines text])
+```
+`lunac sum.luna -r -- a.txt b.txt` builds it and runs it with the arguments `a.txt` and `b.txt`.
+
+`read_line`, `read_all`, `print`, `args`, `read_file`, `write_file` and `exit` reach outside the program, so the runtime gives them: `src/std.luna` declares them with `native` in front, as a signature without a body (`native read_line :: String?`). Only the standard library can declare native functions. `lines`, `to_int` and `to_float` are written in luna, like the rest of the library.

@@ -1,6 +1,9 @@
 //! End-to-end tests: compile every `tests/cases/*.luna` for the host, run
 //! the executable and compare its stdout with `<name>.out` (and stderr with
 //! `<name>.err`, in which case the program must exit with code 1).
+//! A case may give the program its input in `<name>.in` and its arguments,
+//! one per line, in `<name>.args`, where `$OUT` is a folder for the files
+//! it writes.
 //!
 //! Each program is also compiled a second time from its own emitted `.lir`,
 //! which checks that the IR printer and parser round-trip.
@@ -8,8 +11,9 @@
 //! A case can also be a hand-written `tests/cases/*.lir` program, for
 //! testing the runtime directly; it is compiled once, as written.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use rluna::diag::SourceFile;
 use rluna::driver::{self, Input, Options};
@@ -31,9 +35,34 @@ fn case_file(path: &str) -> Option<String> {
     .ok()
 }
 
-fn run_exe(exe: &[u8], path: &Path) -> (String, String, i32) {
+/// What a case gives the program it runs: `<name>.in` and `<name>.args`.
+fn case_inputs(luna: &Path) -> (Vec<u8>, Vec<String>) {
+    let input = std::fs::read(luna.with_extension("in")).unwrap_or_default();
+    let out = out_dir().display().to_string();
+    let args = std::fs::read_to_string(luna.with_extension("args"))
+        .unwrap_or_default()
+        .lines()
+        .map(|a| a.replace("$OUT", &out))
+        .collect();
+    (input, args)
+}
+
+fn run_exe(
+    exe: &[u8],
+    path: &Path,
+    (input, args): &(Vec<u8>, Vec<String>),
+) -> (String, String, i32) {
     driver::write_executable(path, exe).unwrap();
-    let out = Command::new(path).output().unwrap();
+    let mut child = Command::new(path)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // A program may end without reading all of its input.
+    let _ = child.stdin.take().unwrap().write_all(input);
+    let out = child.wait_with_output().unwrap();
     (
         String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"),
         String::from_utf8_lossy(&out.stderr).replace("\r\n", "\n"),
@@ -89,9 +118,14 @@ fn check_case(luna: &Path) -> Result<(), String> {
 
     let dir = out_dir();
     let exe_path = |stem: String| dir.join(stem).with_extension(opts.target.exe_extension());
+    let inputs = case_inputs(luna);
     check(
         "luna",
-        run_exe(artifacts.exe.as_ref().unwrap(), &exe_path(name.clone())),
+        run_exe(
+            artifacts.exe.as_ref().unwrap(),
+            &exe_path(name.clone()),
+            &inputs,
+        ),
     )?;
     if is_lir {
         return Ok(());
@@ -105,6 +139,7 @@ fn check_case(luna: &Path) -> Result<(), String> {
         run_exe(
             again.exe.as_ref().unwrap(),
             &exe_path(format!("{name}-lir")),
+            &inputs,
         ),
     )?;
     Ok(())
@@ -184,6 +219,22 @@ fn compile_errors() {
             "the function is declared to return Int",
         ),
         ("PI = 3\nmain = echo PI", "`PI` is a built-in constant"),
+        (
+            "native now :: Int\nmain = echo now",
+            "only the standard library can declare native functions",
+        ),
+        (
+            "main = print read_line",
+            "argument 1 of `print` is String?, which may be void",
+        ),
+        (
+            "trail F:\n    x :: Int = 1\nf a :: F? -> Int = 1\nmain = echo (f void)",
+            "`F?` cannot be written yet",
+        ),
+        (
+            "f x :: Int -> Int? = \"s\"\nmain = echo (f 1)",
+            "`f` is declared to return Int?",
+        ),
         ("main = echo (len 5)", "`len` takes an array or a string"),
         (
             "main = echo (head [1] [2])",
@@ -202,6 +253,47 @@ fn compile_errors() {
             "`s` is moved in a list comprehension",
         ),
         (
+            "main =\n    if 5:\n        echo 1",
+            "the condition of `if` must be a Boolean, but this is Int",
+        ),
+        (
+            "main =\n    if true:\n        y = 1\n    echo y",
+            "cannot find symbol `y`",
+        ),
+        (
+            "f n :: Int -> Int = if n > 0:\n    1\nmain = echo (f 1)",
+            "`f` is declared to return Int, but this is Int?",
+        ),
+        (
+            "main =\n    if true: echo 1",
+            "the block of `if` goes on the following lines",
+        ),
+        ("main =\n    if true:\n    echo 1", "`if` has no block"),
+        (
+            "main =\n    if true:\n        echo 1\n        else:\n        echo 2",
+            "this `else` belongs to no `if`",
+        ),
+        (
+            "main =\n    t = 0\n    echo [(if x > 1:\n        t = x\n    else:\n        0) | x in [1, 2]]",
+            "a list comprehension cannot give `t` a new value",
+        ),
+        (
+            "main =\n    s = \"a\"\n    if true:\n        t = s\n    echo s",
+            "`s` is used after its value was moved",
+        ),
+        (
+            "trail A:\n    x :: Int\ntrail B:\n    y :: Int\nmain = echo (if true:\n    A {x = 1}\nelse:\n    B {y = 2})",
+            "the blocks of this `if` give A and B",
+        ),
+        (
+            "main = echo (7.5 % 2)",
+            "operator `%` cannot be applied to Float and Int",
+        ),
+        (
+            "trail Box follow Numeric:\n    x :: Int\n    add @other :: Self -> Self = Box {x = x}\n    sub @other :: Self -> Self = Box {x = x}\n    mul @other :: Self -> Self = Box {x = x}\n    div @other :: Self -> Self = Box {x = x}\n    compare @other :: Self -> Int = 0\n    textualize = \"box\"\nmain = echo (Box {x = 1} % Box {x = 2})",
+            "`%` on `Box` values calls its `mod @other :: Self -> Self`",
+        ),
+        (
             "main = echo ([1, 2] !! \"a\")",
             "the position in `!!` must be an int",
         ),
@@ -216,6 +308,14 @@ fn compile_errors() {
         (
             "f n = check n:\n    1 -> 1; else -> 2\nmain = echo (f 1)",
             "expected another arm of the `check` after `;`",
+        ),
+        (
+            "f a b = check a:\n    true -> check b:\n        true -> 1;\n        false -> 2;\n    false -> 3\nmain = echo (f true true)",
+            "the last arm of a `check` has no `;` after it",
+        ),
+        (
+            "f n = check n:\n    1 -> 1\n    else -> 2\nmain = echo (f 1)",
+            "expected `;` after this arm",
         ),
         (
             "f n = check n:\n    else -> 1;\n    1 -> 2\nmain = echo (f 1)",
@@ -536,6 +636,15 @@ fn compile_errors() {
             "`s` is used after its value was moved",
         ),
         ("f a = a\nmain = f 1 2", "called with 2 argument(s)"),
+        ("main = echo (1 :? Nope)", "cannot find the trail `Nope`"),
+        (
+            "main = echo (1 :? Int == true)",
+            "`:?` cannot be chained with another comparison",
+        ),
+        (
+            "main = echo (1 == 1 :? Boolean)",
+            "comparison operators cannot be chained",
+        ),
         ("main = echo (1 + 2", "SyntaxError"),
         (
             "echo 5\nmain = 1",
@@ -760,6 +869,7 @@ entry:
             &out_dir()
                 .join(format!("{name}-leaks"))
                 .with_extension(Target::default().exe_extension()),
+            &case_inputs(luna),
         );
         let live = out.lines().last().unwrap_or_default();
         if code != 0 || live != "0" {

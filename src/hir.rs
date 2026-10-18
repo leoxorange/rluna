@@ -263,6 +263,9 @@ pub struct Func {
     /// For each parameter, whether it is borrowed (`@a`). All definitions
     /// with the same name and number of parameters agree on this.
     pub borrowed: Vec<bool>,
+    /// A `native` function: the runtime function that gives it
+    /// (`rt.read_line`). Its body is empty.
+    pub native: Option<String>,
 }
 
 /// A clause of a list comprehension.
@@ -339,6 +342,13 @@ pub enum HExprKind {
         rhs: Box<HExpr>,
     },
     Neg(Box<HExpr>),
+    /// `value :? Trail`: whether the value follows the trail. `ty` and
+    /// `bound` are what a parameter declared with that trail would have.
+    Is {
+        value: Box<HExpr>,
+        ty: Ty,
+        bound: Option<String>,
+    },
     /// `ret value` / `ret`.
     Ret(Option<Box<HExpr>>),
     /// A call of a built-in function, which takes one argument.
@@ -355,6 +365,20 @@ pub enum HExprKind {
         scrutinee: Box<HExpr>,
         arms: Vec<(HExpr, HExpr)>,
         else_arm: Option<Box<HExpr>>,
+        /// Variables from outside the `check` that its arms give new
+        /// values (in the blocks of `if`s): after it, they hold the value
+        /// the arm that ran left.
+        carried: Vec<LocalId>,
+        /// Written as `if cond:` (with `else:`): `true ->` the first block,
+        /// `else ->` the other one, or void.
+        is_if: bool,
+    },
+    /// The block of an `if` or an `else`: statements, the last of which
+    /// gives the value (void if it is not an expression).
+    Block {
+        stmts: Vec<HStmt>,
+        /// Variables that exist only inside the block.
+        inner: Vec<LocalId>,
     },
     /// A value of a trail. `steps` evaluate the fields into variables of
     /// their own (the fields given, in the order written, then the defaults
@@ -384,13 +408,26 @@ fn embedded_trail(name: &str) -> bool {
 
 /// The trail a written trail name means: an embedded one, or one the
 /// program defines (looked up like a function name, see `FileNames`).
+/// `library` says whether the trail with a global name is one of the
+/// standard library's, or `None` if there is no such trail.
 fn resolve_ty(
     ann: &ast::TypeAnn,
     names: Option<&FileNames>,
-    trails: &HashMap<String, &ast::Trail>,
+    library: &dyn Fn(&str) -> Option<bool>,
 ) -> Result<Ty, Diagnostic> {
     match &ann.kind {
-        ast::TypeAnnKind::Array(inner) => Ok(Ty::array(resolve_ty(inner, names, trails)?)),
+        ast::TypeAnnKind::Array(inner) => Ok(Ty::array(resolve_ty(inner, names, library)?)),
+        // A trail others follow would need its followers and void (not yet).
+        ast::TypeAnnKind::Maybe(inner) => match &inner.kind {
+            ast::TypeAnnKind::Name(n) if TypeName::parse(n).is_none() => Err(Diagnostic::error(
+                ErrorKind::TypeError,
+                ann.span,
+                format!(
+                    "`{n}?` cannot be written yet: `?` works after the embedded trails (`Int?`, `String?`, `[Fruit]?`, ...)"
+                ),
+            )),
+            _ => Ok(resolve_ty(inner, names, library)?.union(Ty::VOID)),
+        },
         ast::TypeAnnKind::Name(n) => {
             if let Some(t) = TypeName::parse(n) {
                 return Ok(Ty::from_name(t));
@@ -402,12 +439,12 @@ fn resolve_ty(
                     .global(n)
                     .map_err(|m| Diagnostic::error(ErrorKind::SymbolNotFoundError, ann.span, m))?,
             };
-            match trails.get(&global) {
+            match library(&global) {
                 // An embedded trail such as Show, as the trail of a field:
                 // any value (one that follows it, in a signature, see
                 // `bound_of`).
-                Some(t) if t.library => Ok(Ty::ANY),
-                Some(_) => Ok(Ty::record(&global)),
+                Some(true) => Ok(Ty::ANY),
+                Some(false) => Ok(Ty::record(&global)),
                 None => Err(Diagnostic::error(
                     ErrorKind::SymbolNotFoundError,
                     ann.span,
@@ -765,7 +802,8 @@ fn used_locals(e: &HExpr, out: &mut Vec<LocalId>) {
         HExprKind::Neg(x)
         | HExprKind::Echo(x)
         | HExprKind::Builtin(_, x)
-        | HExprKind::Field(x, _, _) => go(x),
+        | HExprKind::Field(x, _, _)
+        | HExprKind::Is { value: x, .. } => go(x),
         HExprKind::Ret(x) => x.iter().for_each(|x| go(x)),
         HExprKind::Comprehension { body, clauses } => {
             for c in clauses {
@@ -780,6 +818,7 @@ fn used_locals(e: &HExpr, out: &mut Vec<LocalId>) {
             scrutinee,
             arms,
             else_arm,
+            ..
         } => {
             go(scrutinee);
             for (p, b) in arms {
@@ -790,10 +829,24 @@ fn used_locals(e: &HExpr, out: &mut Vec<LocalId>) {
                 go(e);
             }
         }
+        HExprKind::Block { stmts, .. } => used_locals_stmts(stmts, out),
         HExprKind::Construct { steps, .. } => steps.iter().for_each(|(_, v)| go(v)),
         HExprKind::MethodCall { receiver, args, .. } => {
             go(receiver);
             args.iter().for_each(go);
+        }
+    }
+}
+
+/// The ids of the variables these statements read.
+fn used_locals_stmts(stmts: &[HStmt], out: &mut Vec<LocalId>) {
+    for s in stmts {
+        match s {
+            HStmt::Let { value, .. } | HStmt::Expr(value) => used_locals(value, out),
+            HStmt::Loop { source, body, .. } => {
+                used_locals(source, out);
+                used_locals_stmts(body, out);
+            }
         }
     }
 }
@@ -861,7 +914,7 @@ fn bound_of(
         // values that follow it.
         ast::TypeAnnKind::Name(n) if n == "Any" || n == "Iterable" => None,
         ast::TypeAnnKind::Name(n) => trail_name(n, file),
-        ast::TypeAnnKind::Array(_) => None,
+        ast::TypeAnnKind::Array(_) | ast::TypeAnnKind::Maybe(_) => None,
     }
 }
 
@@ -948,7 +1001,8 @@ pub fn resolve_files(
             }
         }
     }
-    let ann_ty = |ann: &ast::TypeAnn, file: usize| resolve_ty(ann, files.get(file), &trail_defs);
+    let library = |global: &str| trail_defs.get(global).map(|t| t.library);
+    let ann_ty = |ann: &ast::TypeAnn, file: usize| resolve_ty(ann, files.get(file), &library);
     // The trail a name in `file` means, if it names one.
     let trail_name = |n: &str, file: usize| -> Option<String> {
         let global = match files.get(file) {
@@ -1279,6 +1333,22 @@ pub fn resolve_files(
             .collect();
         let body = r.body(&def.body.stmts);
         errors.append(&mut r.errors);
+        let native = def.native.then(|| {
+            // The runtime cannot guess types: every one is written.
+            let sig = def.sig.as_ref();
+            if sig.is_none_or(|s| s.ret.is_none() || patterns.iter().any(Option::is_some)) {
+                errors.push(Diagnostic::error(
+                    ErrorKind::DefinitionError,
+                    def.name_span,
+                    format!(
+                        "the native function `{}` must declare the trails of its parameters and its result, and cannot take arrays apart",
+                        def.name
+                    ),
+                ));
+            }
+            let written = def.name.strip_prefix("std.").unwrap_or(&def.name);
+            format!("rt.{written}")
+        });
         funcs.push(Func {
             name: def.name.clone(),
             name_span: def.name_span,
@@ -1296,6 +1366,7 @@ pub fn resolve_files(
             local_names: r.local_names,
             patterns,
             borrowed,
+            native,
         });
     }
     // Then the default functions themselves.
@@ -1357,6 +1428,7 @@ pub fn resolve_files(
                 local_names: r.local_names,
                 patterns: vec![None; n],
                 borrowed: vec![true; n],
+                native: None,
             });
         }
     }
@@ -1452,6 +1524,7 @@ pub fn resolve_files(
                 local_names: r.local_names,
                 patterns,
                 borrowed,
+                native: None,
             });
         }
     }
@@ -1698,6 +1771,46 @@ impl<'a> Resolver<'a> {
                 })
             }
         }
+    }
+
+    /// The block of an `if` or an `else`, a scope of its own like a loop
+    /// body. Its last expression is its value, so a `{...}` there is a
+    /// value of `expect`.
+    fn block(&mut self, stmts: &[Stmt], expect: Option<Ty>, span: Span) -> HExpr {
+        let visible = self.locals.len();
+        let first_inner = self.local_names.len();
+        let mut out = Vec::new();
+        if let Some((last, rest)) = stmts.split_last() {
+            out = self.stmts(rest);
+            match last {
+                Stmt::Expr(e) => match self.expr_in(e, expect) {
+                    Ok(e) => out.push(HStmt::Expr(e)),
+                    Err(e) => self.errors.push(e),
+                },
+                _ => out.extend(self.stmts(std::slice::from_ref(last))),
+            }
+        }
+        self.locals.truncate(visible);
+        HExpr {
+            kind: HExprKind::Block {
+                stmts: out,
+                inner: (first_inner..self.local_names.len()).collect(),
+            },
+            span,
+        }
+    }
+
+    /// The variables that existed before `first_new` and were given a
+    /// value since `self.assigned[assigned]`.
+    fn carried_since(&self, first_new: usize, assigned: usize) -> Vec<LocalId> {
+        let mut carried: Vec<LocalId> = self.assigned[assigned..]
+            .iter()
+            .copied()
+            .filter(|&id| id < first_new)
+            .collect();
+        carried.sort();
+        carried.dedup();
+        carried
     }
 
     fn clauses(&mut self, clauses: &[ast::Clause]) -> Result<Vec<HClause>, Diagnostic> {
@@ -2110,6 +2223,20 @@ impl<'a> Resolver<'a> {
                 rhs: Box::new(self.expr(rhs)?),
             },
             ExprKind::Neg(inner) => HExprKind::Neg(Box::new(self.expr(inner)?)),
+            ExprKind::Is(value, trail) => {
+                let library = |global: &str| self.trails.get(global).map(|t| t.library);
+                let ty = resolve_ty(trail, self.names, &library)?;
+                let trail_name = |n: &str, _| {
+                    let global = self.global(n, trail.span).ok()?;
+                    self.trails.contains_key(&global).then_some(global)
+                };
+                let bound = bound_of(trail, &trail_name, 0);
+                HExprKind::Is {
+                    value: Box::new(self.expr(value)?),
+                    ty,
+                    bound,
+                }
+            }
             ExprKind::Ret(value) => HExprKind::Ret(match value {
                 Some(v) => Some(Box::new(self.expr_in(v, self.ret)?)),
                 None => None,
@@ -2146,17 +2273,54 @@ impl<'a> Resolver<'a> {
                 scrutinee,
                 arms,
                 else_arm,
-            } => HExprKind::Check {
-                scrutinee: Box::new(self.expr(scrutinee)?),
-                arms: arms
+            } => {
+                let scrutinee = Box::new(self.expr(scrutinee)?);
+                let (first_new, assigned) = (self.local_names.len(), self.assigned.len());
+                let arms = arms
                     .iter()
                     .map(|a| Ok((self.expr(&a.pattern)?, self.expr_in(&a.body, expect)?)))
-                    .collect::<Result<_, Diagnostic>>()?,
-                else_arm: match else_arm {
+                    .collect::<Result<_, Diagnostic>>()?;
+                let else_arm = match else_arm {
                     Some(e) => Some(Box::new(self.expr_in(e, expect)?)),
                     None => None,
-                },
-            },
+                };
+                HExprKind::Check {
+                    scrutinee,
+                    arms,
+                    else_arm,
+                    carried: self.carried_since(first_new, assigned),
+                    is_if: false,
+                }
+            }
+            // `if cond: a else: b` is `check cond: true -> a; else -> b`,
+            // with blocks for arms.
+            ExprKind::If {
+                cond,
+                then,
+                else_block,
+            } => {
+                let cond = Box::new(self.expr(cond)?);
+                let (first_new, assigned) = (self.local_names.len(), self.assigned.len());
+                let then = self.block(then, expect, e.span);
+                let otherwise = match else_block {
+                    Some(block) => self.block(block, expect, e.span),
+                    None => HExpr {
+                        kind: HExprKind::Void,
+                        span: e.span,
+                    },
+                };
+                let yes = HExpr {
+                    kind: HExprKind::Bool(true),
+                    span: cond.span,
+                };
+                HExprKind::Check {
+                    scrutinee: cond,
+                    arms: vec![(yes, then)],
+                    else_arm: Some(Box::new(otherwise)),
+                    carried: self.carried_since(first_new, assigned),
+                    is_if: true,
+                }
+            }
             // A bare `{...}` is a value of the trail expected here.
             ExprKind::Record(fields) => match expect.and_then(|t| t.trail()) {
                 Some(trail) => self.construct(trail, fields, e.span)?,

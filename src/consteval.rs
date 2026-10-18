@@ -12,7 +12,8 @@
 //! not a constant:
 //!
 //! - it has a side effect (`echo`), like `banner = echo "welcome"`, which
-//!   must print every time it is used;
+//!   must print every time it is used, or calls a native function (input,
+//!   output, files), which only the running program can;
 //! - it hits a runtime error (a failed type check, an invalid operator),
 //!   which must happen when the program runs, not when it is compiled;
 //! - it runs too long or recurses too deeply, which could also mean it
@@ -190,6 +191,7 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
             substitute(rhs, consts);
         }
         TExprKind::Neg(x)
+        | TExprKind::Is(x, _)
         | TExprKind::Echo(x)
         | TExprKind::Convert(x)
         | TExprKind::Builtin(_, x) => substitute(x, consts),
@@ -228,6 +230,7 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
                 substitute(e, consts);
             }
         }
+        TExprKind::Block { stmts, .. } => for_each_expr_mut(stmts, &mut |e| substitute(e, consts)),
     }
 }
 
@@ -244,7 +247,9 @@ struct Frame {
 
 impl Interp<'_> {
     fn call(&mut self, inst: InstId, args: Vec<Const>) -> Eval<Const> {
-        if self.depth == MAX_DEPTH {
+        // A native function reaches the world outside (input, files): what
+        // it gives is only known when the program runs.
+        if self.depth == MAX_DEPTH || self.tir.funcs[inst].native.is_some() {
             return Err(NotConstant);
         }
         self.depth += 1;
@@ -468,6 +473,7 @@ impl Interp<'_> {
                 let b = self.expr(rhs, frame)?;
                 binary(*op, &a, &b)?
             }
+            TExprKind::Is(x, passes) => Const::Bool(passes.contains(self.expr(x, frame)?.kind())),
             TExprKind::Neg(x) => match self.expr(x, frame)? {
                 Const::Int(v) => Const::Int(0i64.wrapping_sub(v)),
                 Const::Float(v) => Const::Float(-0.0 - v),
@@ -501,6 +507,8 @@ impl Interp<'_> {
                     None => unreachable!("typeck proved the arms cover every value"),
                 }
             }
+            // The variables the block gives new values are the frame's.
+            TExprKind::Block { stmts, .. } => self.stmts(stmts, frame)?,
         })
     }
 }
@@ -565,6 +573,18 @@ fn matches(value: &Const, pattern: &Const) -> bool {
     }
 }
 
+/// `x % y` as `rt.mod` computes it: the remainder with the sign of `y`
+/// (or 0), so `-7 % 3` is 2. `y` is not 0.
+fn floored_mod(x: i64, y: i64) -> i64 {
+    // `wrapping_rem` is 0 for `i64::MIN % -1`, which overflows otherwise.
+    let r = x.wrapping_rem(y);
+    if r != 0 && (r < 0) != (y < 0) {
+        r + y
+    } else {
+        r
+    }
+}
+
 /// An operator on two values, exactly as the compiled code computes it.
 fn binary(op: BinOp, a: &Const, b: &Const) -> Eval<Const> {
     use Const::*;
@@ -595,6 +615,12 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Eval<Const> {
                     _ => x / y,
                 })
             }
+        },
+        BinOp::Mod => match (a, b) {
+            // `x % 0` stops the program at run time.
+            (Int(_), Int(0)) => return Err(NotConstant),
+            (Int(x), Int(y)) => Int(floored_mod(*x, *y)),
+            _ => unreachable!("only ints, see `binop_result`"),
         },
         BinOp::Eq | BinOp::Ne => {
             let eq = match (a, b) {

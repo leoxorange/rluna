@@ -150,6 +150,22 @@ pub fn frontend_files(
         };
         let tokens = lexer::lex_at(&source.text, base).map_err(|d| fail(files, &source, d))?;
         let program = parser::parse(tokens).map_err(|d| fail(files, &source, d))?;
+        // Only the runtime can give a native function its body, and it
+        // gives those of the standard library.
+        if let Some(def) = program.defs.iter().find(|d| d.native) {
+            return Err(fail(
+                files,
+                &source,
+                Diagnostic::error(
+                    ErrorKind::DefinitionError,
+                    def.span,
+                    format!(
+                        "`{}` is declared `native`, but only the standard library can declare native functions: the runtime gives their bodies",
+                        def.name
+                    ),
+                ),
+            ));
+        }
         files.push(File {
             path,
             source,

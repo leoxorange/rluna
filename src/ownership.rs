@@ -374,7 +374,7 @@ impl Checker<'_> {
                 }
                 self.diverged = true;
             }
-            TExprKind::Neg(x) | TExprKind::Echo(x) => self.read(&[x]),
+            TExprKind::Neg(x) | TExprKind::Is(x, _) | TExprKind::Echo(x) => self.read(&[x]),
             TExprKind::Builtin(b, x) => match b {
                 Builtin::Len | Builtin::Copy => self.read(&[x]),
                 // The element itself: `x` stays borrowed while it is used.
@@ -456,6 +456,25 @@ impl Checker<'_> {
                 }
                 self.moved = after;
                 self.diverged = all_diverge;
+            }
+            // The block of an `if`: its statements in order. Its value is a
+            // new value, so the last statement gives its value up, as an arm
+            // of a `check` does. Its own variables are new each time it
+            // runs, and gone after it.
+            TExprKind::Block { stmts, inner } => {
+                for l in inner {
+                    self.moved.remove(l);
+                }
+                let n = stmts.len();
+                for (i, stmt) in stmts.iter().enumerate() {
+                    match stmt {
+                        TStmt::Expr(v) if i + 1 == n => self.expr(v, Use::Move),
+                        _ => self.stmt(stmt),
+                    }
+                }
+                for l in inner {
+                    self.moved.remove(l);
+                }
             }
         }
     }
