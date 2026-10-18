@@ -25,6 +25,7 @@ extern @libSystem.close(i64) -> i64
 extern @libSystem.exit(i64)
 extern @libSystem.mmap(i64, i64, i64, i64, i64, i64) -> i64
 extern @libSystem.munmap(i64, i64) -> i64
+extern @libSystem.getrlimit(i64, i64) -> i64
 
 ; the arguments dyld passes to `main`, for @rt.sys_args
 data @rt.argc = { i64 0 }
@@ -40,8 +41,26 @@ entry:
   store i64 %argc_slot, 0, %argc
   %argv_slot = addr @rt.argv
   store i64 %argv_slot, 0, %argv
-  call void @luna.main()
+  ; The main thread's stack is as big as the soft limit RLIMIT_STACK (3)
+  ; says, starting about here. Unlimited, or unknown: assume the usual 8 MB.
+  %top = alloca 8
+  %rlimit = alloca 16
+  %three = iconst 3
+  %failed = call i64 @libSystem.getrlimit(%three, %rlimit)
+  %soft = load i64 %rlimit, 0
+  %usual = iconst 8388608
   %zero = iconst 0
+  %ok = icmp eq %failed, %zero
+  br %ok, got, guess
+got:
+  %most = iconst 1073741824
+  %sane = icmp ult %soft, %most
+  br %sane, limit(%soft), limit(%usual)
+guess:
+  jmp limit(%usual)
+limit(%size: i64):
+  call void @rt.stack_set(%top, %size)
+  call void @luna.main()
   call void @rt.exit(%zero)
   unreachable
 }

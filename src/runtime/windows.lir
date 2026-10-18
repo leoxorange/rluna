@@ -19,6 +19,7 @@ extern @kernel32.WideCharToMultiByte(i64, i64, i64, i64, i64, i64, i64, i64) -> 
 extern @kernel32.GetCommandLineW() -> i64
 extern @kernel32.LocalFree(i64) -> i64
 extern @kernel32.ExitProcess(i64)
+extern @kernel32.GetCurrentThreadStackLimits(i64, i64)
 extern @kernel32.VirtualAlloc(i64, i64, i64, i64) -> i64
 extern @kernel32.VirtualFree(i64, i64, i64) -> i64
 extern @shell32.CommandLineToArgvW(i64, i64) -> i64
@@ -42,6 +43,14 @@ entry:
   %err = call i64 @kernel32.GetStdHandle(%err_id)
   %err_slot = addr @rt.stderr
   store i64 %err_slot, 0, %err
+  ; The stack is reserved from `low` up to `high`.
+  %low = alloca 8
+  %high = alloca 8
+  call void @kernel32.GetCurrentThreadStackLimits(%low, %high)
+  %bottom = load i64 %low, 0
+  %top = load i64 %high, 0
+  %size = isub %top, %bottom
+  call void @rt.stack_set(%top, %size)
   call void @luna.main()
   %zero = iconst 0
   call void @rt.exit(%zero)

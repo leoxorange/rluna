@@ -83,6 +83,13 @@ data @rt.s_trail = { i64 5, bytes "trail" }
 data @rt.s_no_match = { i64 29, bytes "TypeError: no definition of `" }
 data @rt.s_no_match_end = { i64 25, bytes "` accepts these arguments" }
 data @rt.s_mod_zero = { i64 42, bytes "ZeroDivisionError: `%` with 0 on the right" }
+data @rt.s_stack = { i64 34, bytes "StackOverflowError: the calls of `" }
+data @rt.s_stack_end = { i64 64, bytes "` went too deep (too many calls inside each other for the stack)" }
+
+; The lowest address the stack may reach before a function that can call
+; itself again stops the program (0: not known, no limit). Below it is room
+; left for printing the error.
+data @rt.stack_limit = { i64 0 }
 
 ; ---------------------------------------------------------------------------
 ; Process exit
@@ -1239,6 +1246,35 @@ entry:
   %one = iconst 1
   call void @rt.sys_exit(%one)
   unreachable
+}
+
+;"StackOverflowError: ..." for a function (its name, a string object) that
+; would go below @rt.stack_limit.
+func @rt.stack_overflow(%name: i64) {
+entry:
+  call void @rt.flush()
+  %s1 = addr @rt.s_stack
+  call void @rt.err_str(%s1)
+  call void @rt.err_str(%name)
+  %s2 = addr @rt.s_stack_end
+  call void @rt.err_str(%s2)
+  %nl = addr @rt.s_newline
+  call void @rt.err_str(%nl)
+  %one = iconst 1
+  call void @rt.sys_exit(%one)
+  unreachable
+}
+
+; The stack ends `%size` bytes below `%top`: set @rt.stack_limit 256 KB
+; above that end.
+func @rt.stack_set(%top: i64, %size: i64) {
+entry:
+  %end = isub %top, %size
+  %margin = iconst 262144
+  %limit = iadd %end, %margin
+  %slot = addr @rt.stack_limit
+  store i64 %slot, 0, %limit
+  ret
 }
 
 ; "TypeError: operator `<op>` cannot be applied to <a>[ and <b>]"; b = 0 for unary operators.

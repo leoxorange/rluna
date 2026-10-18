@@ -97,6 +97,9 @@ first_negative a =
             true -> ret x;
             false -> void
     void
+count n total = check n:
+    0 -> total;
+    else -> count (n - 1) (total + n)
 abs_diff a b = if a > b:
     a - b
 else:
@@ -121,6 +124,9 @@ later =
     echo (1 + 0.5)
     echo (7 % 3)
     echo (-7 % 3)
+    echo (1 < 2 && 2 < 3)
+    echo (5 > 6 || 4 < 10)
+    echo (!(5 > 6))
     echo (1 + 10 % 4 * 3)
     echo ("a" < "b")
     banner
@@ -152,9 +158,20 @@ later =
     echo total
     loop i, c in "abc":
         echo i
+    loop x in [1, 2, 3, 4, 5, 6]:
+        if x % 2 == 0:
+            jump
+        if x > 4:
+            over
+        echo x
+    loop i in [0..infinite]:
+        if i * i > 50:
+            echo i
+            over
     echo product [x | x in [1..6]]
     echo head tail [1, 2, 3]
     echo (first_negative [3, -1, 4])
+    echo (count 1000000 0)
     echo (first_or_zero [7])
     echo (first_or_zero [])
     echo (head [] + 1)

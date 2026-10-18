@@ -42,9 +42,14 @@ echo (7 * 2) # 14, int with int stays an int for + - *
 echo (1 + 0.5) # 1.5, an int with a float gives a float
 echo (7 % 3) # 1, the remainder: `%` is for two ints
 echo (-7 % 3) # 2, the remainder has the sign of the right side, like haskell's mod
+echo (1 < 2 && 2 < 3) # true: both are
+echo (5 > 6 || 4 < 10) # true: one is
+echo (!(5 > 6)) # true: `!` turns false into true, and true into false
 ```
 
 `+` also joins two strings: `"con" + "cat"` is `"concat"`. Strings compare with `<` and `>` in alphabetical order.
+
+`&&` and `||` take two booleans, below the comparisons, with `&&` before `||`: `a || b && c` is `a || (b && c)`. The right side is only evaluated when the left one does not decide: in `x != 0 && 10 / x > 1`, the division only happens when `x` is not 0. `!b` turns a boolean around. It binds like `-`, tighter than the other operators: `!a && b` is `(!a) && b`, and `!even 3` is `!(even 3)`. (`!!` takes an element of an array, so negating twice is `!(!b)`.)
 
 `%` binds like `*` and `/`: `1 + 10 % 4 * 3` is 7. Its result is between 0 and the right side, so `(i - 1) % 12` stays on a clock face even when `i` is 0. `x % 0` stops the program with a `ZeroDivisionError`.
 
@@ -212,6 +217,24 @@ the loop body must be indented.
 - A variable from outside that the body changes (`total` above) keeps its value from one round to the next, and after the loop.
 - The variable of a loop over a range is always an int: you can give it another int (`x = 40`), but giving it a string is an error.
 
+`over` ends the loop at once, and `jump` skips the rest of the round and goes on with the next one. Both belong to the innermost loop around them:
+```
+main =
+    loop x in [1, 2, 3, 4, 5, 6]:
+        if x % 2 == 0:
+            jump # skip the even numbers
+        if x > 4:
+            over # stop at 5
+        echo x # 1, 3
+    loop i in [0..infinite]: # 0, 1, 2, ... for as long as the loop goes on
+        if i * i > 50:
+            echo i # 8
+            over
+```
+- `over` and `jump` work anywhere in the body, also inside a `check` or an `if`, but not in a list comprehension, which is not a loop.
+- a variable from outside that the body changes keeps the value it has at the `over` or `jump`.
+- `[0..infinite]` never ends, so only a loop can go through it, and the loop needs an `over` or a `ret` to finish. It is not an array: `xs = [0..infinite]`, or a list comprehension over it, is an error.
+
 ### function definition and call
 
 ```
@@ -267,6 +290,26 @@ first_negative a =
 main = echo (first_negative [3, -1, 4]) # -1
 ```
 `ret` cannot be used inside a list comprehension.
+
+#### tail calls
+
+Each call waits for the calls inside it to finish, and all of them take room on the stack, which holds some tens of thousands of them. A recursion deeper than that stops the program with a `StackOverflowError` that names the function. But a call whose value is the function's result, with nothing left to do after it, is in *tail position*: the function then starts again with the new arguments instead of going one call deeper, so it can repeat any number of times, like a loop.
+```
+count n total = check n:
+    0 -> total;
+    else -> count (n - 1) (total + n) # tail position: nothing is left to do
+
+depth n = check n:
+    0 -> 0;
+    else -> 1 + depth (n - 1) # not in tail position: `1 +` is still to do
+
+main =
+    echo (count 1000000 0) # 500000500000
+    echo (depth 1000000) # StackOverflowError: the calls of `depth` went too deep
+```
+- tail positions are the last line of the function and a `ret` value, and inside those: the arms of a `check`, the last line of an `if` block, and the right side of `&&` and `||`.
+- only a call of the same definition starts it again. In `sum_list (x:xs) acc = sum_list xs (acc + x)`, the call starts that definition again while `xs` has elements, and calls `sum_list [] acc` at the end. A call of another function in tail position is an ordinary call.
+- an argument the function borrows must be a parameter the function borrows itself (or part of one), a number or a literal; otherwise the call is an ordinary one, as what the argument borrows from must live until the call returns.
 
 ### trail definition
 

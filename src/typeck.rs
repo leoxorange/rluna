@@ -337,6 +337,10 @@ pub enum TExprKind {
     },
     /// `ret value` / `ret`: leave the function.
     Ret(Option<Box<TExpr>>),
+    /// `over`: leave the innermost loop.
+    Over,
+    /// `jump`: go on with the innermost loop's next round.
+    Jump,
     /// A built-in function on an array or a string, which it only reads.
     Builtin(Builtin, Box<TExpr>),
     /// `a ++ b`: both operands are arrays (or void), which it only reads.
@@ -439,8 +443,9 @@ pub fn binop_result(op: BinOp, a: Kind, b: Kind) -> Option<Kind> {
         return Some(Void);
     }
     match op {
-        // Typed with their element types, see `Checker::concat` etc.
-        BinOp::Concat | BinOp::Index | BinOp::ElemMul => None,
+        // Typed with their element types, see `Checker::concat` etc., and
+        // `&&` / `||` as `check`s (`Checker::logic`).
+        BinOp::Concat | BinOp::Index | BinOp::ElemMul | BinOp::And | BinOp::Or => None,
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (a, b) {
             (Int, Int) if op != BinOp::Div => Some(Int),
             _ if numeric(a) && numeric(b) => Some(Float),
@@ -558,6 +563,10 @@ struct Ctx<'a> {
     discard: bool,
     /// How many list comprehensions enclose the current expression.
     in_comprehension: usize,
+    /// The loops being checked, innermost last: the variables each carries,
+    /// with the types they have had at an `over` or a `jump` so far (those
+    /// reach the top of the loop or its end too).
+    loop_exits: Vec<(Vec<usize>, Vec<Ty>)>,
 }
 
 fn err(span: Span, msg: impl Into<String>) -> Diagnostic {
@@ -576,6 +585,32 @@ fn join(a: Ty, b: Ty, span: Span, what: &str) -> Result<Ty, Diagnostic> {
         ));
     }
     Ok(a.union(b))
+}
+
+/// `infinite` as the end of a range: `[0..infinite]`.
+fn is_infinite(end: &HExpr) -> bool {
+    matches!(end.kind, HExprKind::Float(v) if v == f64::INFINITY)
+}
+
+/// `[0..infinite]` anywhere but as what a loop goes through.
+fn endless_range(span: Span) -> Diagnostic {
+    err(
+        span,
+        "a range that never ends (`[0..infinite]`) can only be what a `loop` goes through: an array or a list comprehension would never be finished",
+    )
+}
+
+/// A side of `&&` or `||` that is not a boolean.
+fn logic_error(op: BinOp, ty: Ty) -> String {
+    let hint = if ty.is_maybe() {
+        ": it may be void, so handle the void case first, with a `check` that has a `void ->` arm"
+    } else {
+        ""
+    };
+    format!(
+        "`{}` needs a Boolean on each side, but this is {ty}{hint}",
+        op.as_str()
+    )
 }
 
 /// The name of a trail to show: `food.Fruit`, without the folders.
@@ -650,6 +685,7 @@ impl<'a> Checker<'a> {
             ret_bound: func.ret_bound.clone(),
             discard: func.ret == Some(Ty::VOID),
             in_comprehension: 0,
+            loop_exits: Vec::new(),
         };
         let mut body = self.stmts(&mut cx, &func.body)?;
         // The value of the last statement is the result, if it is an
@@ -759,7 +795,10 @@ impl<'a> Checker<'a> {
                         cx.local_tys[*p] = Ty::INT;
                         cx.loop_vars.push((*p, *span, Ty::INT));
                     }
+                    cx.loop_exits
+                        .push((carried.clone(), vec![Ty::NEVER; carried.len()]));
                     let checked = self.stmts(cx, body);
+                    let (_, exits) = cx.loop_exits.pop().unwrap();
                     if pos.is_some() {
                         cx.loop_vars.pop();
                     }
@@ -768,12 +807,14 @@ impl<'a> Checker<'a> {
                     let widened: Vec<Ty> = carried
                         .iter()
                         .zip(&header)
-                        .map(|(&l, &t)| {
+                        .zip(&exits)
+                        .map(|((&l, &t), &exit)| {
+                            let what = "the values a variable gets in this loop";
                             join(
-                                t,
-                                cx.local_tys[l],
+                                join(t, cx.local_tys[l], *var_span, what)?,
+                                exit,
                                 *var_span,
-                                "the values a variable gets in this loop",
+                                what,
                             )
                         })
                         .collect::<Result<_, _>>()?;
@@ -847,6 +888,20 @@ impl<'a> Checker<'a> {
             let start = self.narrow(start, Ty::INT, || {
                 "the start of a range must be an int".into()
             })?;
+            // `[0..infinite]` never ends: a loop goes on until something
+            // leaves it (`over`, `ret`). The count stops at the largest
+            // int, 2^63 - 1 steps away: centuries, in practice never.
+            if is_infinite(end) {
+                if cx.in_comprehension > 0 {
+                    return Err(endless_range(source.span));
+                }
+                let end = TExpr {
+                    kind: TExprKind::Int(i64::MAX),
+                    ty: Ty::INT,
+                    span: end.span,
+                };
+                return Ok((LoopSource::Range(start, end), Ty::INT));
+            }
             let end = self.expr(cx, end)?;
             let end = self.narrow(end, Ty::INT, || "the end of a range must be an int".into())?;
             return Ok((LoopSource::Range(start, end), Ty::INT));
@@ -1077,7 +1132,9 @@ impl<'a> Checker<'a> {
             BinOp::Mul => ("mul", "Numeric"),
             BinOp::Div => ("div", "Numeric"),
             BinOp::Mod => ("mod", "Numeric"),
-            BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("typed separately"),
+            BinOp::Concat | BinOp::Index | BinOp::ElemMul | BinOp::And | BinOp::Or => {
+                unreachable!("typed separately")
+            }
             _ => ("compare", "Compare"),
         };
         let single = |t: Ty| t.as_kind() == Some(Kind::Record);
@@ -1405,6 +1462,26 @@ impl<'a> Checker<'a> {
                     self.index(lhs, rhs)?
                 }
             }
+            HExprKind::Over | HExprKind::Jump => {
+                // What the carried variables hold here reaches the top of the
+                // loop (`jump`) or its end (`over`), which have the same
+                // types.
+                let (carried, exits) = cx.loop_exits.last_mut().expect("resolved inside a loop");
+                for (&l, exit) in carried.iter().zip(exits.iter_mut()) {
+                    *exit = join(
+                        *exit,
+                        cx.local_tys[l],
+                        span,
+                        "the values a variable gets in this loop",
+                    )?;
+                }
+                let kind = if matches!(e.kind, HExprKind::Over) {
+                    TExprKind::Over
+                } else {
+                    TExprKind::Jump
+                };
+                (kind, Ty::NEVER)
+            }
             HExprKind::Ret(value) => {
                 if cx.in_comprehension > 0 {
                     return Err(err(
@@ -1501,6 +1578,7 @@ impl<'a> Checker<'a> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.array_literal(items)?
             }
+            HExprKind::Range(_, end) if is_infinite(end) => return Err(endless_range(span)),
             HExprKind::Range(start, end) => {
                 let start = self.expr(cx, start)?;
                 let start = self.narrow(start, Ty::INT, || {
@@ -1715,6 +1793,41 @@ impl<'a> Checker<'a> {
                 };
                 (TExprKind::Neg(Box::new(inner)), ty)
             }
+            // `!b` is `b != true`, on a boolean.
+            HExprKind::Not(inner) => {
+                let inner = self.expr(cx, inner)?;
+                if inner.ty.is_never() {
+                    return Ok(TExpr {
+                        kind: TExprKind::Diverge(vec![inner]),
+                        ty: Ty::NEVER,
+                        span,
+                    });
+                }
+                if !inner.ty.is_subset(Ty::BOOL) {
+                    let hint = if inner.ty.is_maybe() {
+                        ": it may be void, so handle the void case first, with a `check` that has a `void ->` arm"
+                    } else {
+                        ""
+                    };
+                    return Err(err(
+                        inner.span,
+                        format!("`!` needs a Boolean, but this is {}{hint}", inner.ty),
+                    ));
+                }
+                let yes = TExpr {
+                    kind: TExprKind::Bool(true),
+                    ty: Ty::BOOL,
+                    span,
+                };
+                (
+                    TExprKind::Binary {
+                        op: BinOp::Ne,
+                        lhs: Box::new(inner),
+                        rhs: Box::new(yes),
+                    },
+                    Ty::BOOL,
+                )
+            }
             HExprKind::Is { value, ty, bound } => {
                 let value = self.expr(cx, value)?;
                 // Each kind of the value's type passes or not while
@@ -1760,8 +1873,16 @@ impl<'a> Checker<'a> {
                 else_arm,
                 carried,
                 is_if,
+                logic,
             } => {
                 let scrutinee = self.expr(cx, scrutinee)?;
+                // `a && b`, `a || b`: two booleans
+                if let Some(op) = logic
+                    && !scrutinee.ty.is_never()
+                    && !scrutinee.ty.is_subset(Ty::BOOL)
+                {
+                    return Err(err(scrutinee.span, logic_error(*op, scrutinee.ty)));
+                }
                 if *is_if && !scrutinee.ty.is_never() && !scrutinee.ty.is_subset(Ty::BOOL) {
                     let hint = if scrutinee.ty.is_maybe() {
                         ": it may be void, so handle the void case first, with a `check` that has a `void ->` arm"
@@ -1856,6 +1977,12 @@ impl<'a> Checker<'a> {
                     }
                     let narrowed = narrow_local.is_some() && !pat.ty.contains(Kind::Void);
                     let body = arm_body(self, cx, body, narrowed)?;
+                    if let Some(op) = logic
+                        && !body.ty.is_never()
+                        && !body.ty.is_subset(Ty::BOOL)
+                    {
+                        return Err(err(body.span, logic_error(*op, body.ty)));
+                    }
                     end_of(cx, &body);
                     ty = join(ty, body.ty, body.span, what)?;
                     narrowed_arms.push(narrowed);
@@ -2337,7 +2464,7 @@ impl<'a> Checker<'a> {
     }
 }
 
-fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
+pub fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
     match &e.kind {
         TExprKind::Int(_)
         | TExprKind::Float(_)
@@ -2359,6 +2486,7 @@ fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
         | TExprKind::Builtin(_, x) => f(x),
         TExprKind::Array(items) => items.iter().for_each(f),
         TExprKind::Ret(value) => value.iter().for_each(|v| f(v)),
+        TExprKind::Over | TExprKind::Jump => {}
         TExprKind::Range(a, b)
         | TExprKind::Concat(a, b)
         | TExprKind::Index(a, b)
@@ -2425,6 +2553,7 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
         | TExprKind::Builtin(_, x) => remap_calls(x, index),
         TExprKind::Array(items) => items.iter_mut().for_each(|i| remap_calls(i, index)),
         TExprKind::Ret(value) => value.iter_mut().for_each(|v| remap_calls(v, index)),
+        TExprKind::Over | TExprKind::Jump => {}
         TExprKind::Range(a, b)
         | TExprKind::Concat(a, b)
         | TExprKind::Index(a, b)

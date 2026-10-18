@@ -9,7 +9,7 @@ Syntax highlighting for the Luna language (`.luna` files):
 - links to other files (`| entity > et`, `| entity#pred, next > p, n`);
 - native definitions (`native read_line :: String?`) and maybe types in
   signatures (`-> Int?`);
-- keywords (`check`, `else`, `loop`, `in`, `ret`, `echo`), the built-in
+- keywords (`check`, `if`, `else`, `loop`, `in`, `over`, `jump`, `ret`, `echo`), the built-in
   functions (`len`, `head`, `tail`, `init`, `last`, `reverse`, `copy`) and
   constants (`true`, `false`, `void`, `PI`, `infinite`);
 - strings with their escapes, numbers, comments, fields (`t.name`,

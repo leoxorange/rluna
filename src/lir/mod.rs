@@ -348,6 +348,14 @@ impl FunctionBuilder {
         b
     }
 
+    /// Go on building a finished function, at its entry block.
+    pub fn resume(func: Function) -> FunctionBuilder {
+        FunctionBuilder {
+            func,
+            current: BlockId(0),
+        }
+    }
+
     pub fn param(&self, i: usize) -> Value {
         self.func.blocks[0].params[i]
     }

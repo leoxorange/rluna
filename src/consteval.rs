@@ -88,6 +88,10 @@ enum Stop {
     NotConstant,
     /// `ret`: the current call returns this value.
     Return(Const),
+    /// `over`: the innermost loop ends.
+    Over,
+    /// `jump`: the innermost loop goes on with its next round.
+    Jump,
 }
 
 use Stop::NotConstant;
@@ -201,6 +205,7 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
         }
         TExprKind::Field(base, _) | TExprKind::Textualize(base) => substitute(base, consts),
         TExprKind::Ret(value) => value.iter_mut().for_each(|v| substitute(v, consts)),
+        TExprKind::Over | TExprKind::Jump => {}
         TExprKind::Range(a, b)
         | TExprKind::Concat(a, b)
         | TExprKind::Index(a, b)
@@ -294,14 +299,31 @@ impl Interp<'_> {
                     body,
                     ..
                 } => {
-                    for (i, element) in self.elements(source, frame)?.into_iter().enumerate() {
+                    // A range is counted as it goes: `[0..infinite]` with an
+                    // `over` ends, and the fuel stops one without.
+                    let elements = match &**source {
+                        LoopSource::Range(start, end) => {
+                            let (Const::Int(from), Const::Int(to)) =
+                                (self.expr(start, frame)?, self.expr(end, frame)?)
+                            else {
+                                unreachable!("range bounds are ints")
+                            };
+                            Box::new((from..to).map(Const::Int)) as Box<dyn Iterator<Item = Const>>
+                        }
+                        LoopSource::Each(_) => Box::new(self.elements(source, frame)?.into_iter()),
+                    };
+                    for (i, element) in elements.enumerate() {
                         // Every iteration costs fuel, even an empty body.
                         self.fuel = self.fuel.checked_sub(1).ok_or(NotConstant)?;
                         frame.locals[*var] = Some(element);
                         if let Some(p) = pos {
                             frame.locals[*p] = Some(Const::Int(i as i64));
                         }
-                        self.stmts(body, frame)?;
+                        match self.stmts(body, frame) {
+                            Ok(_) | Err(Stop::Jump) => {}
+                            Err(Stop::Over) => break,
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
             }
@@ -468,6 +490,8 @@ impl Interp<'_> {
                 };
                 return Err(Stop::Return(v));
             }
+            TExprKind::Over => return Err(Stop::Over),
+            TExprKind::Jump => return Err(Stop::Jump),
             TExprKind::Binary { op, lhs, rhs } => {
                 let a = self.expr(lhs, frame)?;
                 let b = self.expr(rhs, frame)?;
@@ -597,7 +621,9 @@ fn binary(op: BinOp, a: &Const, b: &Const) -> Eval<Const> {
     }
     let numeric = |c: &Const| matches!(c, Int(_) | Float(_));
     Ok(match op {
-        BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("evaluated separately"),
+        BinOp::Concat | BinOp::Index | BinOp::ElemMul | BinOp::And | BinOp::Or => {
+            unreachable!("evaluated separately")
+        }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => match (a, b) {
             (Str(x), Str(y)) => Str(format!("{x}{y}")),
             // Machine integers wrap around on overflow.

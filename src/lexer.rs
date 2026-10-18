@@ -36,6 +36,8 @@ pub enum TokenKind {
     Loop,
     In,
     Ret,
+    Over,
+    Jump,
     Trail,
     Native,
     // punctuation
@@ -50,8 +52,11 @@ pub enum TokenKind {
     PlusPlus, // ++
     StarStar, // **
     BangBang, // !!
+    Bang,     // !
     DotDot,   // ..
     Bar,      // |
+    AndAnd,   // &&
+    OrOr,     // ||
     Minus,    // -
     Star,     // *
     Slash,    // /
@@ -95,6 +100,8 @@ impl TokenKind {
             TokenKind::Loop => "`loop`".into(),
             TokenKind::In => "`in`".into(),
             TokenKind::Ret => "`ret`".into(),
+            TokenKind::Over => "`over`".into(),
+            TokenKind::Jump => "`jump`".into(),
             TokenKind::Trail => "`trail`".into(),
             TokenKind::Native => "`native`".into(),
             TokenKind::LBrace => "`{`".into(),
@@ -111,8 +118,11 @@ impl TokenKind {
             TokenKind::PlusPlus => "`++`".into(),
             TokenKind::StarStar => "`**`".into(),
             TokenKind::BangBang => "`!!`".into(),
+            TokenKind::Bang => "`!`".into(),
             TokenKind::DotDot => "`..`".into(),
             TokenKind::Bar => "`|`".into(),
+            TokenKind::AndAnd => "`&&`".into(),
+            TokenKind::OrOr => "`||`".into(),
             TokenKind::Minus => "`-`".into(),
             TokenKind::Star => "`*`".into(),
             TokenKind::Slash => "`/`".into(),
@@ -323,6 +333,8 @@ impl<'a> Lexer<'a> {
                         "loop" => TokenKind::Loop,
                         "in" => TokenKind::In,
                         "ret" => TokenKind::Ret,
+                        "over" => TokenKind::Over,
+                        "jump" => TokenKind::Jump,
                         "trail" => TokenKind::Trail,
                         "native" => TokenKind::Native,
                         _ => TokenKind::Ident(word.to_string()),
@@ -344,7 +356,10 @@ impl<'a> Lexer<'a> {
                         (b'+', b'+') => (TokenKind::PlusPlus, 2),
                         (b'*', b'*') => (TokenKind::StarStar, 2),
                         (b'!', b'!') => (TokenKind::BangBang, 2),
+                        (b'!', _) => (TokenKind::Bang, 1),
                         (b'.', b'.') => (TokenKind::DotDot, 2),
+                        (b'&', b'&') => (TokenKind::AndAnd, 2),
+                        (b'|', b'|') => (TokenKind::OrOr, 2),
                         (b'|', _) => (TokenKind::Bar, 1),
                         (b'=', _) => (TokenKind::Assign, 1),
                         (b'<', _) => (TokenKind::Lt, 1),
@@ -381,7 +396,11 @@ impl<'a> Lexer<'a> {
                             return Err(Diagnostic::error(
                                 ErrorKind::SyntaxError,
                                 Span::new(start, start + ch.len_utf8()),
-                                format!("unexpected character `{ch}`"),
+                                if ch == '&' {
+                                    "`&` alone is not an operator: `a && b` is true when both booleans are".to_string()
+                                } else {
+                                    format!("unexpected character `{ch}`")
+                                },
                             ));
                         }
                     };

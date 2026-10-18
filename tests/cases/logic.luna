@@ -1,0 +1,41 @@
+# `&&` and `||` on booleans: below the comparisons, `&&` before `||`. The
+# right side is only evaluated when the left one does not decide. `!b` turns
+# true into false and false into true; it binds like `-`.
+
+loud name b =
+    echo name
+    b
+uses s = len s > 2
+even n = n % 2 == 0
+flag :: Boolean = !(5 > 6)
+
+main =
+    echo (true && false)
+    echo (true || false)
+    echo (1 < 2 && 2 < 3)
+    echo (false || 1 > 2 && true)
+    echo (true || false && false)
+    echo (false && loud "not printed" true)
+    echo (true || loud "not printed" true)
+    echo (true && loud "printed" true)
+    # `s` moves into `uses` only if the right side runs; either way it is
+    # freed once
+    s = "abc"
+    echo (false && uses s)
+    t = "abcd"
+    echo (true && uses t)
+    n = 7
+    if n > 5 && n < 10:
+        echo "between"
+    echo [x | x in [0..10], x > 2 && x < 5 || x == 9]
+    loop i in [0..4]:
+        echo (i == 1 || i == 3)
+    echo (!true)
+    echo (!false && true)
+    echo (!(true && false))
+    echo (!even 3)
+    echo [x | x in [0..6], !even x]
+    if !even 7:
+        echo "odd"
+    echo (!(!true))
+    echo flag

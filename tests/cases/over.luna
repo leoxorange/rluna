@@ -1,0 +1,119 @@
+first_square_over limit =
+    found = 0
+    loop i in [0..infinite]:
+        if i * i > limit:
+            found = i
+            over
+    found
+
+odd_sum @xs =
+    total = 0
+    loop x in @xs:
+        if x % 2 == 0:
+            jump
+        total = total + x
+    total
+
+words =
+    out = ""
+    loop w in ["a", "bb", "stop", "c"]:
+        if w == "stop":
+            over
+        out = out + w
+    out
+
+grow =
+    x = 0
+    loop i in [0..10]:
+        if i == 3:
+            x = "three"
+            over
+        x = i
+    x
+
+nested =
+    n = 0
+    loop i in [0..5]:
+        loop j in [0..5]:
+            if j > i:
+                over
+            if j == 1:
+                jump
+            n = n + 1
+    n
+
+keep_owned =
+    xs = [[1], [2, 2], [3, 3, 3], [4]]
+    seen = []
+    loop x in xs:
+        if len x == 3:
+            over
+        seen = seen ++ [x]
+    seen
+
+# The round's own values are freed when it ends early.
+names =
+    out = []
+    loop w in ["ann", "bob", "", "cy", "dan"]:
+        upper = w + "!"
+        if w == "":
+            jump
+        if w == "dan":
+            over
+        out = out ++ [upper]
+    out
+
+# A maybe value seen without its void, carried out by `over`.
+last_found @xs =
+    found = void
+    loop x in @xs:
+        found = check x:
+            void -> found;
+            else -> x
+        check found:
+            void -> void;
+            else -> if found > 2:
+                over
+    found
+
+# Ending a loop over a range of a range: `over` from the inner loop only.
+pairs =
+    out = []
+    loop i in [0..3]:
+        loop j in [0..infinite]:
+            if j > i:
+                over
+            out = out ++ [[i, j]]
+    out
+
+# A value made before a `jump` (or a `ret`) in the same expression is freed
+# on the way out.
+lengths =
+    n = 0
+    loop w in ["a", "", "b"]:
+        x = ["x"] ++ (check w == "":
+            true -> jump;
+            false -> [w])
+        n = n + len x
+    n
+
+first_long @ws =
+    loop w in @ws:
+        x = [w + "?"] ++ (check len w > 2:
+            true -> ret w + "!";
+            false -> [copy w])
+        echo x
+    "none"
+
+main =
+    echo (first_square_over 50)
+    echo (odd_sum [1, 2, 3, 4, 5])
+    echo words
+    echo grow
+    echo nested
+    echo keep_owned
+    echo names
+    echo (last_found [1, void, 3, 4])
+    echo pairs
+    echo lengths
+    echo (first_long ["ab", "abc", "d"])

@@ -178,6 +178,30 @@ fn compile_errors() {
             "argument 1 of `sum` must be Numeric",
         ),
         ("main = echo missing", "SymbolNotFoundError"),
+        (
+            "main =\n    over",
+            "`over` leaves a loop, but this is not inside a `loop`",
+        ),
+        (
+            "main =\n    loop i in [0..3]:\n        echo [jump | x in [0..3]]",
+            "`jump` goes on with a loop's next round, but this is not inside a `loop`",
+        ),
+        (
+            "main =\n    xs = [0..infinite]",
+            "a range that never ends (`[0..infinite]`) can only be what a `loop` goes through",
+        ),
+        (
+            "main =\n    echo [x | x in [0..infinite]]",
+            "a range that never ends",
+        ),
+        (
+            "take s = s\nmain =\n    s = \"a\"\n    loop i in [0..3]:\n        take s\n        if i == 1:\n            over\n        s = \"b\"",
+            "so after the loop it would have no value; give `s` a new value before this `over`",
+        ),
+        (
+            "take s = s\nmain =\n    s = \"a\"\n    loop i in [0..3]:\n        take s\n        if i == 1:\n            jump\n        s = \"b\"",
+            "give `s` a new value before this `jump`",
+        ),
         ("foo = 1", "no `main` function"),
         (
             "main = check 3:\n    1 -> echo \"a\"",
@@ -590,6 +614,30 @@ fn compile_errors() {
             "describe @f :: Show -> Int = 1\ntrail P:\n    x :: Int\nmain = echo (describe [P {x = 1}])",
             "argument 1 of `describe` must follow Show, but this is [P]",
         ),
+        // && and ||
+        (
+            "main = echo (1 && true)",
+            "`&&` needs a Boolean on each side, but this is Int",
+        ),
+        (
+            "main = echo (true || \"s\")",
+            "`||` needs a Boolean on each side, but this is String",
+        ),
+        (
+            "main = echo (head [true] && true)",
+            "but this is Boolean?: it may be void",
+        ),
+        (
+            "take s = len s > 1\nmain =\n    s = \"abc\"\n    echo (true && take s)\n    echo s",
+            "`s` is used after its value was moved",
+        ),
+        ("main = echo (true & false)", "`&` alone is not an operator"),
+        ("main = echo (!5)", "`!` needs a Boolean, but this is Int"),
+        (
+            "main = echo (!(head [true]))",
+            "`!` needs a Boolean, but this is Boolean?: it may be void",
+        ),
+        ("main = echo (!!true)", "to negate twice, write `!(!b)`"),
         // moving: loops, `++` and `tail` take what they are given
         (
             "main =\n    a = [1]\n    loop x in a:\n        echo x\n    echo a",

@@ -30,7 +30,7 @@
 //! have come from a C compiler, which is why the runtime can be written in
 //! it and why backends for new CPUs only need to understand LIR.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::BinOp;
 use crate::hir::{Builtin, HPattern};
@@ -41,7 +41,7 @@ use crate::lir::{
 use crate::ownership::Use;
 use crate::typeck::{
     LenTest, LoopSource, TClause, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result,
-    gives_element_itself,
+    gives_element_itself, visit_children,
 };
 use crate::typefns::{TypeFns, load_elem, load_field, new_record, store_elem, store_field};
 use crate::types::{Kind, Ty};
@@ -81,6 +81,8 @@ pub fn lower(tir: &Tir) -> Module {
         let func = FnLower::new(tir, f, &mut strings, &mut fns).run();
         module.funcs.push(func);
     }
+    let names: Vec<String> = tir.funcs.iter().map(|f| f.name.clone()).collect();
+    guard_recursion(&mut module.funcs, &names, &mut strings);
 
     // A fixed-name wrapper around the user's `main`. The runtime always
     // calls `@luna.main`, whatever symbol typeck gave `main`'s instance and
@@ -104,6 +106,222 @@ pub fn lower(tir: &Tir) -> Module {
 
     module.data = strings.data;
     module
+}
+
+// -- stack overflow -------------------------------------------------------------
+
+/// Every call takes some stack, which ends; past its end the program would
+/// crash without a word. Only a function that can call itself again,
+/// directly or through others, can go arbitrarily deep, so each of those
+/// first checks that the stack has not come down to `rt.stack_limit`, and
+/// otherwise stops the program with a `StackOverflowError` naming it. (A
+/// call in tail position does not go deeper: see `tail_calls`.)
+fn guard_recursion(funcs: &mut [lir::Function], names: &[String], strings: &mut Strings) {
+    let index: HashMap<String, usize> = funcs
+        .iter()
+        .enumerate()
+        .map(|(k, f)| (f.name.clone(), k))
+        .collect();
+    let callees: Vec<Vec<usize>> = funcs
+        .iter()
+        .map(|f| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|i| match &i.op {
+                    lir::Op::Call(name, _) => index.get(name).copied(),
+                    _ => None,
+                })
+                .collect()
+        })
+        .collect();
+    for k in 0..funcs.len() {
+        // Can `k` be reached from what it calls?
+        let mut seen = vec![false; funcs.len()];
+        let mut todo = callees[k].clone();
+        let mut recursive = false;
+        while let Some(c) = todo.pop() {
+            if c == k {
+                recursive = true;
+                break;
+            }
+            if !std::mem::replace(&mut seen[c], true) {
+                todo.extend(&callees[c]);
+            }
+        }
+        if recursive {
+            funcs[k] = guard_stack(funcs[k].clone(), &names[k], strings);
+        }
+    }
+}
+
+/// Put the stack check in front of `func`'s entry block. The address of a
+/// slot in its frame tells how far down the stack is.
+fn guard_stack(func: lir::Function, name: &str, strings: &mut Strings) -> lir::Function {
+    let mut b = FunctionBuilder::resume(func);
+    let ok = b.new_block("stack_ok");
+    let overflow = b.new_block("stack_overflow");
+    let entry = &mut b.func.blocks[0];
+    let (insts, term) = (std::mem::take(&mut entry.insts), entry.term.take());
+    let block = &mut b.func.blocks[ok.0 as usize];
+    (block.insts, block.term) = (insts, term);
+    let here = b.alloca(8);
+    let slot = b.addr("rt.stack_limit");
+    let limit = b.load(MemTy::I64, slot, 0);
+    let room = b.icmp(ICond::Uge, here, limit);
+    b.br(room, ok, vec![], overflow, vec![]);
+    b.switch_to(overflow);
+    let sym = strings.intern(name);
+    let header = b.addr(&sym);
+    let header_size = b.iconst(8);
+    let name = b.ibin(IBinOp::Add, header, header_size);
+    b.call("rt.stack_overflow", vec![name], None);
+    b.unreachable();
+    b.finish()
+}
+
+// -- tail calls ---------------------------------------------------------------
+
+/// The calls whose value is the function's result, with nothing left to do
+/// after them but the drops: the last expression of the body and every
+/// `ret` value, and inside them the arms of a `check` and the last
+/// expression of a block. Only a call giving exactly the function's result
+/// type counts (no conversion follows it). Also whether one of them may
+/// call `f` itself in a way that reuses its frame (see `reuses_frame`).
+fn tail_calls(tir: &Tir, f: &TFunc, assigned: &[bool]) -> (HashSet<*const TExpr>, bool) {
+    struct Scan<'a> {
+        tir: &'a Tir,
+        f: &'a TFunc,
+        assigned: &'a [bool],
+        out: HashSet<*const TExpr>,
+        reuses: bool,
+    }
+    impl Scan<'_> {
+        fn mark(&mut self, e: &TExpr) {
+            let (tir, f, assigned) = (self.tir, self.f, self.assigned);
+            match &e.kind {
+                TExprKind::Call { inst, args } if f.discard || e.ty == f.ret => {
+                    self.out.insert(e);
+                    self.reuses |=
+                        reuses_frame(tir, f, assigned, *inst, args, &tir.funcs[*inst].params);
+                }
+                TExprKind::Dispatch { args, cases, .. } if f.discard || e.ty == f.ret => {
+                    self.out.insert(e);
+                    self.reuses |= cases
+                        .iter()
+                        .any(|c| reuses_frame(tir, f, assigned, c.inst, args, &c.params));
+                }
+                TExprKind::Check { arms, else_arm, .. } => {
+                    for (_, body) in arms {
+                        self.mark(body);
+                    }
+                    if let Some(e) = else_arm {
+                        self.mark(e);
+                    }
+                }
+                TExprKind::Block { stmts, .. } => {
+                    if let Some(TStmt::Expr(e)) = stmts.last() {
+                        self.mark(e);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn rets(&mut self, e: &TExpr) {
+            if let TExprKind::Ret(Some(v)) = &e.kind {
+                self.mark(v);
+            }
+            visit_children(e, &mut |c| self.rets(c));
+        }
+    }
+    let mut scan = Scan {
+        tir,
+        f,
+        assigned,
+        out: HashSet::new(),
+        reuses: false,
+    };
+    if let Some(TStmt::Expr(e)) = f.body.last() {
+        scan.mark(e);
+    }
+    crate::typeck::for_each_expr(&f.body, &mut |e| scan.rets(e));
+    (scan.out, scan.reuses)
+}
+
+/// Can a call of `inst` in tail position (see `tail_calls`) start `f`'s
+/// body again instead? It must call `f` itself, and the drops before the
+/// jump must not free what it borrows: a borrowed argument must be a value
+/// that outlives `f`'s frame (a number, a string literal, a borrowed
+/// parameter, or part of one), already of the parameter's type.
+fn reuses_frame(
+    tir: &Tir,
+    f: &TFunc,
+    assigned: &[bool],
+    inst: usize,
+    args: &[TExpr],
+    params: &[Ty],
+) -> bool {
+    fn lasting(a: &TExpr, f: &TFunc, assigned: &[bool]) -> bool {
+        if !a.ty.needs_drop() {
+            return true;
+        }
+        match &a.kind {
+            TExprKind::Str(_) => true,
+            TExprKind::Local(l) => *l < f.params.len() && f.borrowed[*l] && !assigned[*l],
+            TExprKind::Builtin(Builtin::Head | Builtin::Last, x) | TExprKind::Index(x, _)
+                if gives_element_itself(x.ty) =>
+            {
+                lasting(x, f, assigned)
+            }
+            TExprKind::Field(base, _) if !a.ty.is_copy() => lasting(base, f, assigned),
+            _ => false,
+        }
+    }
+    std::ptr::eq(&tir.funcs[inst], f)
+        && args
+            .iter()
+            .zip(params)
+            .zip(&f.borrowed)
+            .all(|((a, &to), &b)| !b || (a.ty == to && lasting(a, f, assigned)))
+}
+
+/// Whether evaluating `e` may leave it halfway, through a `ret`, `over` or
+/// `jump` inside. (One that belongs to a loop inside `e` does not, but
+/// counting it only costs a pending entry.)
+fn may_leave(e: &TExpr) -> bool {
+    let mut found = matches!(
+        e.kind,
+        TExprKind::Ret(_) | TExprKind::Over | TExprKind::Jump
+    );
+    if !found {
+        visit_children(e, &mut |c| found |= may_leave(c));
+    }
+    found
+}
+
+/// Mark the variables the statements give values, at any depth.
+fn assigned_locals(stmts: &[TStmt], out: &mut [bool]) {
+    fn expr(e: &TExpr, out: &mut [bool]) {
+        if let TExprKind::Block { stmts, .. } = &e.kind {
+            assigned_locals(stmts, out);
+        } else {
+            visit_children(e, &mut |c| expr(c, out));
+        }
+    }
+    for s in stmts {
+        match s {
+            TStmt::Let { local, value } => {
+                out[*local] = true;
+                expr(value, out);
+            }
+            TStmt::Expr(e) => expr(e, out),
+            TStmt::Loop { source, body, .. } => {
+                source.exprs().into_iter().for_each(|e| expr(e, out));
+                assigned_locals(body, out);
+            }
+        }
+    }
 }
 
 /// `rt.out_hook`, which the runtime's `rt.out` calls with every piece of
@@ -269,6 +487,32 @@ struct FnLower<'a> {
     /// The current code follows a `ret`: it never runs, and the paths that
     /// join after `check` arms or loops must not count it.
     dead: bool,
+    /// The loops being lowered, innermost last, for `over` and `jump`.
+    loops: Vec<LoopCx>,
+    /// The calls in tail position (see `tail_calls`), and the block that
+    /// starts the body again with new parameters, if one of them calls
+    /// this function.
+    tail: HashSet<*const TExpr>,
+    restart: Option<BlockId>,
+    /// The parameters the body gives new values.
+    assigned: Vec<bool>,
+}
+
+/// Where `over` and `jump` go in a loop being lowered.
+struct LoopCx {
+    header: BlockId,
+    exit: BlockId,
+    /// The arguments of the header that start the next round, before the
+    /// carried variables.
+    next: [Value; 2],
+    carried: Vec<(usize, Ty)>,
+    inner: Vec<usize>,
+    /// How many values were pending when the body started: those after are
+    /// the body's, freed when a round ends early.
+    pending: usize,
+    /// The body has an `over`: a moving loop may leave elements in its
+    /// source.
+    over: bool,
 }
 
 /// A variable of a maybe type (`string?`) inside a `check` arm where it
@@ -294,11 +538,29 @@ impl<'a> FnLower<'a> {
         let ret = if f.discard { None } else { ret_repr(f.ret) };
         let mut b = FunctionBuilder::new(f.symbol.clone(), &params, ret);
         b.func.comment = Some(f.signature());
+        let n = f.local_tys.len();
+        let mut assigned = vec![false; n];
+        let (mut tail, mut reuses) = (HashSet::new(), false);
+        if f.native.is_none() {
+            assigned_locals(&f.body, &mut assigned);
+            (tail, reuses) = tail_calls(tir, f, &assigned);
+        }
+        // A call of this function in tail position reuses its frame: it
+        // jumps back to the start of the body, whose block takes the
+        // parameters, so a deep recursion runs like a loop.
+        let mut restart = None;
+        let mut starts: Vec<Value> = (0..f.params.len()).map(|i| b.param(i)).collect();
+        if reuses {
+            let block = b.new_block("restart");
+            let ps: Vec<Value> = params.iter().map(|&t| b.block_param(block, t)).collect();
+            b.jmp(block, starts);
+            b.switch_to(block);
+            starts = ps;
+            restart = Some(block);
+        }
         // The parameters are the first variables. Arguments are moved into
         // the call, so the function owns them, except those it borrows.
-        let n = f.local_tys.len();
-        let mut locals: Vec<Option<Value>> =
-            (0..f.params.len()).map(|i| Some(b.param(i))).collect();
+        let mut locals: Vec<Option<Value>> = starts.into_iter().map(Some).collect();
         locals.resize(n, None);
         let mut local_tys = f.params.clone();
         local_tys.resize(n, Ty::NEVER);
@@ -324,6 +586,10 @@ impl<'a> FnLower<'a> {
             lent,
             pending: Vec::new(),
             dead: false,
+            loops: Vec::new(),
+            tail,
+            restart,
+            assigned,
         }
     }
 
@@ -402,6 +668,19 @@ impl<'a> FnLower<'a> {
         let after = self.b.new_block("after_ret");
         self.b.switch_to(after);
         self.dead = true;
+    }
+
+    /// A call of this function in tail position, with these arguments: as
+    /// `ret` would after the call, drop everything the function still owns,
+    /// then start the body again instead of calling.
+    fn restart(&mut self, args: Vec<Value>) {
+        self.drop_owned(&self.owned.clone(), None);
+        for k in (0..self.pending.len()).rev() {
+            let (v, ty) = (self.pending[k].value, self.pending[k].ty);
+            self.fns.drop(&mut self.b, v, ty);
+        }
+        let restart = self.restart.expect("a tail call that reuses the frame");
+        self.b.jmp(restart, args);
     }
 
     /// A parameter with a pattern `(x:y:xs)` receives an array with at
@@ -529,7 +808,11 @@ impl<'a> FnLower<'a> {
 
         self.b.switch_to(header);
         let more = self.iter_more(&it, counter);
-        self.b.br(more, body_block, vec![], exit, vec![]);
+        self.b.br(more, body_block, vec![], exit, params.clone());
+        let after: Vec<Value> = carried
+            .iter()
+            .map(|&(_, ty)| self.b.block_param(exit, repr(ty)))
+            .collect();
         let at_header = self.owned.clone();
         for (&(l, _), &p) in carried.iter().zip(&params) {
             self.locals[l] = Some(p);
@@ -544,9 +827,19 @@ impl<'a> FnLower<'a> {
         }
         let one = self.b.iconst(1);
         let next_position = self.b.ibin(IBinOp::Add, position, one);
+        self.loops.push(LoopCx {
+            header,
+            exit,
+            next: [next, next_position],
+            carried: carried.to_vec(),
+            inner: inner.to_vec(),
+            pending: self.pending.len(),
+            over: false,
+        });
         for stmt in body {
             self.stmt(stmt);
         }
+        let cx = self.loops.pop().expect("the loop is open");
         if std::mem::take(&mut self.dead) {
             // The body always returns: no next iteration.
             self.b.unreachable();
@@ -572,12 +865,57 @@ impl<'a> FnLower<'a> {
         // After the loop: the ownership checker made sure every outside
         // variable is owned exactly as it was before the loop.
         self.b.switch_to(exit);
-        for (&(l, ty), &p) in carried.iter().zip(&params) {
+        for (&(l, ty), &p) in carried.iter().zip(&after) {
             self.locals[l] = Some(p);
             self.local_tys[l] = ty;
         }
         self.owned = at_header;
-        self.iter_end(&it);
+        self.iter_end(&it, cx.over);
+    }
+
+    /// `over` (`to_exit`) or `jump`: end this round of the innermost loop
+    /// now. The body's own variables and the values it has pending are
+    /// freed, as at the end of the body; then the loop ends, or goes on with
+    /// its next round.
+    fn leave_round(&mut self, to_exit: bool) {
+        let saved = (
+            self.locals.clone(),
+            self.local_tys.clone(),
+            self.owned.clone(),
+        );
+        let cx = self.loops.last_mut().expect("resolved inside a loop");
+        cx.over |= to_exit;
+        let (inner, carried, mark) = (cx.inner.clone(), cx.carried.clone(), cx.pending);
+        let (header, exit, next) = (cx.header, cx.exit, cx.next);
+        let mut dropped = Owned {
+            locals: vec![false; self.owned.locals.len()],
+        };
+        for &l in &inner {
+            dropped.locals[l] = self.owned.locals[l];
+        }
+        self.drop_owned(&dropped, None);
+        for k in (mark..self.pending.len()).rev() {
+            let (v, ty) = (self.pending[k].value, self.pending[k].ty);
+            self.fns.drop(&mut self.b, v, ty);
+        }
+        // A carried variable seen through a view goes on as its box.
+        for view in &self.views {
+            if !view.moved_out && carried.iter().any(|&(l, _)| l == view.local) {
+                self.locals[view.local] = Some(view.boxed);
+                self.local_tys[view.local] = view.ty;
+            }
+        }
+        let mut args = if to_exit { vec![] } else { next.to_vec() };
+        for &(l, ty) in &carried {
+            args.push(self.carry(l, ty));
+        }
+        self.b.jmp(if to_exit { exit } else { header }, args);
+        (self.locals, self.local_tys, self.owned) = saved;
+        let after = self
+            .b
+            .new_block(if to_exit { "after_over" } else { "after_jump" });
+        self.b.switch_to(after);
+        self.dead = true;
     }
 
     // -- going through ranges, arrays and strings -------------------------------
@@ -717,14 +1055,16 @@ impl<'a> FnLower<'a> {
     }
 
     /// Done going through: a source the loop owns is freed. If its elements
-    /// were moved out, only the array itself is left to free.
-    fn iter_end(&mut self, it: &Iter) {
+    /// were moved out, only the array itself is left to free, unless the
+    /// loop may have ended early (`left`): then the elements not taken yet
+    /// are freed too (the taken ones left placeholders).
+    fn iter_end(&mut self, it: &Iter, left: bool) {
         let Some(e) = it.owned else {
             return;
         };
         let pending = self.unpend(e).expect("the source is pending");
         match it.kind {
-            IterKind::Array { array, .. } if it.moving => {
+            IterKind::Array { array, .. } if it.moving && !left => {
                 self.b.call("rt.free", vec![array], None);
             }
             _ => self.fns.drop(&mut self.b, pending.0, pending.1),
@@ -790,7 +1130,7 @@ impl<'a> FnLower<'a> {
         if !guards.is_empty() {
             self.b.store(MemTy::I64, result, 0, k);
         }
-        self.iter_end(&it);
+        self.iter_end(&it, false);
         result
     }
 
@@ -886,7 +1226,7 @@ impl<'a> FnLower<'a> {
                 self.b.jmp(header, vec![next, next_position]);
                 self.owned.locals[*var] = false;
                 self.b.switch_to(exit);
-                self.iter_end(&it);
+                self.iter_end(&it, false);
             }
         }
     }
@@ -956,8 +1296,8 @@ impl<'a> FnLower<'a> {
     /// elements of both. It takes both operands: their elements move into
     /// the result, so nothing is copied.
     fn concat(&mut self, a: &TExpr, b: &TExpr, ty: Ty) -> Value {
-        let va = self.expr(a, Use::Move);
-        let vb = self.expr(b, Use::Move);
+        let v = self.operands(&[(a, Use::Move), (b, Use::Move)]);
+        let (va, vb) = (v[0], v[1]);
         let elem = ty.elem().unwrap_or(Ty::NEVER);
         let (ea, eb) = (
             a.ty.elem().unwrap_or(Ty::NEVER),
@@ -997,8 +1337,8 @@ impl<'a> FnLower<'a> {
     /// both operands. (Their elements are numbers, so the result is built
     /// with copies of them, and the operands are dropped.)
     fn elem_mul(&mut self, a: &TExpr, b: &TExpr, ty: Ty) -> Value {
-        let va = self.expr(a, Use::Move);
-        let vb = self.expr(b, Use::Move);
+        let v = self.operands(&[(a, Use::Move), (b, Use::Move)]);
+        let (va, vb) = (v[0], v[1]);
         let r = if a.ty.as_kind() == Some(Kind::Array) && b.ty.as_kind() == Some(Kind::Array) {
             self.elem_mul_arrays(va, a.ty, vb, b.ty, ty)
         } else {
@@ -1088,8 +1428,8 @@ impl<'a> FnLower<'a> {
     /// number, copied as usual. A character is a new string.
     fn index(&mut self, e: &TExpr, a: &TExpr, i: &TExpr, ty: Ty) -> Value {
         let itself = gives_element_itself(a.ty);
-        let va = self.expr(a, Use::Borrow);
-        let vi = self.expr(i, Use::Borrow);
+        let v = self.operands(&[(a, Use::Borrow), (i, Use::Borrow)]);
+        let (va, vi) = (v[0], v[1]);
         // The position, and whether there is one (it may be void).
         let (has_pos, pos) = if i.ty == Ty::INT {
             (self.b.iconst(1), vi)
@@ -1525,6 +1865,32 @@ impl<'a> FnLower<'a> {
         }
     }
 
+    /// Evaluate the operands of one operation, in order. If a later one may
+    /// leave (`ret`, `over`, `jump`), the values of the earlier ones that
+    /// are still to be used or dropped are pending while it runs, so that
+    /// leaving frees them; afterwards they are the operation's again.
+    fn operands(&mut self, items: &[(&TExpr, Use)]) -> Vec<Value> {
+        let mut vals = Vec::with_capacity(items.len());
+        let mut held = Vec::new();
+        for (k, &(e, usage)) in items.iter().enumerate() {
+            let v = self.expr(e, usage);
+            vals.push(v);
+            let owned = e.ty.needs_drop() && (usage == Use::Move || !e.is_borrowed());
+            if owned && items[k + 1..].iter().any(|(later, _)| may_leave(later)) {
+                self.pending.push(Pending {
+                    key: e,
+                    value: v,
+                    ty: e.ty,
+                });
+                held.push(e);
+            }
+        }
+        for e in held {
+            self.unpend(e);
+        }
+        vals
+    }
+
     /// Drop the temporaries the borrowed value `e` was taken from.
     fn release(&mut self, e: &TExpr) {
         if let Some((v, ty)) = self.unpend(e) {
@@ -1677,9 +2043,14 @@ impl<'a> FnLower<'a> {
                 self.ret(value.as_deref());
                 self.dummy(e.ty)
             }
+            TExprKind::Over | TExprKind::Jump => {
+                self.leave_round(matches!(e.kind, TExprKind::Over));
+                self.dummy(e.ty)
+            }
             TExprKind::Array(items) => {
                 let elem = e.ty.elem().unwrap_or(Ty::NEVER);
-                let vals: Vec<Value> = items.iter().map(|i| self.expr(i, Use::Move)).collect();
+                let items: Vec<_> = items.iter().map(|i| (i, Use::Move)).collect();
+                let vals = self.operands(&items);
                 let n = self.b.iconst(vals.len() as i64);
                 let array = self
                     .b
@@ -1744,11 +2115,28 @@ impl<'a> FnLower<'a> {
             // call if they are temporaries.
             TExprKind::Call { inst, args } => {
                 let callee = &self.tir.funcs[*inst];
-                let vals: Vec<Value> = args
+                let operands: Vec<_> = args
                     .iter()
                     .zip(&callee.borrowed)
-                    .map(|(a, &b)| self.expr(a, if b { Use::Borrow } else { Use::Move }))
+                    .map(|(a, &b)| (a, if b { Use::Borrow } else { Use::Move }))
                     .collect();
+                let vals = self.operands(&operands);
+                if self.tail.contains(&(e as *const TExpr))
+                    && reuses_frame(
+                        self.tir,
+                        self.f,
+                        &self.assigned,
+                        *inst,
+                        args,
+                        &callee.params,
+                    )
+                {
+                    self.restart(vals);
+                    let after = self.b.new_block("after_tail_call");
+                    self.b.switch_to(after);
+                    self.dead = true;
+                    return self.dummy(e.ty);
+                }
                 let ret = if callee.discard {
                     None
                 } else {
@@ -1783,11 +2171,12 @@ impl<'a> FnLower<'a> {
             } => {
                 // Every case borrows the same parameters (see `hir`).
                 let borrowed = &self.tir.funcs[cases[0].inst].borrowed;
-                let vals: Vec<Value> = args
+                let operands: Vec<_> = args
                     .iter()
                     .zip(borrowed)
-                    .map(|(a, &b)| self.expr(a, if b { Use::Borrow } else { Use::Move }))
+                    .map(|(a, &b)| (a, if b { Use::Borrow } else { Use::Move }))
                     .collect();
+                let vals = self.operands(&operands);
                 let merge = self.b.new_block("dispatch_end");
                 let result = self.b.block_param(merge, repr(e.ty));
                 for case in cases {
@@ -1829,6 +2218,28 @@ impl<'a> FnLower<'a> {
                     }
                     self.b.jmp(take, vec![]);
                     self.b.switch_to(take);
+                    if self.tail.contains(&(e as *const TExpr))
+                        && reuses_frame(
+                            self.tir,
+                            self.f,
+                            &self.assigned,
+                            case.inst,
+                            args,
+                            &case.params,
+                        )
+                    {
+                        // The arguments are only converted (`reuses_frame`
+                        // made sure a borrowed one needs no conversion).
+                        let converted: Vec<Value> = vals
+                            .iter()
+                            .zip(args)
+                            .zip(&case.params)
+                            .map(|((&v, a), &to)| self.convert(v, a.ty, to))
+                            .collect();
+                        self.restart(converted);
+                        self.b.switch_to(next);
+                        continue;
+                    }
                     let converted: Vec<Value> = vals
                         .iter()
                         .zip(args)
@@ -1878,14 +2289,13 @@ impl<'a> FnLower<'a> {
                 result
             }
             TExprKind::Diverge(args) => {
-                for a in args {
-                    self.expr(a, Use::Move);
-                }
+                let operands: Vec<_> = args.iter().map(|a| (a, Use::Move)).collect();
+                self.operands(&operands);
                 self.dummy(e.ty)
             }
             TExprKind::Binary { op, lhs, rhs } => {
-                let l = self.expr(lhs, Use::Borrow);
-                let r = self.expr(rhs, Use::Borrow);
+                let v = self.operands(&[(lhs, Use::Borrow), (rhs, Use::Borrow)]);
+                let (l, r) = (v[0], v[1]);
                 if e.ty.is_never() {
                     return self.dummy(e.ty);
                 }
@@ -2467,7 +2877,9 @@ impl<'a> FnLower<'a> {
             // Two ints (see `binop_result`): the runtime stops the program
             // on `x % 0` instead of letting the machine trap.
             BinOp::Mod => self.b.call("rt.mod", vec![a, b], Some(Type::I64)).unwrap(),
-            BinOp::Concat | BinOp::Index | BinOp::ElemMul => unreachable!("lowered separately"),
+            BinOp::Concat | BinOp::Index | BinOp::ElemMul | BinOp::And | BinOp::Or => {
+                unreachable!("lowered separately")
+            }
             BinOp::Eq | BinOp::Ne => {
                 let eq = if ka == Array && kb == Array {
                     if ta == tb {

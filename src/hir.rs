@@ -342,6 +342,8 @@ pub enum HExprKind {
         rhs: Box<HExpr>,
     },
     Neg(Box<HExpr>),
+    /// `!b` on a boolean.
+    Not(Box<HExpr>),
     /// `value :? Trail`: whether the value follows the trail. `ty` and
     /// `bound` are what a parameter declared with that trail would have.
     Is {
@@ -351,6 +353,10 @@ pub enum HExprKind {
     },
     /// `ret value` / `ret`.
     Ret(Option<Box<HExpr>>),
+    /// `over`: leave the innermost loop.
+    Over,
+    /// `jump`: the innermost loop's next round.
+    Jump,
     /// A call of a built-in function, which takes one argument.
     Builtin(Builtin, Box<HExpr>),
     Array(Vec<HExpr>),
@@ -372,6 +378,10 @@ pub enum HExprKind {
         /// Written as `if cond:` (with `else:`): `true ->` the first block,
         /// `else ->` the other one, or void.
         is_if: bool,
+        /// Written as `a && b` (`true -> b; false -> false`) or `a || b`
+        /// (`true -> true; false -> b`): `b` only runs when `a` does not
+        /// decide, and both must be booleans.
+        logic: Option<BinOp>,
     },
     /// The block of an `if` or an `else`: statements, the last of which
     /// gives the value (void if it is not an expression).
@@ -793,6 +803,8 @@ fn used_locals(e: &HExpr, out: &mut Vec<LocalId>) {
         | HExprKind::Float(_)
         | HExprKind::Str(_)
         | HExprKind::Bool(_)
+        | HExprKind::Over
+        | HExprKind::Jump
         | HExprKind::Void => {}
         HExprKind::Call { args, .. } | HExprKind::Array(args) => args.iter().for_each(go),
         HExprKind::Binary { lhs, rhs, .. } | HExprKind::Range(lhs, rhs) => {
@@ -800,6 +812,7 @@ fn used_locals(e: &HExpr, out: &mut Vec<LocalId>) {
             go(rhs);
         }
         HExprKind::Neg(x)
+        | HExprKind::Not(x)
         | HExprKind::Echo(x)
         | HExprKind::Builtin(_, x)
         | HExprKind::Field(x, _, _)
@@ -1270,6 +1283,7 @@ pub fn resolve_files(
                 locals: others.iter().cloned().zip(0..).collect(),
                 local_names: others.clone(),
                 assigned: Vec::new(),
+                loop_depth: 0,
                 fixed: (0..others.len()).collect(),
                 errors: Vec::new(),
             };
@@ -1312,6 +1326,7 @@ pub fn resolve_files(
             locals: params.iter().cloned().zip(0..).collect(),
             local_names: params,
             assigned: Vec::new(),
+            loop_depth: 0,
             fixed: (0..borrowed.len()).filter(|&i| borrowed[i]).collect(),
             errors: Vec::new(),
         };
@@ -1393,6 +1408,7 @@ pub fn resolve_files(
                 locals: params.iter().cloned().zip(0..).collect(),
                 local_names: params.clone(),
                 assigned: Vec::new(),
+                loop_depth: 0,
                 fixed: (0..params.len()).collect(),
                 errors: Vec::new(),
             };
@@ -1486,6 +1502,7 @@ pub fn resolve_files(
                 locals: params.iter().cloned().zip(0..).collect(),
                 local_names: params.clone(),
                 assigned: Vec::new(),
+                loop_depth: 0,
                 fixed: (0..borrowed.len()).filter(|&i| borrowed[i]).collect(),
                 errors: Vec::new(),
             };
@@ -1669,6 +1686,9 @@ struct Resolver<'a> {
     /// Every variable given a value so far, in order; a loop looks at the
     /// part written while resolving its body.
     assigned: Vec<LocalId>,
+    /// How many loops of this function enclose the current expression
+    /// (a list comprehension starts again from 0: it is not a loop).
+    loop_depth: usize,
     /// Variables that hold something borrowed: `@` parameters and the
     /// variables of loops over `@source`. They cannot get a new value.
     fixed: Vec<LocalId>,
@@ -1750,7 +1770,9 @@ impl<'a> Resolver<'a> {
                 if *borrowed {
                     self.fixed.push(var);
                 }
+                self.loop_depth += 1;
                 let body = self.stmts(body);
+                self.loop_depth -= 1;
                 self.locals.truncate(visible);
                 let mut carried: Vec<LocalId> = self.assigned[assigned..]
                     .iter()
@@ -2217,12 +2239,41 @@ impl<'a> Resolver<'a> {
                     .collect::<Result<_, _>>()?;
                 HExprKind::Call { name, args }
             }
+            // `a && b` is `check a: true -> b; false -> false`, and `a || b`
+            // is `check a: true -> true; false -> b`.
+            ExprKind::Binary {
+                op: op @ (BinOp::And | BinOp::Or),
+                lhs,
+                rhs,
+            } => {
+                let scrutinee = Box::new(self.expr(lhs)?);
+                let (first_new, assigned) = (self.local_names.len(), self.assigned.len());
+                let rhs = self.expr(rhs)?;
+                let constant = |b: bool| HExpr {
+                    kind: HExprKind::Bool(b),
+                    span: e.span,
+                };
+                let arms = if *op == BinOp::And {
+                    vec![(constant(true), rhs), (constant(false), constant(false))]
+                } else {
+                    vec![(constant(true), constant(true)), (constant(false), rhs)]
+                };
+                HExprKind::Check {
+                    scrutinee,
+                    arms,
+                    else_arm: None,
+                    carried: self.carried_since(first_new, assigned),
+                    is_if: false,
+                    logic: Some(*op),
+                }
+            }
             ExprKind::Binary { op, lhs, rhs } => HExprKind::Binary {
                 op: *op,
                 lhs: Box::new(self.expr(lhs)?),
                 rhs: Box::new(self.expr(rhs)?),
             },
             ExprKind::Neg(inner) => HExprKind::Neg(Box::new(self.expr(inner)?)),
+            ExprKind::Not(inner) => HExprKind::Not(Box::new(self.expr(inner)?)),
             ExprKind::Is(value, trail) => {
                 let library = |global: &str| self.trails.get(global).map(|t| t.library);
                 let ty = resolve_ty(trail, self.names, &library)?;
@@ -2237,6 +2288,22 @@ impl<'a> Resolver<'a> {
                     bound,
                 }
             }
+            ExprKind::Over | ExprKind::Jump if self.loop_depth == 0 => {
+                let (word, what) = if matches!(e.kind, ExprKind::Over) {
+                    ("over", "leaves a loop")
+                } else {
+                    ("jump", "goes on with a loop's next round")
+                };
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    e.span,
+                    format!(
+                        "`{word}` {what}, but this is not inside a `loop` (a list comprehension is not one)"
+                    ),
+                ));
+            }
+            ExprKind::Over => HExprKind::Over,
+            ExprKind::Jump => HExprKind::Jump,
             ExprKind::Ret(value) => HExprKind::Ret(match value {
                 Some(v) => Some(Box::new(self.expr_in(v, self.ret)?)),
                 None => None,
@@ -2258,6 +2325,7 @@ impl<'a> Resolver<'a> {
                 // it; the body sees them all. None exist after the brackets.
                 let visible = self.locals.len();
                 let elem = expect.and_then(|t| t.elem());
+                let loops = std::mem::take(&mut self.loop_depth);
                 let resolved = self.clauses(clauses).and_then(|clauses| {
                     let body = self.expr_in(body, elem)?;
                     Ok(HExprKind::Comprehension {
@@ -2265,6 +2333,7 @@ impl<'a> Resolver<'a> {
                         clauses,
                     })
                 });
+                self.loop_depth = loops;
                 self.locals.truncate(visible);
                 resolved?
             }
@@ -2290,6 +2359,7 @@ impl<'a> Resolver<'a> {
                     else_arm,
                     carried: self.carried_since(first_new, assigned),
                     is_if: false,
+                    logic: None,
                 }
             }
             // `if cond: a else: b` is `check cond: true -> a; else -> b`,
@@ -2319,6 +2389,7 @@ impl<'a> Resolver<'a> {
                     else_arm: Some(Box::new(otherwise)),
                     carried: self.carried_since(first_new, assigned),
                     is_if: true,
+                    logic: None,
                 }
             }
             // A bare `{...}` is a value of the trail expected here.

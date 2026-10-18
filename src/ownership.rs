@@ -88,6 +88,7 @@ pub fn check(tir: &Tir) -> Result<(), Vec<Diagnostic>> {
                 .map(|(i, _)| (i, Lent::Param))
                 .collect(),
             diverged: false,
+            loops: Vec::new(),
             errors: Vec::new(),
         };
         c.function();
@@ -141,6 +142,9 @@ struct Checker<'a> {
     /// The current path has left the function (`ret`): it continues nowhere,
     /// so its moves do not matter for what follows.
     diverged: bool,
+    /// The loops being checked, innermost last: what was moved before the
+    /// loop, its body's own variables, and where its source is.
+    loops: Vec<(HashMap<Owner, Span>, Vec<Owner>, Span)>,
     errors: Vec<Diagnostic>,
 }
 
@@ -216,52 +220,73 @@ impl Checker<'_> {
                 for l in inner {
                     self.moved.remove(l);
                 }
+                self.loops.push((before, inner.clone(), range));
                 self.stmts(body);
-                // A body that always leaves the function never starts
-                // another iteration.
-                if std::mem::take(&mut self.diverged) {
-                    self.moved = before;
-                    self.borrows.truncate(mark);
-                    return;
-                }
-                let outside = |owner: &Owner| !inner.contains(owner);
-                let mut moved: Vec<(Owner, Span)> = self.moved.clone().into_iter().collect();
-                moved.sort_by_key(|(o, _)| *o);
-                for (owner, span) in moved {
-                    if outside(&owner) && !before.contains_key(&owner) {
-                        let name = self.name(owner).to_string();
-                        self.errors.push(Diagnostic::error(
-                            ErrorKind::OwnershipError,
-                            span,
-                            format!(
-                                "`{name}` is moved in this loop, so the next iteration would find it without a value; give `{name}` a new value before the end of the loop body"
-                            ),
-                        ));
-                    }
-                }
-                let mut revived: Vec<(Owner, Span)> = before
-                    .iter()
-                    .filter(|(o, _)| outside(o) && !self.moved.contains_key(o))
-                    .map(|(o, s)| (*o, *s))
-                    .collect();
-                revived.sort_by_key(|(o, _)| *o);
-                for (owner, moved_at) in revived {
-                    let name = self.name(owner).to_string();
-                    self.errors.push(
-                        Diagnostic::error(
-                            ErrorKind::OwnershipError,
-                            range,
-                            format!(
-                                "`{name}` gets a value in this loop, but it was moved before the loop, so after the loop it would hold a value only if the loop ran"
-                            ),
-                        )
-                        .with_note(moved_at, format!("the value of `{name}` was moved here")),
+                // A body that always leaves the function (or the round, with
+                // `over` or `jump`, checked there) does not reach its end.
+                if !std::mem::take(&mut self.diverged) {
+                    self.round_ends(
+                        "so the next iteration would find it without a value; give `{name}` a new value before the end of the loop body",
+                        None,
                     );
                 }
+                let (before, _, _) = self.loops.pop().unwrap();
                 self.moved = before;
             }
         }
         self.borrows.truncate(mark);
+    }
+
+    /// A round of the innermost loop ends here: at the end of its body, at a
+    /// `jump` or at an `over`. Then the variables from outside the loop must
+    /// be as they were before it, for the next round and after the loop.
+    /// `then` says what would go wrong with a variable moved in the loop;
+    /// `early` is the `over` or `jump` that ends the round.
+    fn round_ends(&mut self, then: &str, early: Option<(Span, &str)>) {
+        let (before, inner, range) = self.loops.last().unwrap();
+        let outside = |owner: &Owner| !inner.contains(owner);
+        let mut moved: Vec<(Owner, Span)> = self
+            .moved
+            .iter()
+            .filter(|(o, _)| outside(o) && !before.contains_key(o))
+            .map(|(o, s)| (*o, *s))
+            .collect();
+        moved.sort_by_key(|(o, _)| *o);
+        let mut revived: Vec<(Owner, Span)> = before
+            .iter()
+            .filter(|(o, _)| outside(o) && !self.moved.contains_key(o))
+            .map(|(o, s)| (*o, *s))
+            .collect();
+        revived.sort_by_key(|(o, _)| *o);
+        let range = *range;
+        for (owner, span) in moved {
+            let name = self.name(owner).to_string();
+            let mut d = Diagnostic::error(
+                ErrorKind::OwnershipError,
+                span,
+                format!(
+                    "`{name}` is moved in this loop, {}",
+                    then.replace("{name}", &name)
+                ),
+            );
+            if let Some((at, what)) = early {
+                d = d.with_note(at, what);
+            }
+            self.errors.push(d);
+        }
+        for (owner, moved_at) in revived {
+            let name = self.name(owner).to_string();
+            self.errors.push(
+                Diagnostic::error(
+                    ErrorKind::OwnershipError,
+                    range,
+                    format!(
+                        "`{name}` gets a value in this loop, but it was moved before the loop, so after the loop it would hold a value only if the loop ran"
+                    ),
+                )
+                .with_note(moved_at, format!("the value of `{name}` was moved here")),
+            );
+        }
     }
 
     /// What a loop or a generator goes through. It moves into the loop,
@@ -372,6 +397,21 @@ impl Checker<'_> {
                 if let Some(v) = value {
                     self.take(&[v]);
                 }
+                self.diverged = true;
+            }
+            // The round ends here, and what follows on this path never runs.
+            TExprKind::Jump => {
+                self.round_ends(
+                    "so the next iteration would find it without a value; give `{name}` a new value before this `jump`",
+                    Some((e.span, "the next iteration starts here")),
+                );
+                self.diverged = true;
+            }
+            TExprKind::Over => {
+                self.round_ends(
+                    "so after the loop it would have no value; give `{name}` a new value before this `over`",
+                    Some((e.span, "the loop ends here")),
+                );
                 self.diverged = true;
             }
             TExprKind::Neg(x) | TExprKind::Is(x, _) | TExprKind::Echo(x) => self.read(&[x]),

@@ -1,0 +1,10 @@
+# A recursion that never stops, outside of tail position (`1 +` is still to
+# do after each call), runs out of stack: the program stops with a
+# StackOverflowError naming the function, instead of crashing.
+
+depth n = 1 + depth (n + 1)
+
+main =
+    echo "before"
+    echo (depth 0)
+    echo "never printed"

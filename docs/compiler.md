@@ -79,6 +79,17 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   the loop and at the end of the body (and may not mix in `void`). A loop
   over an array or a string takes it (`loop x in a:`, see Ownership), or
   borrows it with `@` (`loop x in @a:`).
+- **`over` and `jump`** end the innermost loop (`break`) or its current
+  round (`continue`), from anywhere in the body, including `check` arms and
+  `if` blocks. They are expressions of type never, like `ret`. `hir`
+  rejects them outside a loop, and a list comprehension counts as outside
+  (`loop_depth` starts again from 0 in it). What the carried variables hold
+  at an `over` or a `jump` reaches the top of the loop or its end, so typeck
+  joins those types into the loop's widening too (`Ctx::loop_exits`).
+- **`[a..infinite]`** is a range without an end, only for a `loop` (typeck
+  makes its end `i64::MAX`). An array or a comprehension over one would
+  never be finished, so they are a `TypeError`. Constant evaluation counts
+  a range as it goes, so such a loop with an `over` can still be constant.
 - **Top level** holds only definitions; executable code goes in `main`
   (`main = ...`, no arguments, required).
 - **Application** binds tighter than operators (`sum a 9 + 1` is
@@ -138,7 +149,12 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
 - **Numbers.** `5` is an `int` (64-bit), `5.0`/`1e3` are `float` (64-bit).
   `int op int` stays `int` for `+ - *`; `/` always produces a `float`
   (`7 / 2` is `3.5`). Mixed `int`/`float` arithmetic gives `float`.
-- **Operators.** `+ - * / %`, unary `-`, `== != < <= > >=`, and `:?`. `+` also joins
+- **Operators.** `+ - * / %`, unary `-` and `!` (on a boolean; typeck makes
+  `!b` the `b != true`), `== != < <= > >=`, `:?`, and `&&` / `||`
+  on booleans (below the comparisons, `&&` first; `hir` makes `a && b` the
+  `check a: true -> b; false -> false`, and `a || b` the `check a: true ->
+  true; false -> b`, so the right side runs only when needed and gets a
+  `check`'s handling of moves and drops). `+` also joins
   two strings. Strings compare lexicographically. Arrays add `++` (between
   comparisons and `+`), `!!` (just below function application) and `**`
   (with `*` and `/`), and compare with `==` element by element.
@@ -272,6 +288,28 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   including inside loops and `check` arms; its value joins the function's
   result type (a bare `ret` adds void). It cannot be used inside a list
   comprehension.
+- **Tail calls.** A call whose value is the function's result is in tail
+  position: the last expression, a `ret` value, and inside those the arms
+  of a `check` (so the right side of `&&` / `||`) and the last expression
+  of a block. Only a call giving exactly the function's result type counts,
+  since no conversion may follow it. If it calls the same instance (a
+  `Call`, or the case of a `Dispatch` that is this definition), lowering
+  drops everything the function owns, as `ret` would, and jumps back to the
+  `restart` block at the top of the body, whose parameters are the
+  function's (`lower::tail_calls`, `reuses_frame`). A borrowed argument must
+  outlive the frame, so it must be a number, a string literal, or a `@`
+  parameter of this function (or a part of one) that the body never gives a
+  new value, already of the parameter's type. Calls of other functions are
+  ordinary calls (no mutual recursion).
+- **Stack overflow.** A function that can call itself again, directly or
+  through others (a cycle in the LIR call graph, `lower::guard_recursion`),
+  first compares the address of a slot in its frame with `rt.stack_limit`
+  and calls `rt.stack_overflow` below it, which prints `StackOverflowError:
+  the calls of `f` went too deep …` and exits with 1. Other functions are
+  bounded in depth and pay nothing. `rt.start` sets the limit 256 KB above
+  the end of the stack, leaving room to print the error: on macOS the stack
+  is `RLIMIT_STACK` (8 MB if unlimited) below `rt.start`'s frame, on Windows
+  `GetCurrentThreadStackLimits` gives it.
 - **Redefinition.** A later definition with the same name, arity and
   parameter types replaces the earlier one (with a warning). Definitions that
   differ in arity or parameter types are overloads.
@@ -367,7 +405,8 @@ marked, and nothing is copied unless the program asks.
   count), and has a value again only if every one gave it one.
 - **Loops.** A loop body must leave every outside variable as it found it:
   moving `s` inside the body is an error unless `s` gets a new value before
-  the body ends (otherwise the next iteration would find it empty), and a
+  the body ends (otherwise the next iteration would find it empty), and
+  before every `jump` or `over` (the round ends there too), and a
   variable moved before the loop cannot get a value inside it (whether it
   held one afterwards would depend on how often the loop ran). So the state
   after a loop never depends on the number of iterations. What a loop goes
@@ -402,6 +441,15 @@ counts or runtime flags:
   `check`'s scrutinee, an array whose element is in use. Thanks to the
   placeholders, dropping a half-consumed source frees exactly the elements
   not taken yet;
+- `over` and `jump` drop the body's own variables and the values that
+  became pending inside the body, then jump to the loop's end (whose block
+  takes the carried variables, like the header) or to its header. A loop
+  that owns an array and has an `over` frees it whole at the end, since
+  elements may be left in it;
+- while an operand that may leave (`ret`, `over`, `jump` inside) is being
+  evaluated, the values of the operands before it are pending too
+  (`FnLower::operands`), so `["x"] ++ (check …: … -> jump)` frees `["x"]`
+  on the way out;
 - when only some `check` arms move an owner, the other arms drop it before
   joining, so every path leaves the same owners behind;
 - unboxing an owned value (`numeric` → `int`) frees the box; unboxing a
@@ -753,6 +801,11 @@ assemblers.
 - register allocation and more LIR optimizations (constant folding, inlining)
 - more of the standard library
 - lazy list comprehensions (infinite lists such as `[x | x in [0..infinite]]`)
+- tail calls between different functions (mutual recursion), and a
+  borrowed argument made inside the function (it would need to be dropped
+  after the call)
+- `(x:xs)` copies the rest into a new array, so a recursion over a long
+  array is quadratic; a view of the rest would make it linear
 - maybe types of a program's trails in signatures (`-> Fruit?`)
 - running the Windows I/O layer in CI: it is only linked, not run, on
   other systems

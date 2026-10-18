@@ -266,6 +266,10 @@ pub enum BinOp {
     Le,
     Gt,
     Ge,
+    /// `a && b`: true when both are; `b` is only evaluated when `a` is true.
+    And,
+    /// `a || b`: true when either is; `b` is only evaluated when `a` is false.
+    Or,
     /// `a ++ b`: the elements of `a`, then those of `b`.
     Concat,
     /// `a !! i`: the element of `a` at position `i`.
@@ -289,6 +293,8 @@ impl BinOp {
             BinOp::Le => "<=",
             BinOp::Gt => ">",
             BinOp::Ge => ">=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
             BinOp::Concat => "++",
             BinOp::Index => "!!",
             BinOp::ElemMul => "**",
@@ -333,11 +339,17 @@ pub enum ExprKind {
         rhs: Box<Expr>,
     },
     Neg(Box<Expr>),
+    /// `!b`: true when the boolean `b` is false, and false when it is true.
+    Not(Box<Expr>),
     /// `value :? Trail`: whether `value` follows the trail, like Java's
     /// `instanceof`: `"hi" :? String` is true, and so is anything `:? Any`.
     Is(Box<Expr>, TypeAnn),
     /// `ret value` / `ret`: leave the function now with `value` (or void).
     Ret(Option<Box<Expr>>),
+    /// `over`: leave the innermost loop now.
+    Over,
+    /// `jump`: go on with the innermost loop's next round now.
+    Jump,
     /// `[a, b, c]`.
     Array(Vec<Expr>),
     /// `[start..end]`: the ints start, start + 1, ..., end - 1.
@@ -519,11 +531,18 @@ fn dump_expr(out: &mut String, e: &Expr, indent: usize) {
             dump_expr(out, inner, indent);
             out.push(')');
         }
+        ExprKind::Not(inner) => {
+            out.push_str("(not ");
+            dump_expr(out, inner, indent);
+            out.push(')');
+        }
         ExprKind::Is(value, trail) => {
             out.push_str("(:? ");
             dump_expr(out, value, indent);
             write!(out, " {trail})").unwrap();
         }
+        ExprKind::Over => out.push_str("(over)"),
+        ExprKind::Jump => out.push_str("(jump)"),
         ExprKind::Ret(value) => {
             out.push_str("(ret");
             if let Some(v) = value {
@@ -711,15 +730,19 @@ fn collect_block_variables(e: &Expr, out: &mut Vec<String>) {
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
         | ExprKind::Void
+        | ExprKind::Over
+        | ExprKind::Jump
         | ExprKind::Name(_) => {}
         ExprKind::Call { args, .. } | ExprKind::Array(args) => args.iter().for_each(go),
         ExprKind::Binary { lhs, rhs, .. } | ExprKind::Range(lhs, rhs) => {
             go(lhs);
             go(rhs);
         }
-        ExprKind::Neg(x) | ExprKind::Echo(x) | ExprKind::Field(x, _, _) | ExprKind::Is(x, _) => {
-            go(x)
-        }
+        ExprKind::Neg(x)
+        | ExprKind::Not(x)
+        | ExprKind::Echo(x)
+        | ExprKind::Field(x, _, _)
+        | ExprKind::Is(x, _) => go(x),
         ExprKind::Ret(x) => x.iter().for_each(|x| go(x)),
         ExprKind::Record(fields) => fields.iter().for_each(|(_, _, v)| go(v)),
         ExprKind::Method { receiver, args, .. } => {
@@ -786,6 +809,8 @@ fn rename_expr(e: &mut Expr, renames: &std::collections::HashMap<String, String>
         | ExprKind::Float(_)
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
+        | ExprKind::Over
+        | ExprKind::Jump
         | ExprKind::Void => {}
         ExprKind::Name(n) => {
             if !vars.contains(n)
@@ -808,9 +833,11 @@ fn rename_expr(e: &mut Expr, renames: &std::collections::HashMap<String, String>
             go(a);
             go(b);
         }
-        ExprKind::Neg(x) | ExprKind::Echo(x) | ExprKind::Field(x, _, _) | ExprKind::Is(x, _) => {
-            go(x)
-        }
+        ExprKind::Neg(x)
+        | ExprKind::Not(x)
+        | ExprKind::Echo(x)
+        | ExprKind::Field(x, _, _)
+        | ExprKind::Is(x, _) => go(x),
         ExprKind::Record(fields) => fields.iter_mut().for_each(|(_, _, v)| go(v)),
         ExprKind::Method { receiver, args, .. } => {
             go(receiver);

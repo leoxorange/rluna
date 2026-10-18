@@ -827,7 +827,7 @@ impl Parser {
         let (pos, var, var_span) = self.loop_names()?;
         self.expect(&TokenKind::In, "`in`")?;
         let borrowed = self.eat(&TokenKind::At);
-        let source = self.comparison()?;
+        let source = self.logic()?;
         self.expect(&TokenKind::Colon, "`:` after what the loop goes through")?;
         let header = loop_tok.span.to(self.prev_span());
         if self.peek() != &TokenKind::Newline {
@@ -857,6 +857,14 @@ impl Parser {
 
     fn expr(&mut self) -> PResult<Expr> {
         match self.peek() {
+            TokenKind::Over => Ok(Expr {
+                kind: ExprKind::Over,
+                span: self.bump().span,
+            }),
+            TokenKind::Jump => Ok(Expr {
+                kind: ExprKind::Jump,
+                span: self.bump().span,
+            }),
             TokenKind::Check => self.check(),
             TokenKind::If => self.if_expr(),
             TokenKind::Ret => {
@@ -880,7 +888,7 @@ impl Parser {
                     span: start.to(self.prev_span()),
                 })
             }
-            _ => self.comparison(),
+            _ => self.logic(),
         }
     }
 
@@ -901,7 +909,7 @@ impl Parser {
     fn check(&mut self) -> PResult<Expr> {
         let indent = self.line_indent(self.pos);
         let start = self.bump().span;
-        let scrutinee = self.comparison()?;
+        let scrutinee = self.logic()?;
         self.expect(&TokenKind::Colon, "`:` after the checked expression")?;
         let header = start.to(self.prev_span());
         let mut arms = Vec::new();
@@ -1005,7 +1013,7 @@ impl Parser {
     fn if_expr(&mut self) -> PResult<Expr> {
         let indent = self.line_indent(self.pos);
         let start = self.bump().span;
-        let cond = self.comparison()?;
+        let cond = self.logic()?;
         self.expect(&TokenKind::Colon, "`:` after the condition of `if`")?;
         let header = start.to(self.prev_span());
         let then = self.if_block(indent, header, "`if`")?;
@@ -1069,6 +1077,26 @@ impl Parser {
     ///
     /// `value :? Trail` sits on the same level, and takes a trail on its
     /// right, written as in a signature: `x + 1 :? Int` tests `x + 1`.
+    /// `a || b`, below `&&`, which is below the comparisons: `x < 1 || y > 2
+    /// && z` is `(x < 1) || ((y > 2) && z)`. Both are left-associative.
+    fn logic(&mut self) -> PResult<Expr> {
+        let mut lhs = self.and()?;
+        while !self.line_ends() && self.eat(&TokenKind::OrOr) {
+            let rhs = self.and()?;
+            lhs = binary(BinOp::Or, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn and(&mut self) -> PResult<Expr> {
+        let mut lhs = self.comparison()?;
+        while !self.line_ends() && self.eat(&TokenKind::AndAnd) {
+            let rhs = self.comparison()?;
+            lhs = binary(BinOp::And, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.concat()?;
         if self.line_ends() {
@@ -1211,6 +1239,17 @@ impl Parser {
     }
 
     fn unary(&mut self) -> PResult<Expr> {
+        // `!b`, like `-x`: tighter than every operator, so `!a && b` is
+        // `(!a) && b`; `!f x` is `!(f x)`.
+        if self.peek() == &TokenKind::Bang {
+            let start = self.bump().span;
+            let inner = self.unary()?;
+            let span = start.to(inner.span);
+            return Ok(Expr {
+                kind: ExprKind::Not(Box::new(inner)),
+                span,
+            });
+        }
         if self.peek() == &TokenKind::Minus {
             let start = self.bump().span;
             let inner = self.unary()?;
@@ -1507,6 +1546,13 @@ impl Parser {
                     span: span.to(self.prev_span()),
                 });
             }
+            TokenKind::BangBang => {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    span,
+                    "`!!` takes an element of an array (`a !! 2`); to negate twice, write `!(!b)`",
+                ));
+            }
             TokenKind::At => {
                 return Err(Diagnostic::error(
                     ErrorKind::SyntaxError,
@@ -1518,6 +1564,19 @@ impl Parser {
         };
         self.bump();
         Ok(Expr { kind, span })
+    }
+}
+
+/// `lhs op rhs`, spanning both.
+fn binary(op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
+    let span = lhs.span.to(rhs.span);
+    Expr {
+        kind: ExprKind::Binary {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+        },
+        span,
     }
 }
 
