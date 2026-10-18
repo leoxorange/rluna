@@ -19,6 +19,14 @@ lunac hello.luna --emit=ast,ir,asm     # also writes the syntax tree, the IR and
 
 The targets are `macos-arm64` (Apple silicon Macs) and `windows-x64`. Without `--target`, lunac builds for the system it runs on.
 
+### editor support
+
+`editors/vscode` is a Visual Studio Code extension that highlights luna code. To use it, link it into VS Code's extensions folder from the root of this repository, then reload VS Code (see `editors/vscode/README.md` for Windows and other ways):
+
+```
+ln -s "$PWD/editors/vscode" ~/.vscode/extensions/luna
+```
+
 ## chapter 1. basic syntax
 
 ### calculation

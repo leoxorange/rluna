@@ -1,0 +1,36 @@
+{
+  "name": "luna",
+  "displayName": "Luna",
+  "description": "Syntax highlighting for the Luna language (.luna files)",
+  "version": "0.1.0",
+  "publisher": "luna",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "luna",
+        "aliases": [
+          "Luna",
+          "luna"
+        ],
+        "extensions": [
+          ".luna"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "luna",
+        "scopeName": "source.luna",
+        "path": "./syntaxes/luna.tmLanguage.json"
+      }
+    ]
+  }
+}

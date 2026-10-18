@@ -19,6 +19,14 @@ lunac hello.luna --emit=ast,ir,asm     # 同時輸出語法樹、中介表示（
 
 目標平台有 `macos-arm64`（Apple 晶片的 Mac）和 `windows-x64`。不寫 `--target` 時，lunac 會為它目前執行的系統編譯。
 
+### 編輯器支援
+
+`editors/vscode` 是一個 Visual Studio Code 擴充功能，可以為 luna 程式碼提供語法高亮。使用時，在這個儲存庫的根目錄把它連結到 VS Code 的擴充功能資料夾，然後重新載入 VS Code（Windows 和其他方式見 `editors/vscode/README.md`）：
+
+```
+ln -s "$PWD/editors/vscode" ~/.vscode/extensions/luna
+```
+
 ## 第 1 章 基本語法
 
 ### 計算

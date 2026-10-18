@@ -1,0 +1,196 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Luna",
+  "scopeName": "source.luna",
+  "fileTypes": ["luna"],
+  "patterns": [
+    { "include": "#link" },
+    { "include": "#comment" },
+    { "include": "#trail-header" },
+    { "include": "#definition" },
+    { "include": "#signature" },
+    { "include": "#expression" }
+  ],
+  "repository": {
+    "comment": {
+      "match": "#.*$",
+      "name": "comment.line.number-sign.luna"
+    },
+    "link": {
+      "comment": "| entity/try > try, | entity#pred, next > p, n: a `#` right after the path picks definitions; after a space it starts a comment",
+      "begin": "^(\\|)",
+      "beginCaptures": { "1": { "name": "keyword.control.import.luna" } },
+      "end": "$",
+      "patterns": [
+        { "match": "(?<=\\s)#.*$", "name": "comment.line.number-sign.luna" },
+        { "match": "(?<=\\w)(#)", "captures": { "1": { "name": "keyword.operator.pick.luna" } } },
+        { "match": ">", "name": "keyword.operator.alias.luna" },
+        { "match": "/", "name": "punctuation.separator.path.luna" },
+        { "match": ",", "name": "punctuation.separator.comma.luna" },
+        { "match": "[A-Za-z_][A-Za-z0-9_]*", "name": "entity.name.namespace.luna" }
+      ]
+    },
+    "trail-header": {
+      "comment": "trail Fruit follow Show, Copy:",
+      "match": "^(trail)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s+(follow)\\s+([^:#]*))?\\s*(:)",
+      "captures": {
+        "1": { "name": "keyword.declaration.trail.luna" },
+        "2": { "name": "entity.name.type.trail.luna" },
+        "3": { "name": "keyword.declaration.follow.luna" },
+        "4": {
+          "patterns": [
+            { "match": "[A-Za-z_][A-Za-z0-9_.]*", "name": "entity.other.inherited-class.luna" },
+            { "match": ",", "name": "punctuation.separator.comma.luna" }
+          ]
+        },
+        "5": { "name": "punctuation.separator.colon.luna" }
+      }
+    },
+    "definition": {
+      "comment": "A definition starts in column 1 (`sum a b = ...`), or is a field or function of a trail, indented (`describe n :: Int -> String = ...`)",
+      "patterns": [
+        {
+          "match": "^([A-Za-z_][A-Za-z0-9_]*)((?:\\s+(?:@?[A-Za-z_][A-Za-z0-9_]*|\\([A-Za-z_:\\s0-9]*\\)|\\[\\]))*)(?=\\s*(?:=(?!=)|::))",
+          "captures": {
+            "1": { "name": "entity.name.function.luna" },
+            "2": { "patterns": [{ "include": "#parameters" }] }
+          }
+        },
+        {
+          "match": "^(\\s+)([a-z_][A-Za-z0-9_]*)((?:\\s+(?:@?[A-Za-z_][A-Za-z0-9_]*|\\([A-Za-z_:\\s0-9]*\\)|\\[\\]))+)(?=\\s*(?:=(?!=)|::))",
+          "captures": {
+            "2": { "name": "entity.name.function.member.luna" },
+            "3": { "patterns": [{ "include": "#parameters" }] }
+          }
+        },
+        {
+          "match": "^(\\s+)([a-z_][A-Za-z0-9_]*)(?=\\s*::)",
+          "captures": {
+            "2": { "name": "variable.other.property.field.luna" }
+          }
+        }
+      ]
+    },
+    "parameters": {
+      "patterns": [
+        {
+          "match": "(@)([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.modifier.borrow.luna" },
+            "2": { "name": "variable.parameter.luna" }
+          }
+        },
+        { "match": "[A-Za-z_][A-Za-z0-9_]*", "name": "variable.parameter.luna" },
+        { "match": "[():]", "name": "punctuation.definition.pattern.luna" },
+        { "match": "\\[\\]", "name": "punctuation.definition.pattern.luna" }
+      ]
+    },
+    "signature": {
+      "comment": ":: Int, [Fruit] -> String, up to the `=`",
+      "begin": "::",
+      "beginCaptures": { "0": { "name": "keyword.operator.signature.luna" } },
+      "end": "(?==(?!=))|$",
+      "patterns": [
+        { "include": "#comment" },
+        { "match": "->", "name": "keyword.operator.arrow.luna" },
+        { "match": "\\b(int|float|string|boolean|void|numeric|array|iterable|any)\\b", "name": "support.type.luna" },
+        { "match": "\\bSelf\\b", "name": "variable.language.self.luna" },
+        { "match": "[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*", "name": "entity.name.type.luna" },
+        { "match": "[\\[\\],]", "name": "punctuation.separator.luna" }
+      ]
+    },
+    "expression": {
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#number" },
+        { "include": "#keyword" },
+        { "include": "#constant" },
+        { "include": "#builtin" },
+        { "include": "#borrow" },
+        { "include": "#record-field" },
+        { "include": "#field" },
+        { "include": "#type" },
+        { "include": "#operator" },
+        { "include": "#punctuation" }
+      ]
+    },
+    "keyword": {
+      "patterns": [
+        { "match": "\\b(check|else|loop|in|ret)\\b", "name": "keyword.control.luna" },
+        { "match": "\\becho\\b", "name": "keyword.other.echo.luna" },
+        { "match": "\\b(trail|follow)\\b", "name": "keyword.declaration.luna" }
+      ]
+    },
+    "constant": {
+      "patterns": [
+        { "match": "\\b(true|false)\\b", "name": "constant.language.boolean.luna" },
+        { "match": "\\bvoid\\b", "name": "constant.language.void.luna" },
+        { "match": "\\b(PI|infinite)\\b", "name": "constant.language.luna" }
+      ]
+    },
+    "builtin": {
+      "match": "\\b(len|head|tail|init|last|reverse|copy)\\b",
+      "name": "support.function.builtin.luna"
+    },
+    "borrow": {
+      "match": "@(?=[A-Za-z_(\\[])",
+      "name": "storage.modifier.borrow.luna"
+    },
+    "record-field": {
+      "comment": "the field names in `{name = \"kiwi\", peel = true}`",
+      "match": "(?<=\\{|,)(\\s*)([a-z_][A-Za-z0-9_]*)(?=\\s*=(?!=))",
+      "captures": { "2": { "name": "variable.other.property.luna" } }
+    },
+    "field": {
+      "comment": "t.name, (buy 6).name, et.pred",
+      "match": "(?<=[A-Za-z0-9_)\\]}])(\\.)([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "punctuation.accessor.luna" },
+        "2": { "name": "variable.other.property.luna" }
+      }
+    },
+    "type": {
+      "comment": "trail names start with an uppercase letter, by convention",
+      "match": "\\b(Self)\\b|\\b([A-Z][A-Za-z0-9_]*)\\b",
+      "captures": {
+        "1": { "name": "variable.language.self.luna" },
+        "2": { "name": "entity.name.type.luna" }
+      }
+    },
+    "string": {
+      "begin": "\"",
+      "beginCaptures": { "0": { "name": "punctuation.definition.string.begin.luna" } },
+      "end": "\"|$",
+      "endCaptures": { "0": { "name": "punctuation.definition.string.end.luna" } },
+      "name": "string.quoted.double.luna",
+      "patterns": [
+        { "match": "\\\\[ntr0\\\\\"]", "name": "constant.character.escape.luna" },
+        { "match": "\\\\.", "name": "invalid.illegal.escape.luna" }
+      ]
+    },
+    "number": {
+      "match": "\\b\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?\\b",
+      "name": "constant.numeric.luna"
+    },
+    "operator": {
+      "patterns": [
+        { "match": "\\+\\+|\\*\\*|!!", "name": "keyword.operator.array.luna" },
+        { "match": "->", "name": "keyword.operator.arrow.luna" },
+        { "match": "::", "name": "keyword.operator.signature.luna" },
+        { "match": "\\.\\.", "name": "keyword.operator.range.luna" },
+        { "match": "==|!=|<=|>=|<|>", "name": "keyword.operator.comparison.luna" },
+        { "match": "[-+*/]", "name": "keyword.operator.arithmetic.luna" },
+        { "match": "=", "name": "keyword.operator.assignment.luna" },
+        { "match": "\\|", "name": "keyword.operator.comprehension.luna" }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        { "match": ";", "name": "punctuation.terminator.arm.luna" },
+        { "match": ",", "name": "punctuation.separator.comma.luna" },
+        { "match": ":", "name": "punctuation.separator.colon.luna" }
+      ]
+    }
+  }
+}
