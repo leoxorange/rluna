@@ -61,11 +61,13 @@ are inferred today but cannot be written.
 
 ## Projects and the standard library
 
-### Modules and multiple files
-A Luna project made of several files that use each other's definitions,
-to build larger applications. To decide: how a file names what it uses
-from another (imports), what is private to a file, and how the files are
-found and compiled together. `std.luna` would become a module too.
+### More for multiple files
+Linking files works (`| entity > et`, `| entity#pred > p`; see the readme
+and `docs/compiler.md`). Still open:
+- private definitions: everything a file defines can be linked today;
+- whether `std.luna` becomes a file programs link like any other;
+- compiling each file once and reusing the result between builds (today
+  every build compiles every linked file again).
 
 ### Standard library
 - More functions once functions as values exist: `map`, `filter`, `fold`,

@@ -1509,12 +1509,15 @@ impl<'a> Checker<'a> {
         for &id in &order {
             let inst = &mut self.instances[id];
             let func = &self.hir.funcs[inst.func];
+            // A linked file's definitions are named after the file
+            // (`entity/try.pred`); symbols use `.` instead of `/`.
+            let base = func.name.replace('/', ".");
             let symbol = if count[func.name.as_str()] == 1 {
-                func.name.clone()
+                base
             } else {
                 let n = seen.entry(func.name.clone()).or_default();
                 *n += 1;
-                format!("{}.{}", func.name, n)
+                format!("{base}.{n}")
             };
             let mut body = std::mem::take(&mut inst.body);
             for_each_expr_mut(&mut body, &mut |e| remap_calls(e, &index));

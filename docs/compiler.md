@@ -38,6 +38,7 @@ the backend, the linker and the runtime's OS layer.
 |----------|-------------------------|----------------------------------------------------------------|
 | lexer    | `src/lexer.rs`          | tokens; newlines are significant outside parentheses           |
 | parser   | `src/parser.rs`         | AST (`src/ast.rs`), layout rules below                         |
+| driver   | `src/driver.rs`         | runs the stages; reads linked files, joins them into one AST   |
 | hir      | `src/hir.rs`            | name resolution, overload groups, `SymbolNotFoundError`        |
 | typeck   | `src/typeck.rs`         | type inference and specialization → typed IR (TIR)             |
 | ownership| `src/ownership.rs`      | move checking: no value is used after it was moved             |
@@ -201,6 +202,47 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
 - **Redefinition.** A later definition with the same name, arity and
   parameter types replaces the earlier one (with a warning). Definitions that
   differ in arity or parameter types are overloads.
+
+## Multiple files
+
+A program can be several files. The file given to `lunac` is the main
+file; `| path` lines at the top of a file link others (see the readme):
+
+- `| entity/try > try` links `entity/try.luna`, whose definitions are then
+  written `try.pred` (without `>`, the name is the path's last part).
+  `| entity` means `entity.luna`, or `entity/entity.luna` for a folder of
+  the same name (both existing is an error).
+- `| entity#pred, next > p, n` links only `pred` and `next`, written without
+  a prefix, here under the names `p` and `n`.
+- Paths always start at the main file's folder, also in linked files. Each
+  file is read once, so files may link each other in any way, cycles
+  included.
+
+The lexer reads `et.pred` as one name, and a `#` right after the path of a
+link line as `#` (anywhere else it starts a comment).
+
+**How it works.** The driver reads all the files first, following the links
+(`driver::frontend_files`; the file system is behind a `Loader`, so tests
+use files in memory). Then it joins their definitions into one program,
+where every file but the main one names its definitions after the file:
+`pred` in `entity/try.luna` becomes `entity/try.pred`, a name no program can
+write (`/` is division), so files never clash. Each file also gets a table,
+`hir::FileNames`, of what its names mean:
+
+- its own definitions;
+- the files it links whole (`et` → the definitions of `entity/entity.luna`);
+- the definitions it links by name;
+- in a linked file, the main file's definitions are hidden: their names
+  mean the standard library's function (or the built-in one) of that name,
+  if there is one, and are otherwise unknown;
+- every other name is looked up as before (the library, built-ins).
+
+Name resolution (`hir`) looks every global name up in the table of the
+file the definition came from (`Def::file`). After that, nothing knows
+there were several files: types, ownership and lowering see one program.
+Symbols in LIR use `.` for `/` (`entity.try.pred`). Every file has its own
+range of byte offsets (`diag::Sources`), so errors point into the right
+file.
 
 ## Ownership
 

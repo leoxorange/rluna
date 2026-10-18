@@ -79,6 +79,62 @@ impl Builtin {
     }
 }
 
+/// The built-in function a global name stands for: its own name, or
+/// `builtin.len` from a file where `len` means something else (see
+/// `FileNames::hidden`).
+fn builtin_of(global: &str) -> Option<Builtin> {
+    Builtin::from_name(global.strip_prefix("builtin.").unwrap_or(global))
+}
+
+/// How the names written in one file reach the global definitions, in a
+/// program made of several files (see `driver`, which builds one table per
+/// file). Each file sees its own definitions, the ones it links, and the
+/// standard library; the definitions of every file but the main one have
+/// global names of their own (`entity/try.pred`), so files never clash.
+#[derive(Debug, Default, Clone)]
+pub struct FileNames {
+    /// The file, for messages (`entity/try.luna`).
+    pub file: String,
+    /// Names written without a `.` that mean a global of another name: the
+    /// file's own definitions, and the definitions it links by name.
+    pub names: HashMap<String, String>,
+    /// Names of the main file's definitions, which a linked file does not
+    /// see: what they mean there instead (the standard library's or a
+    /// built-in function of that name), if anything.
+    pub hidden: HashMap<String, Option<String>>,
+    /// The files linked whole, by the name they are linked as: the file
+    /// (for messages) and its definitions (name -> global name).
+    pub files: HashMap<String, (String, HashMap<String, String>)>,
+}
+
+impl FileNames {
+    /// The global name `written` refers to in this file.
+    fn global(&self, written: &str) -> Result<String, String> {
+        if let Some((alias, member)) = written.split_once('.') {
+            let Some((file, defs)) = self.files.get(alias) else {
+                return Err(format!(
+                    "cannot find symbol `{written}`: no file is linked as `{alias}` in `{}`",
+                    self.file
+                ));
+            };
+            return defs.get(member).cloned().ok_or_else(|| {
+                format!("cannot find symbol `{written}`: `{file}` has no definition `{member}`")
+            });
+        }
+        if let Some(global) = self.names.get(written) {
+            return Ok(global.clone());
+        }
+        match self.hidden.get(written) {
+            Some(Some(global)) => Ok(global.clone()),
+            Some(None) => Err(format!(
+                "cannot find symbol `{written}` (the main file defines it, but `{}` does not link it)",
+                self.file
+            )),
+            None => Ok(written.to_string()),
+        }
+    }
+}
+
 /// Built-in constants: names with a fixed float value.
 fn constant(name: &str) -> Option<f64> {
     match name {
@@ -219,6 +275,15 @@ pub enum HExprKind {
 /// Errors are collected rather than returned at the first one, so the user
 /// sees every unknown name at once instead of fixing them one per compile.
 pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Diagnostic>> {
+    resolve_files(program, &[])
+}
+
+/// `resolve` for a program of several files: `files[def.file]` says how
+/// the names in each definition reach the globals.
+pub fn resolve_files(
+    program: &ast::Program,
+    files: &[FileNames],
+) -> Result<(Hir, Vec<Diagnostic>), Vec<Diagnostic>> {
     let mut warnings = Vec::new();
     let mut errors = Vec::new();
 
@@ -362,6 +427,7 @@ pub fn resolve(program: &ast::Program) -> Result<(Hir, Vec<Diagnostic>), Vec<Dia
         let borrowed: Vec<bool> = def.params.iter().map(|p| p.borrowed).collect();
         let mut r = Resolver {
             arities: &arities,
+            names: files.get(def.file),
             locals: params.iter().cloned().zip(0..).collect(),
             local_names: params,
             assigned: Vec::new(),
@@ -500,6 +566,9 @@ fn has_patterns(def: &ast::Def) -> bool {
 /// Resolves the names in one function body.
 struct Resolver<'a> {
     arities: &'a HashMap<&'a str, Vec<usize>>,
+    /// How this file's names reach the globals, in a program of several
+    /// files.
+    names: Option<&'a FileNames>,
     /// Visible variables, innermost last. This stack is the "symbol table"
     /// of the classic textbook: a loop body pushes its variables and pops
     /// them when it ends, so they are not visible after the loop.
@@ -643,16 +712,28 @@ impl<'a> Resolver<'a> {
         self.lookup_local(name).map(HExprKind::Local)
     }
 
+    /// The global name `written` refers to: itself, except in a program of
+    /// several files (see `FileNames`).
+    fn global(&self, written: &str, span: Span) -> Result<String, Diagnostic> {
+        match self.names {
+            None => Ok(written.to_string()),
+            Some(names) => names
+                .global(written)
+                .map_err(|m| Diagnostic::error(ErrorKind::SymbolNotFoundError, span, m)),
+        }
+    }
+
     /// How many arguments `name` takes, if it names a function: a
     /// variable is a value, and a constant or unknown name is no function.
     fn function_arities(&self, name: &str) -> Option<Vec<usize>> {
         if self.lookup_local(name).is_some() {
             return None;
         }
-        if let Some(a) = self.arities.get(name) {
+        let global = self.global(name, Span::default()).ok()?;
+        if let Some(a) = self.arities.get(global.as_str()) {
             return Some(a.clone());
         }
-        Builtin::from_name(name).map(|_| vec![1])
+        builtin_of(&global).map(|_| vec![1])
     }
 
     /// Arity-directed grouping of `callee arg1 arg2 ...` when the flat
@@ -756,15 +837,18 @@ impl<'a> Resolver<'a> {
         ways
     }
 
-    fn check_callable(&self, name: &str, nargs: usize, span: Span) -> Result<(), Diagnostic> {
-        if !self.arities.contains_key(name) && Builtin::from_name(name).is_some() {
+    /// Check that `name` names a function taking `nargs` arguments, and
+    /// give its global name.
+    fn check_callable(&self, name: &str, nargs: usize, span: Span) -> Result<String, Diagnostic> {
+        let global = self.global(name, span)?;
+        if !self.arities.contains_key(global.as_str()) && builtin_of(&global).is_some() {
             return Err(Diagnostic::error(
                 ErrorKind::TypeError,
                 span,
                 format!("`{name}` is called with {nargs} argument(s), but it takes 1"),
             ));
         }
-        let Some(arities) = self.arities.get(name) else {
+        let Some(arities) = self.arities.get(global.as_str()) else {
             return Err(Diagnostic::error(
                 ErrorKind::SymbolNotFoundError,
                 span,
@@ -783,7 +867,7 @@ impl<'a> Resolver<'a> {
                 ),
             ));
         }
-        Ok(())
+        Ok(global)
     }
 
     fn expr(&mut self, e: &ast::Expr) -> Result<HExpr, Diagnostic> {
@@ -802,13 +886,10 @@ impl<'a> Resolver<'a> {
                 None if !self.arities.contains_key(name.as_str()) && constant(name).is_some() => {
                     HExprKind::Float(constant(name).unwrap())
                 }
-                None => {
-                    self.check_callable(name, 0, e.span)?;
-                    HExprKind::Call {
-                        name: name.clone(),
-                        args: Vec::new(),
-                    }
-                }
+                None => HExprKind::Call {
+                    name: self.check_callable(name, 0, e.span)?,
+                    args: Vec::new(),
+                },
             },
             ExprKind::Call {
                 callee,
@@ -831,8 +912,9 @@ impl<'a> Resolver<'a> {
                 {
                     return self.expr(&grouped);
                 }
-                if !self.arities.contains_key(callee.as_str())
-                    && let Some(b) = Builtin::from_name(callee)
+                let global = self.global(callee, *callee_span)?;
+                if !self.arities.contains_key(global.as_str())
+                    && let Some(b) = builtin_of(&global)
                 {
                     let [arg] = &args[..] else {
                         return Err(Diagnostic::error(
@@ -849,15 +931,12 @@ impl<'a> Resolver<'a> {
                         span: e.span,
                     });
                 }
-                self.check_callable(callee, args.len(), *callee_span)?;
+                let name = self.check_callable(callee, args.len(), *callee_span)?;
                 let args = args
                     .iter()
                     .map(|a| self.expr(a))
                     .collect::<Result<_, _>>()?;
-                HExprKind::Call {
-                    name: callee.clone(),
-                    args,
-                }
+                HExprKind::Call { name, args }
             }
             ExprKind::Binary { op, lhs, rhs } => HExprKind::Binary {
                 op: *op,

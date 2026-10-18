@@ -21,6 +21,16 @@ fn out_dir() -> PathBuf {
     dir
 }
 
+/// Reads linked files below `tests/cases` (`| links/geometry`).
+fn case_file(path: &str) -> Option<String> {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/cases")
+            .join(path),
+    )
+    .ok()
+}
+
 fn run_exe(exe: &[u8], path: &Path) -> (String, String, i32) {
     driver::write_executable(path, exe).unwrap();
     let out = Command::new(path).output().unwrap();
@@ -49,6 +59,7 @@ fn check_case(luna: &Path) -> Result<(), String> {
     let opts = Options {
         want_asm: true,
         name: &name,
+        files: Some(&case_file),
         ..Options::default()
     };
     let input = if is_lir {
@@ -368,6 +379,113 @@ fn compile_errors() {
     }
 }
 
+/// Mistakes in linking files: each program is a set of files, the first
+/// one the main file.
+#[test]
+fn link_errors() {
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (
+            &[("main.luna", "| nothere\nmain = echo 1")],
+            "cannot find the file `nothere.luna` or `nothere/nothere.luna`",
+        ),
+        (
+            &[
+                ("main.luna", "| m > q\nmain = echo q.nope"),
+                ("m.luna", "f a = a"),
+            ],
+            "cannot find symbol `q.nope`: `m.luna` has no definition `nope`",
+        ),
+        (
+            &[
+                ("main.luna", "| m\nmain = echo zz.f 1"),
+                ("m.luna", "f a = a"),
+            ],
+            "no file is linked as `zz`",
+        ),
+        (
+            &[("main.luna", "main = echo 1\n| m"), ("m.luna", "f a = a")],
+            "links (`| file`) go at the top of the file",
+        ),
+        (
+            &[
+                ("main.luna", "| m#f\nf x = x\nmain = echo (f 1)"),
+                ("m.luna", "f a = a"),
+            ],
+            "`f` is defined in this file and linked from `m.luna`",
+        ),
+        (
+            &[
+                ("main.luna", "| m\n| m\nmain = echo 1"),
+                ("m.luna", "f a = a"),
+            ],
+            "two files are linked as `m`",
+        ),
+        (
+            &[
+                ("main.luna", "| m#f, g > a\nmain = echo 1"),
+                ("m.luna", "f a = a\ng = 1"),
+            ],
+            "2 definition(s) are linked but 1 new name(s) are given",
+        ),
+        (
+            &[
+                ("main.luna", "| m#nope\nmain = echo 1"),
+                ("m.luna", "f a = a"),
+            ],
+            "`m.luna` has no definition `nope`",
+        ),
+        (
+            &[("main.luna", "m.f x = x\nmain = echo 1")],
+            "a name defined here cannot contain `.`",
+        ),
+        // a linked file sees only its own names, what it links, and the library
+        (
+            &[
+                ("main.luna", "| m\nhelper = 1\nmain = echo m.uses"),
+                ("m.luna", "uses = helper"),
+            ],
+            "cannot find symbol `helper` (the main file defines it, but `m.luna` does not link it)",
+        ),
+        // an error in a linked file points into it
+        (
+            &[
+                ("main.luna", "| lib/m\nmain = echo m.bad"),
+                ("lib/m.luna", "bad = \"a\" - 1"),
+            ],
+            "--> lib/m.luna:1:7",
+        ),
+        (
+            &[
+                ("main.luna", "| m\nmain = echo m.f 1"),
+                ("m.luna", "f a = a"),
+                ("m/m.luna", "f a = a"),
+            ],
+            "both `m.luna` and `m/m.luna` exist",
+        ),
+    ];
+    for (files, expected) in cases {
+        let main = SourceFile::new(files[0].0, files[0].1);
+        let load = |path: &str| {
+            files[1..]
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, text)| text.to_string())
+        };
+        let opts = Options {
+            files: Some(&load),
+            ..Options::default()
+        };
+        match driver::compile(Input::Luna(&main), &opts) {
+            Ok(_) => panic!("expected an error for:\n{files:?}"),
+            Err(e) => assert!(
+                e.message.contains(expected),
+                "for:\n{files:?}\nexpected `{expected}` in:\n{}",
+                e.message
+            ),
+        }
+    }
+}
+
 /// Every target compiles on every host, even where its programs cannot run.
 #[test]
 fn all_targets_link() {
@@ -433,7 +551,7 @@ fn no_leaks() {
         let name = luna.file_stem().unwrap().to_string_lossy().to_string();
         let src = SourceFile::new(name.clone(), std::fs::read_to_string(luna).unwrap());
         let mut artifacts = driver::Artifacts::default();
-        let mut module = driver::frontend(&src, &mut artifacts)
+        let mut module = driver::frontend_files(&src, &case_file, &mut artifacts)
             .unwrap_or_else(|e| panic!("{name}: {}", e.message));
         for f in &mut module.funcs {
             if f.name == "luna.main" {

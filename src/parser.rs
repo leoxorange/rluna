@@ -148,8 +148,20 @@ impl Parser {
 
     fn program(&mut self) -> PResult<Program> {
         let mut defs = Vec::new();
+        let mut links = Vec::new();
         self.skip_newlines();
+        while self.at_link() {
+            links.push(self.link()?);
+            self.skip_newlines();
+        }
         while self.peek() != &TokenKind::Eof {
+            if self.at_link() {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    self.span(),
+                    "links (`| file`) go at the top of the file, before the definitions",
+                ));
+            }
             if !self.at_def_start() {
                 let msg = if self.toks[self.pos].at_col0 {
                     "expected a definition (`name args = body`); top-level code must live inside a function such as `main`"
@@ -161,7 +173,85 @@ impl Parser {
             defs.push(self.def()?);
             self.skip_newlines();
         }
-        Ok(Program { defs })
+        Ok(Program { links, defs })
+    }
+
+    /// A line starting with `|` in column 1.
+    fn at_link(&self) -> bool {
+        let tok = &self.toks[self.pos];
+        tok.at_col0 && tok.kind == TokenKind::Bar
+    }
+
+    /// `| path [#name, ...] [> alias, ...]`, alone on its line. The path is
+    /// names separated by `/`.
+    fn link(&mut self) -> PResult<Link> {
+        let start = self.bump().span;
+        let name = |this: &mut Self, what: &str| -> PResult<(String, Span)> {
+            match this.peek().clone() {
+                TokenKind::Ident(n) if !n.contains('.') => Ok((n, this.bump().span)),
+                _ => Err(this.unexpected(what)),
+            }
+        };
+        let list = |this: &mut Self, what: &str| -> PResult<Vec<(String, Span)>> {
+            let mut items = vec![name(this, what)?];
+            while this.eat(&TokenKind::Comma) {
+                items.push(name(this, what)?);
+            }
+            Ok(items)
+        };
+        let first = name(
+            self,
+            "the path of a file to link (`| entity` or `| entity/try`)",
+        )?;
+        let mut path_span = first.1;
+        let mut path = vec![first.0];
+        while self.eat(&TokenKind::Slash) {
+            let (part, span) = name(self, "a folder or file name after `/`")?;
+            path.push(part);
+            path_span = path_span.to(span);
+        }
+        let names = if self.eat(&TokenKind::Hash) {
+            Some(list(self, "the name of a definition to link")?)
+        } else {
+            None
+        };
+        let aliases = if self.eat(&TokenKind::Gt) && matches!(self.peek(), TokenKind::Ident(_)) {
+            list(self, "a name")?
+        } else {
+            Vec::new()
+        };
+        let span = start.to(self.prev_span());
+        if !matches!(self.peek(), TokenKind::Newline | TokenKind::Eof) {
+            return Err(self.unexpected("end of line after the link"));
+        }
+        match &names {
+            None if aliases.len() > 1 => {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    aliases[1].1,
+                    "a whole file is linked under one name, like `| entity > et`",
+                ));
+            }
+            Some(names) if !aliases.is_empty() && aliases.len() != names.len() => {
+                return Err(Diagnostic::error(
+                    ErrorKind::SyntaxError,
+                    span,
+                    format!(
+                        "{} definition(s) are linked but {} new name(s) are given; the names after `>` go with the definitions pair by pair",
+                        names.len(),
+                        aliases.len()
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        Ok(Link {
+            path,
+            path_span,
+            names,
+            aliases,
+            span,
+        })
     }
 
     fn def(&mut self) -> PResult<Def> {
@@ -169,6 +259,7 @@ impl Parser {
         let TokenKind::Ident(name) = self.bump().kind else {
             unreachable!()
         };
+        plain(&name, start)?;
         let mut params: Vec<Param> = Vec::new();
         let mut names: Vec<String> = Vec::new();
         while let Some(param) = self.param()? {
@@ -205,6 +296,7 @@ impl Parser {
             sig,
             body,
             span: start.to(self.prev_span()),
+            file: 0,
         })
     }
 
@@ -223,6 +315,7 @@ impl Parser {
                     ));
                 };
                 self.bump();
+                plain(&name, self.prev_span())?;
                 Ok(Some(Param {
                     name,
                     span: start.to(self.prev_span()),
@@ -232,6 +325,7 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.bump();
+                plain(&name, start)?;
                 Ok(Some(Param {
                     name,
                     span: start,
@@ -356,6 +450,7 @@ impl Parser {
             let tok = &self.toks[self.pos];
             if tok.kind == TokenKind::Eof
                 || self.at_def_start()
+                || self.at_link()
                 || deeper_than.is_some_and(|col| tok.col <= col)
             {
                 return Ok(stmts);
@@ -382,6 +477,7 @@ impl Parser {
         if let (TokenKind::Ident(name), TokenKind::Assign) = (self.peek().clone(), self.peek_at(1))
         {
             let span = self.bump().span;
+            plain(&name, span)?;
             self.bump();
             let value = self.expr()?;
             return Ok(Stmt::Let { name, span, value });
@@ -396,6 +492,7 @@ impl Parser {
             return Err(self.unexpected("a name for the elements"));
         };
         let first_span = self.bump().span;
+        plain(&first, first_span)?;
         if !self.eat(&TokenKind::Comma) {
             return Ok((None, first, first_span));
         }
@@ -403,6 +500,7 @@ impl Parser {
             return Err(self.unexpected("a name for the elements after the position (`i, x`)"));
         };
         let var_span = self.bump().span;
+        plain(&var, var_span)?;
         Ok((Some((first, first_span)), var, var_span))
     }
 
@@ -922,6 +1020,21 @@ impl Parser {
     }
 }
 
+/// A name being defined has no `.`: `et.pred` names a definition of
+/// another file (see `Link`).
+fn plain(name: &str, span: Span) -> PResult<()> {
+    if name.contains('.') {
+        return Err(Diagnostic::error(
+            ErrorKind::SyntaxError,
+            span,
+            format!(
+                "`{name}` names a definition of a linked file; a name defined here cannot contain `.`"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,6 +1108,24 @@ mod tests {
         let p = parse_src("main =\n  x = 5\n  echo x\n");
         assert!(matches!(p.defs[0].body.stmts[0], Stmt::Let { .. }));
         assert_eq!(p.defs.len(), 1);
+    }
+
+    #[test]
+    fn links() {
+        let p = parse_src(
+            "| entity > et # a comment\n| entity/try\n| entity#pred, next > p, n\n| x#y >\nmain = echo et.pred 5\n",
+        );
+        let dumped = crate::ast::dump(&p);
+        assert!(
+            dumped.starts_with(
+                "(link entity > et)\n(link entity/try)\n(link entity #pred,next > p,n)\n(link x #y)\n"
+            ),
+            "{dumped}"
+        );
+        assert!(dumped.contains("(echo (et.pred 5))"), "{dumped}");
+        // `#` starts a comment everywhere else, even right after a name
+        let p = parse_src("main = echo a#b\na = 1\n");
+        assert_eq!(p.defs.len(), 2);
     }
 
     #[test]

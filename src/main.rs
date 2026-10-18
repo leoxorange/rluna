@@ -125,10 +125,14 @@ fn run() -> Result<ExitCode, String> {
     } else {
         Input::Luna(&source)
     };
+    // Linked files are found below the main file's folder.
+    let folder = opts.input.parent().unwrap_or(Path::new("")).to_path_buf();
+    let load = move |path: &str| std::fs::read_to_string(folder.join(path)).ok();
     let compile_opts = driver::Options {
         target: opts.target,
         want_asm: opts.emit_asm,
         name: &name,
+        files: Some(&load),
     };
     let artifacts = match driver::compile(input, &compile_opts) {
         Ok(a) => a,

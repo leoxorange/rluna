@@ -18,7 +18,26 @@ use crate::diag::Span;
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    /// The files this one links, from the `| ...` lines at its top.
+    pub links: Vec<Link>,
     pub defs: Vec<Def>,
+}
+
+/// `| entity/try > try` links the file `entity/try.luna`: its definitions
+/// are used as `try.name`. `| entity#pred, next > p, n` links only `pred`
+/// and `next`, used without a prefix (as `p` and `n`).
+#[derive(Debug, Clone)]
+pub struct Link {
+    /// The path below the entry file's folder, without `.luna`:
+    /// `["entity", "try"]`.
+    pub path: Vec<String>,
+    pub path_span: Span,
+    /// `#pred, next`: only these definitions.
+    pub names: Option<Vec<(String, Span)>>,
+    /// After `>`: the name of the file (for a whole file), or one new name
+    /// per definition (for `#...`). Empty when there is none.
+    pub aliases: Vec<(String, Span)>,
+    pub span: Span,
 }
 
 /// A top-level definition: `name params [:: signature] = body`.
@@ -30,6 +49,9 @@ pub struct Def {
     pub sig: Option<Signature>,
     pub body: Block,
     pub span: Span,
+    /// Which file it is in, when a program has several (see `driver`): an
+    /// index into the per-file name tables given to `hir::resolve_files`.
+    pub file: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -274,6 +296,18 @@ pub struct Arm {
 
 pub fn dump(program: &Program) -> String {
     let mut out = String::new();
+    for link in &program.links {
+        write!(out, "(link {}", link.path.join("/")).unwrap();
+        if let Some(names) = &link.names {
+            let names: Vec<&str> = names.iter().map(|(n, _)| n.as_str()).collect();
+            write!(out, " #{}", names.join(",")).unwrap();
+        }
+        if !link.aliases.is_empty() {
+            let aliases: Vec<&str> = link.aliases.iter().map(|(n, _)| n.as_str()).collect();
+            write!(out, " > {}", aliases.join(",")).unwrap();
+        }
+        out.push_str(")\n");
+    }
     for def in &program.defs {
         let params: Vec<String> = def
             .params

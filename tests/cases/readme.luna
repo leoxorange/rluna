@@ -1,5 +1,6 @@
 # Every example from readme.md, gathered into one program (the examples of
-# errors are in `compile_errors`). Examples that reuse a name get their own:
+# errors are in `compile_errors`, those of several files in `linking.luna`
+# and `link_errors`). Examples that reuse a name get their own:
 # `play` for the overloading example, `first` for the pattern example of
 # `head`, which would hide the built-in `head` used in chapter 2, `add_up`
 # for the pattern example of `sum`. Chapter 1's `sum a b` replaces the

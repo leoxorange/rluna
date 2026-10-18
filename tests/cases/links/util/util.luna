@@ -1,0 +1,9 @@
+# Linked by `linking.luna` and `links/geometry.luna`: a file in a folder of
+# the same name is linked as just `links/util`.
+| links/geometry > geo
+
+double x = x * 2
+greet @name = "hi " + name
+# its own `sum`, which has nothing to do with the library's
+sum xs = 0 - len xs
+squares n = [geo.area x x | x in [0..n]]

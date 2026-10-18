@@ -245,6 +245,8 @@ foo _ :: any -> void = 5
 ```
 although you write a 5 here, nothing will be returned since this function has a void return type. The 5 will be discarded when exiting this function.
 
+
+
 #### void and maybe types
 
 void is the one "nothing" value, and `echo` prints it as `void`. A function that gives a value on some paths and void on others has a *maybe* type: `head [1, 2]` is an `int?`, because head gives void for an empty array. The compiler finds maybe types by itself.
@@ -259,6 +261,54 @@ first_or_zero a =
         else -> h # here h is an int, not an int?
 ```
 `void ->` only matches void. Maybe types cannot be written in type definitions yet.
+
+### multiple files and how to link them
+
+sometimes you can not write all the codes into single file, so here's the solution for a large project.
+
+for example:
+
+```
+src - main.luna
+    - entity
+        - try.luna
+        - entity.luna
+    - test
+        - test.luna
+```
+in entity.luna
+```
+pred a = a - 1
+process a = a + 10
+next a = a + 1
+```
+now you want to use the pred in main.luna
+```
+# the search root is where the main entry file is, in this example, src will be the root path.
+# since entity has the same name of the directory, you can only write the entity here
+| entity > et # this must be placed at the top of the file, et is an alias for entity and its optional.
+# but for try.luna, you have to write the full path
+| entity/try > try 
+
+echo et.pred 5 # get 4
+```
+for partically link
+```
+| entity#pred, next > # only links pred and next
+# if you want to give them alias
+| entity#pred, next > p, n # the alias will match the read symbols pair by pair
+
+echo pred 5 # get 4
+```
+
+you are no need to write all files when using ``lunac``, you only provides the main.luna(or other file contains the ``main`` entry), compiler will find others automatically.
+
+a few more rules:
+
+- without `>`, a whole file is used under its file name: after `| entity/try`, write `try.pred`.
+- each file only sees its own definitions, the files it links, and the standard library. So two files can define the same name, and a linked file does not see the definitions of main.luna unless it links main.luna.
+- a linked file can link other files too (its paths also start at the folder of main.luna), and files may link each other.
+- a name defined in a file cannot also be linked into it by name: give the linked one another name with `>`.
 
 ## chapter 2. internal values and functions
 

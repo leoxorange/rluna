@@ -1,0 +1,23 @@
+# Several files: `| path` links a file, whose definitions are then used as
+# `name.def`; `| path#a, b > x, y` links only some definitions, used without
+# a prefix (here under new names). Each file has names of its own: the
+# main file's `sum` is not the library's, nor `util`'s.
+| links/geometry > geo
+| links/util
+| links/util#greet, double > hello, twice
+
+sum a b = a + b
+
+main =
+    echo geo.area 2 3
+    echo geo.perimeter 2 3
+    echo geo.unit
+    echo util.double 4
+    echo (util.sum [1, 2])
+    echo util.squares 4
+    echo hello "luna"
+    echo twice 5
+    echo (sum 1 2)
+    s = "ann"
+    echo (util.greet s)
+    echo s

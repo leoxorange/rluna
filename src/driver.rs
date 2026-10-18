@@ -14,11 +14,12 @@
 //! Luna). LIR is the contract between them, which is why a `.lir` file can
 //! skip the frontend entirely and go straight to the backend.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
 use crate::codegen;
-use crate::diag::{Diagnostic, SourceFile, Sources};
+use crate::diag::{Diagnostic, ErrorKind, SourceFile, Sources, Span};
 use crate::link::{Image, macho, pe};
 use crate::lir::{self, Module};
 use crate::target::Target;
@@ -36,6 +37,9 @@ pub struct Options<'a> {
     /// Name of the program, recorded in the executable where the format
     /// has a place for it (the macOS code signature).
     pub name: &'a str,
+    /// Reads the files the program links (see `frontend_files`); without
+    /// it, a program cannot link files.
+    pub files: Option<Loader<'a>>,
 }
 
 impl Default for Options<'_> {
@@ -44,6 +48,7 @@ impl Default for Options<'_> {
             target: Target::default(),
             want_asm: false,
             name: "luna",
+            files: None,
         }
     }
 }
@@ -74,41 +79,198 @@ fn render_all(sources: &Sources, diags: &[Diagnostic]) -> String {
 /// compiled to machine code.
 pub const STD_LUNA: &str = include_str!("std.luna");
 
-/// Compile Luna source to an LIR module (without the runtime).
+/// Reads the files a program links: given a path below the main file's
+/// folder (`entity/try.luna`), its text, or `None` if there is no such file.
+pub type Loader<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Compile Luna source to an LIR module (without the runtime). The program
+/// cannot link other files.
 pub fn frontend(src: &SourceFile, artifacts: &mut Artifacts) -> Result<Module, CompileError> {
-    // The standard library's byte offsets follow the program's, so every
-    // span says which file it is in.
+    frontend_files(src, &|_| None, artifacts)
+}
+
+/// One file of a program.
+struct File {
+    /// Its path below the main file's folder: `main.luna`, `entity/try.luna`.
+    path: String,
+    source: SourceFile,
+    base: usize,
+    program: ast::Program,
+    /// For each link, the file it links (an index into the files).
+    targets: Vec<usize>,
+}
+
+impl File {
+    /// What its definitions are called globally: the main file's by their
+    /// own names, the others' after their file (`entity/try.pred`).
+    fn global(&self, index: usize, name: &str) -> String {
+        if index == 0 {
+            name.to_string()
+        } else {
+            format!("{}.{name}", self.path.trim_end_matches(".luna"))
+        }
+    }
+}
+
+/// Compile a Luna program to an LIR module (without the runtime). The main
+/// file `src` can link other files (`| entity`), which `load` reads.
+///
+/// All files are read first, following the links from the main file (each
+/// file once, so files may link each other in any way). Their definitions
+/// then become one program: those of linked files get global names after
+/// their file (`entity/try.pred`), so two files can define the same name,
+/// and each file gets a table of what its names mean (`hir::FileNames`).
+/// From there on, the compiler sees one program.
+pub fn frontend_files(
+    src: &SourceFile,
+    load: Loader,
+    artifacts: &mut Artifacts,
+) -> Result<Module, CompileError> {
+    let main_path = std::path::Path::new(&src.name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "main.luna".into());
+    let folder = std::path::Path::new(&src.name)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let mut files: Vec<File> = Vec::new();
+    // Every file gets its own range of byte offsets (see `diag::Sources`).
+    let mut next_base = 0;
+    let mut add = |files: &mut Vec<File>, path: String, source: SourceFile| {
+        let base = next_base;
+        next_base += source.text.len() + 1;
+        let fail = |files: &[File], source: &SourceFile, d: Diagnostic| {
+            let mut all: Vec<(usize, &SourceFile)> =
+                files.iter().map(|f| (f.base, &f.source)).collect();
+            all.push((base, source));
+            CompileError {
+                message: Sources::new(all).render(&d),
+            }
+        };
+        let tokens = lexer::lex_at(&source.text, base).map_err(|d| fail(files, &source, d))?;
+        let program = parser::parse(tokens).map_err(|d| fail(files, &source, d))?;
+        files.push(File {
+            path,
+            source,
+            base,
+            program,
+            targets: Vec::new(),
+        });
+        Ok::<usize, CompileError>(files.len() - 1)
+    };
+    add(
+        &mut files,
+        main_path,
+        SourceFile::new(src.name.clone(), src.text.clone()),
+    )?;
+    artifacts.ast = Some(ast::dump(&files[0].program));
+
+    // Follow the links. A link `| entity` means `entity.luna` or, for a
+    // folder of the same name, `entity/entity.luna`.
+    let mut i = 0;
+    while i < files.len() {
+        for k in 0..files[i].program.links.len() {
+            let link = &files[i].program.links[k];
+            let span = link.path_span;
+            let joined = link.path.join("/");
+            let candidates = [
+                format!("{joined}.luna"),
+                format!("{joined}/{}.luna", link.path.last().unwrap()),
+            ];
+            let mut found: Vec<usize> = Vec::new();
+            for path in &candidates {
+                if let Some(j) = files.iter().position(|f| &f.path == path) {
+                    found.push(j);
+                } else if let Some(text) = load(path) {
+                    let shown = folder.join(path).display().to_string();
+                    found.push(add(&mut files, path.clone(), SourceFile::new(shown, text))?);
+                }
+            }
+            let error = |files: &[File], msg: String| {
+                let all = files.iter().map(|f| (f.base, &f.source)).collect();
+                CompileError {
+                    message: Sources::new(all).render(&Diagnostic::error(
+                        ErrorKind::SymbolNotFoundError,
+                        span,
+                        msg,
+                    )),
+                }
+            };
+            match found[..] {
+                [j] => files[i].targets.push(j),
+                [] => {
+                    return Err(error(
+                        &files,
+                        format!(
+                            "cannot find the file `{}` or `{}` to link (paths start at the folder of the main file)",
+                            candidates[0], candidates[1]
+                        ),
+                    ));
+                }
+                _ => {
+                    return Err(error(
+                        &files,
+                        format!(
+                            "both `{}` and `{}` exist; move or rename one of them so that `{joined}` names one file",
+                            candidates[0], candidates[1]
+                        ),
+                    ));
+                }
+            }
+        }
+        i += 1;
+    }
+
     let std = SourceFile::new("std.luna", STD_LUNA);
-    let std_base = src.text.len() + 1;
-    let sources = Sources::new(vec![(0, src), (std_base, &std)]);
+    let std_base = next_base;
+    let mut all: Vec<(usize, &SourceFile)> = files.iter().map(|f| (f.base, &f.source)).collect();
+    all.push((std_base, &std));
+    let sources = Sources::new(all);
     let fail = |diags: &[Diagnostic]| CompileError {
         message: render_all(&sources, diags),
     };
-    let tokens = lexer::lex(&src.text).map_err(|d| fail(&[d]))?;
-    let mut program = parser::parse(tokens).map_err(|d| fail(&[d]))?;
-    artifacts.ast = Some(ast::dump(&program));
     let std_tokens = lexer::lex_at(&std.text, std_base).map_err(|d| fail(&[d]))?;
     let mut library = parser::parse(std_tokens).map_err(|d| fail(&[d]))?;
-    // A program's own definition of a name replaces the library's (all of
-    // its definitions of that name) for the program. The library keeps
-    // using its own: those definitions get a name no program can write
-    // (`std.sum`), and the library's calls are pointed at it.
-    let own: std::collections::HashSet<&str> =
-        program.defs.iter().map(|d| d.name.as_str()).collect();
-    let renames: std::collections::HashMap<String, String> = library
+    // A main file's own definition of a name replaces the library's (all
+    // of its definitions of that name) for the main file. The library
+    // keeps using its own: those definitions get a name no program can
+    // write (`std.sum`), and the library's calls are pointed at it.
+    let own: HashSet<&str> = files[0]
+        .program
         .defs
         .iter()
-        .filter(|d| own.contains(d.name.as_str()))
-        .map(|d| (d.name.clone(), format!("std.{}", d.name)))
+        .map(|d| d.name.as_str())
+        .collect();
+    let library_names: HashSet<String> = library.defs.iter().map(|d| d.name.clone()).collect();
+    let renames: HashMap<String, String> = library_names
+        .iter()
+        .filter(|n| own.contains(n.as_str()))
+        .map(|n| (n.clone(), format!("std.{n}")))
         .collect();
     for def in &mut library.defs {
         ast::rename_globals(def, &renames);
         if let Some(new) = renames.get(&def.name) {
             def.name = new.clone();
         }
+        def.file = files.len();
+    }
+
+    let names = file_names(&files, &library_names, &renames).map_err(|d| fail(&[d]))?;
+    let mut program = ast::Program {
+        links: Vec::new(),
+        defs: Vec::new(),
+    };
+    for (index, file) in files.iter().enumerate() {
+        for def in &file.program.defs {
+            let mut def = def.clone();
+            def.name = file.global(index, &def.name);
+            def.file = index;
+            program.defs.push(def);
+        }
     }
     program.defs.extend(library.defs);
-    let (hir, warnings) = hir::resolve(&program).map_err(|ds| fail(&ds))?;
+    let (hir, warnings) = hir::resolve_files(&program, &names).map_err(|ds| fail(&ds))?;
     // Warnings about the library are not the program's business.
     artifacts.warnings.extend(
         warnings
@@ -125,6 +287,109 @@ pub fn frontend(src: &SourceFile, artifacts: &mut Artifacts) -> Result<Module, C
     let mut module = lower::lower(&tir);
     lir::opt::optimize_module(&mut module);
     Ok(module)
+}
+
+/// What the names in each file mean (see `hir::FileNames`): the file's own
+/// definitions, the files it links whole (`et.pred`), and the definitions
+/// it links by name. A linked file does not see the main file's
+/// definitions; where it uses one of their names, it means the standard
+/// library's or a built-in function, if there is one.
+fn file_names(
+    files: &[File],
+    library: &HashSet<String>,
+    renames: &HashMap<String, String>,
+) -> Result<Vec<hir::FileNames>, Diagnostic> {
+    let defined = |j: usize| -> HashMap<String, String> {
+        files[j]
+            .program
+            .defs
+            .iter()
+            .map(|d| (d.name.clone(), files[j].global(j, &d.name)))
+            .collect()
+    };
+    let mut tables = Vec::new();
+    for (i, file) in files.iter().enumerate() {
+        let mut table = hir::FileNames {
+            file: file.path.clone(),
+            names: defined(i),
+            ..Default::default()
+        };
+        // Where each name came from, for the error when two links clash.
+        let mut linked_at: HashMap<String, Span> = HashMap::new();
+        for (link, &j) in file.program.links.iter().zip(&file.targets) {
+            let theirs = defined(j);
+            match &link.names {
+                None => {
+                    let (alias, span) = link
+                        .aliases
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| (link.path.last().unwrap().clone(), link.path_span));
+                    if table.files.contains_key(&alias) {
+                        return Err(Diagnostic::error(
+                            ErrorKind::DefinitionError,
+                            span,
+                            format!(
+                                "two files are linked as `{alias}`; give one of them another name with `>`"
+                            ),
+                        ));
+                    }
+                    table.files.insert(alias, (files[j].path.clone(), theirs));
+                }
+                Some(picked) => {
+                    for (k, (name, span)) in picked.iter().enumerate() {
+                        let Some(global) = theirs.get(name) else {
+                            return Err(Diagnostic::error(
+                                ErrorKind::SymbolNotFoundError,
+                                *span,
+                                format!("`{}` has no definition `{name}`", files[j].path),
+                            ));
+                        };
+                        let (local, local_span) = link.aliases.get(k).unwrap_or(&picked[k]);
+                        if let Some(&before) = linked_at.get(local) {
+                            if table.names[local] != *global {
+                                return Err(Diagnostic::error(
+                                    ErrorKind::DefinitionError,
+                                    *local_span,
+                                    format!("`{local}` is linked twice, from different files"),
+                                )
+                                .with_note(before, "linked here first"));
+                            }
+                        } else if table.names.contains_key(local) {
+                            return Err(Diagnostic::error(
+                                ErrorKind::DefinitionError,
+                                *local_span,
+                                format!(
+                                    "`{local}` is defined in this file and linked from `{}`; give the linked one another name with `>`",
+                                    files[j].path
+                                ),
+                            ));
+                        }
+                        table.names.insert(local.clone(), global.clone());
+                        linked_at.insert(local.clone(), *local_span);
+                    }
+                }
+            }
+        }
+        if i > 0 {
+            for def in &files[0].program.defs {
+                let n = &def.name;
+                if table.names.contains_key(n) {
+                    continue;
+                }
+                let instead = if library.contains(n) {
+                    Some(renames.get(n).cloned().unwrap_or_else(|| n.clone()))
+                } else if hir::Builtin::from_name(n).is_some() {
+                    Some(format!("builtin.{n}"))
+                } else {
+                    None
+                };
+                table.hidden.insert(n.clone(), instead);
+            }
+        }
+        tables.push(table);
+    }
+    Ok(tables)
 }
 
 /// The runtime library for a target: the core plus the target's OS layer.
@@ -195,7 +460,10 @@ pub fn compile(input: Input, opts: &Options) -> Result<Artifacts, CompileError> 
     let mut artifacts = Artifacts::default();
     let module = match input {
         Input::Luna(src) => {
-            let program = frontend(src, &mut artifacts)?;
+            let program = match opts.files {
+                Some(load) => frontend_files(src, load, &mut artifacts)?,
+                None => frontend(src, &mut artifacts)?,
+            };
             let runtime = runtime_module(opts.target);
             artifacts.ir = Some(format!(
                 "; Luna IR generated by lunac {}\n; ---- program ----\n\n{}\n; ---- runtime ----\n\n{}",

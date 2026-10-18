@@ -62,6 +62,7 @@ pub enum TokenKind {
     Comma,      // ,
     Semi,       // ;
     At,         // @
+    Hash,       // # right after a path in a link line: `| entity#pred`
     Newline,
     Eof,
 }
@@ -107,6 +108,7 @@ impl TokenKind {
             TokenKind::Comma => "`,`".into(),
             TokenKind::Semi => "`;`".into(),
             TokenKind::At => "`@`".into(),
+            TokenKind::Hash => "`#`".into(),
             TokenKind::Newline => "end of line".into(),
             TokenKind::Eof => "end of file".into(),
         }
@@ -195,6 +197,20 @@ impl<'a> Lexer<'a> {
         self.src.get(self.pos + 1).copied().unwrap_or(0)
     }
 
+    /// The current line is a link, `| path ...`: it starts with `|` in
+    /// column 1.
+    fn in_link_line(&self) -> bool {
+        let first = self
+            .out
+            .iter()
+            .rev()
+            .take_while(|t| t.kind != TokenKind::Newline)
+            .last();
+        first.is_some_and(|t| {
+            t.kind == TokenKind::Bar && t.at_col0 && t.span.start >= self.line_begin
+        })
+    }
+
     fn push(&mut self, kind: TokenKind, start: usize) {
         let line_first = self.line_start;
         let at_col0 = line_first && (start == 0 || self.src[start - 1] == b'\n');
@@ -215,6 +231,16 @@ impl<'a> Lexer<'a> {
             let c = self.peek();
             match c {
                 b' ' | b'\t' | b'\r' => self.pos += 1,
+                // In a link line, `#` right after the path picks definitions
+                // (`| entity#pred`); everywhere else it starts a comment.
+                b'#' if self.in_link_line()
+                    && start > 0
+                    && (self.src[start - 1] == b'_'
+                        || self.src[start - 1].is_ascii_alphanumeric()) =>
+                {
+                    self.pos += 1;
+                    self.push(TokenKind::Hash, start);
+                }
                 b'#' => {
                     while self.pos < self.src.len() && self.peek() != b'\n' {
                         self.pos += 1;
@@ -248,8 +274,19 @@ impl<'a> Lexer<'a> {
                 b'0'..=b'9' => self.number()?,
                 b'"' => self.string()?,
                 c if c == b'_' || c.is_ascii_alphabetic() => {
-                    while self.peek() == b'_' || self.peek().is_ascii_alphanumeric() {
+                    let word_char = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+                    while word_char(self.peek()) {
                         self.pos += 1;
+                    }
+                    // A qualified name, `et.pred`: a definition of the file
+                    // linked as `et`. (`a..b` stays a range.)
+                    while self.peek() == b'.'
+                        && (self.peek2() == b'_' || self.peek2().is_ascii_alphabetic())
+                    {
+                        self.pos += 1;
+                        while word_char(self.peek()) {
+                            self.pos += 1;
+                        }
                     }
                     let word = &self.text[start..self.pos];
                     // Keywords are lexed exactly like names and then looked

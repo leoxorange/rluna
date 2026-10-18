@@ -1,0 +1,6 @@
+# Linked by `linking.luna`.
+| links/util#double
+
+area w h = w * h
+perimeter w h = double (w + h)
+unit = 1
