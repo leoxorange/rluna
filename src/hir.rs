@@ -31,61 +31,6 @@ use crate::ast::{self, BinOp, ExprKind, Stmt, TypeName};
 use crate::diag::{Diagnostic, ErrorKind, Span};
 use crate::types::{Kind, Ty};
 
-/// The functions built into the language (chapter 2 of the readme). A
-/// program that defines a function with the same name uses its own instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Builtin {
-    /// The number of elements (or characters).
-    Len,
-    /// The first element, or void if there is none.
-    Head,
-    /// Everything after the first element, or void if there is none.
-    Tail,
-    /// Everything before the last element, or void if there is none.
-    Init,
-    /// The last element, or void if there is none.
-    Last,
-    /// The elements (or characters) in the opposite order.
-    Reverse,
-    /// A copy of any value, owned by whoever receives it: the way to keep
-    /// something borrowed (`copy a` inside `f @a = ...`, `copy (head a)`).
-    Copy,
-}
-
-impl Builtin {
-    pub fn from_name(name: &str) -> Option<Builtin> {
-        Some(match name {
-            "len" => Builtin::Len,
-            "head" => Builtin::Head,
-            "tail" => Builtin::Tail,
-            "init" => Builtin::Init,
-            "last" => Builtin::Last,
-            "reverse" => Builtin::Reverse,
-            "copy" => Builtin::Copy,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Builtin::Len => "len",
-            Builtin::Head => "head",
-            Builtin::Tail => "tail",
-            Builtin::Init => "init",
-            Builtin::Last => "last",
-            Builtin::Reverse => "reverse",
-            Builtin::Copy => "copy",
-        }
-    }
-}
-
-/// The built-in function a global name stands for: its own name, or
-/// `builtin.len` from a file where `len` means something else (see
-/// `FileNames::hidden`).
-fn builtin_of(global: &str) -> Option<Builtin> {
-    Builtin::from_name(global.strip_prefix("builtin.").unwrap_or(global))
-}
-
 /// How the names written in one file reach the global definitions, in a
 /// program made of several files (see `driver`, which builds one table per
 /// file). Each file sees its own definitions, the ones it links, and the
@@ -263,9 +208,18 @@ pub struct Func {
     /// For each parameter, whether it is borrowed (`@a`). All definitions
     /// with the same name and number of parameters agree on this.
     pub borrowed: Vec<bool>,
-    /// A `native` function: the runtime function that gives it
-    /// (`rt.read_line`). Its body is empty.
-    pub native: Option<String>,
+    /// A `native` function: who gives it. Its body is empty.
+    pub native: Option<Native>,
+}
+
+/// Who gives a `native` function.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Native {
+    /// The runtime function of this name (`rt.read_line`).
+    Runtime(String),
+    /// The compiler, for the values of an embedded trail (`len` of an
+    /// array): see `ast::Intrinsic`.
+    Intrinsic(ast::Intrinsic),
 }
 
 /// A clause of a list comprehension.
@@ -357,8 +311,6 @@ pub enum HExprKind {
     Over,
     /// `jump`: the innermost loop's next round.
     Jump,
-    /// A call of a built-in function, which takes one argument.
-    Builtin(Builtin, Box<HExpr>),
     Array(Vec<HExpr>),
     Range(Box<HExpr>, Box<HExpr>),
     /// `[body | clauses]`; the generators' variables exist only inside.
@@ -366,7 +318,6 @@ pub enum HExprKind {
         body: Box<HExpr>,
         clauses: Vec<HClause>,
     },
-    Echo(Box<HExpr>),
     Check {
         scrutinee: Box<HExpr>,
         arms: Vec<(HExpr, HExpr)>,
@@ -813,8 +764,6 @@ fn used_locals(e: &HExpr, out: &mut Vec<LocalId>) {
         }
         HExprKind::Neg(x)
         | HExprKind::Not(x)
-        | HExprKind::Echo(x)
-        | HExprKind::Builtin(_, x)
         | HExprKind::Field(x, _, _)
         | HExprKind::Is { value: x, .. } => go(x),
         HExprKind::Ret(x) => x.iter().for_each(|x| go(x)),
@@ -996,7 +945,7 @@ pub fn resolve_files(
             ))
         } else if trail_defs.contains_key(&t.name) {
             Some(format!("the trail `{written}` is defined more than once"))
-        } else if def_names.contains(t.name.as_str()) || Builtin::from_name(&t.name).is_some() {
+        } else if def_names.contains(t.name.as_str()) {
             Some(format!(
                 "`{written}` names both a trail and a function; a trail's name must be unique"
             ))
@@ -1246,6 +1195,7 @@ pub fn resolve_files(
     }
     for a in arities.values_mut() {
         a.sort();
+        a.dedup();
     }
 
     // The defaults of trail fields become functions of the fields they use,
@@ -1361,8 +1311,13 @@ pub fn resolve_files(
                     ),
                 ));
             }
-            let written = def.name.strip_prefix("std.").unwrap_or(&def.name);
-            format!("rt.{written}")
+            match &def.intrinsic {
+                Some(i) => Native::Intrinsic(i.clone()),
+                None => {
+                    let written = def.name.strip_prefix("std.").unwrap_or(&def.name);
+                    Native::Runtime(format!("rt.{written}"))
+                }
+            }
         });
         funcs.push(Func {
             name: def.name.clone(),
@@ -1903,13 +1858,10 @@ impl<'a> Resolver<'a> {
         if self.member_has(name, true) {
             return self.method_arities.get(name).cloned();
         }
-        if let Ok(global) = self.global(name, Span::default()) {
-            if let Some(a) = self.arities.get(global.as_str()) {
-                return Some(a.clone());
-            }
-            if builtin_of(&global).is_some() {
-                return Some(vec![1]);
-            }
+        if let Ok(global) = self.global(name, Span::default())
+            && let Some(a) = self.arities.get(global.as_str())
+        {
+            return Some(a.clone());
         }
         // `t.describe`: a function of a value
         let (_, method) = name.rsplit_once('.')?;
@@ -1989,6 +1941,27 @@ impl<'a> Resolver<'a> {
         let ExprKind::Name(name) = &atom.kind else {
             return vec![(i + 1, atom.clone())];
         };
+        // `Fruit {...}`: a trail's name and the braces after it are one value.
+        if let Some(
+            fields @ ast::Expr {
+                kind: ExprKind::Record(_),
+                ..
+            },
+        ) = args.get(i + 1)
+            && self
+                .global(name, atom.span)
+                .is_ok_and(|g| self.trails.contains_key(&g))
+        {
+            let value = ast::Expr {
+                kind: ExprKind::Call {
+                    callee: name.clone(),
+                    callee_span: atom.span,
+                    args: vec![fields.clone()],
+                },
+                span: atom.span.to(fields.span),
+            };
+            return vec![(i + 2, value)];
+        }
         let Some(arities) = self.function_arities(name) else {
             return vec![(i + 1, atom.clone())];
         };
@@ -2021,13 +1994,6 @@ impl<'a> Resolver<'a> {
     /// give its global name.
     fn check_callable(&self, name: &str, nargs: usize, span: Span) -> Result<String, Diagnostic> {
         let global = self.global(name, span)?;
-        if !self.arities.contains_key(global.as_str()) && builtin_of(&global).is_some() {
-            return Err(Diagnostic::error(
-                ErrorKind::TypeError,
-                span,
-                format!("`{name}` is called with {nargs} argument(s), but it takes 1"),
-            ));
-        }
         let Some(arities) = self.arities.get(global.as_str()) else {
             return Err(Diagnostic::error(
                 ErrorKind::SymbolNotFoundError,
@@ -2121,6 +2087,21 @@ impl<'a> Resolver<'a> {
                 {
                     return self.expr_in(&grouped, expect);
                 }
+                // No grouping fits: a name among the arguments that is not
+                // found (`echo zz.f 1`) is the real problem.
+                if let Some(arities) = self.function_arities(callee)
+                    && !arities.contains(&args.len())
+                {
+                    for a in args {
+                        let ExprKind::Name(n) = &a.kind else {
+                            continue;
+                        };
+                        let base = n.split_once('.').map_or(n.as_str(), |(b, _)| b);
+                        if self.lookup_local(base).is_none() && !self.member_has(base, false) {
+                            self.global(n, a.span)?;
+                        }
+                    }
+                }
                 if let Some(t) = &self.default_of
                     && self.lookup_local(callee).is_none()
                     && self.trails[t].methods.iter().any(|m| &m.name == callee)
@@ -2198,25 +2179,6 @@ impl<'a> Resolver<'a> {
                             ),
                         )),
                     };
-                }
-                let global = self.global(callee, *callee_span)?;
-                if !self.arities.contains_key(global.as_str())
-                    && let Some(b) = builtin_of(&global)
-                {
-                    let [arg] = &args[..] else {
-                        return Err(Diagnostic::error(
-                            ErrorKind::TypeError,
-                            *callee_span,
-                            format!(
-                                "`{callee}` is called with {} argument(s), but it takes 1",
-                                args.len()
-                            ),
-                        ));
-                    };
-                    return Ok(HExpr {
-                        kind: HExprKind::Builtin(b, Box::new(self.expr(arg)?)),
-                        span: e.span,
-                    });
                 }
                 let name = self.check_callable(callee, args.len(), *callee_span)?;
                 // An argument is a value of its parameter's trail when every
@@ -2337,7 +2299,6 @@ impl<'a> Resolver<'a> {
                 self.locals.truncate(visible);
                 resolved?
             }
-            ExprKind::Echo(inner) => HExprKind::Echo(Box::new(self.expr(inner)?)),
             ExprKind::Check {
                 scrutinee,
                 arms,

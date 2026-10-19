@@ -274,7 +274,7 @@ echo head tail [1, 2, 3] # echo (head (tail [1, 2, 3])): 2
 ```
 If the arguments can be grouped in more than one way, the compiler asks you to add parentheses.
 
-`echo` takes one argument: a name, a value, a call (like `echo sum xs`), or anything in parentheses. So `echo (5 > 6)` needs its parentheses.
+`echo` is a function too (of the standard library, see chapter 2), and takes one argument: a name, a value, a call (like `echo sum xs`), or anything in parentheses. So `echo (5 > 6)` needs its parentheses.
 
 #### ret
 
@@ -380,12 +380,12 @@ main =
 this defines a trail Fruit, and the return type will be Fruit.
 
 - **values.** `Fruit {name = "orange"}` makes a Fruit anywhere. A bare `{...}` works only where its trail is already known: a declared return trail (`-> Fruit`, as in `buy`), a parameter declared `:: Fruit`, or a global declared `test :: Fruit = {...}`. A field without a default must be given; giving a field the trail does not have, or a value of the wrong trail, is an error. `Fruit {}` takes every default.
-- **fields.** `t.name` reads a field. Like `head`, it gives the field itself, still inside `t`: you can read it, and to keep it you copy it (`copy t.name`).
+- **fields.** `t.name` reads a field. Like `a !! i`, it gives the field itself, still inside `t`: you can read it, and to keep it you copy it (`copy t.name`).
 - **a field with a default and a function without arguments are the same thing.** `peel :: Boolean = false` and `textualize = copy name` are both a name with a value. The value can use the other fields by name, borrowed (to keep one, it copies it: `textualize = copy name`), and is computed when the value is made, after the fields it uses; a `Fruit {...}` may give its own (`Fruit {name = "kiwi", textualize = "a kiwi"}`).
 - **follow.** `trail Apple follow Fruit:` gives Apple the fields and functions of Fruit, plus its own, and an Apple can be given wherever a parameter or a result is declared `:: Fruit`. (A field or an array declared with `Fruit` holds Fruits only, for now: see "one trail at a time".) A trail can follow several: `trail Box follow Show, Compare:`.
 - **trails as parameters.** `print any :: Show -> Void` accepts any value whose trail follows Show; the function is compiled for each trail it is used with.
 - **one trail at a time.** An array holds values of one trail, and all the branches of a `check` give the same trail: `[Fruit {name = "a"}, Warehouse {rack = []}]` is an error for now.
-- **echo.** `echo` prints a value with its `textualize`. A value whose trail does not follow Show prints its trail name (`Fruit`), with a warning.
+- **echo.** `echo` prints a value with its `textualize`. A value whose trail does not follow Show prints its trail name (`Fruit`).
 - **Copy.** `copy x` only accepts a value whose trail follows Copy, and copies it field by field, so every field must follow Copy too. Following Copy never changes what a program does: `y = x` still moves `x`. Only the embedded Int, Float, Boolean and Void are copied by themselves.
 - **Compare.** A trail that follows Compare gives `compare @other :: Self -> Int`, called on a value: `a.compare b` is -1 if `a` comes first, 0 if they are equal, 1 if `b` comes first. `<`, `<=`, `>`, `>=`, `==` and `!=` all come from it (`a < b` means `a.compare b < 0`), so only trails that follow Compare can be compared, or used as `check` patterns, and only with values of the same trail. An operator only reads its operands, which is why `other` is borrowed (`@other`). `Self` means the trail itself (or one that follows it).
 - **Numeric.** A trail that follows Numeric plays like a number: it gives `add`, `sub`, `mul` and `div` (each like `add @other :: Self -> Self`), `compare` and `textualize`, and then `a + b` means `a.add b`, for two values of the same trail. A trail that also gives `mod @other :: Self -> Self` can use `%` (`a % b` means `a.mod b`); Numeric does not ask for it. Still, only the embedded numbers are copied by themselves. For now, only the embedded trails follow Iterable and Array.
@@ -523,7 +523,7 @@ a few more rules:
 
 ## chapter 2. internal values and functions
 
-since we have numeric, string and array, now we need some internal functions to help us do more things
+since we have numeric, string and array, now we need some functions to help us do more things. They are written in luna itself, in the standard library (`src/std.luna`, see chapter 4), on top of a few primitives the compiler gives:
 ```
 a = [1, 2, 3]
 hi = "hello"
@@ -542,6 +542,9 @@ main =
     echo (reverse hi) # "olleh"
     echo (head []) # void
     echo (copy a) # [1, 2, 3]
+    echo (slice a 1 3) # [2, 3]
+    echo (slice hi 1 3) # "el"
+    echo (at a 0) # 1
 ```
 len returns the length of an iterable object.
 head grabs the first element in an iterable object, tail grabs the rest.
@@ -549,6 +552,21 @@ init grabs all the elements except the last one, and last only grabs the last on
 reverse gives the elements in the opposite order.
 head, tail, init and last give void when there is no element.
 copy gives a copy of a value whose trail follows Copy, as all the embedded ones do (see chapter 3 and "trail definition").
+slice gives the elements from the first position up to (not including) the second; positions outside the array or string are moved to its ends, so `slice a 1 99` is everything after the first.
+at gives the element at a position, like `!!`, but a position outside stops the program with an `IndexError` instead of giving void, so its result is never void.
+
+These functions only read what they are given (it is borrowed), and give copies: `head names` is a copy of the first name, and `names` keeps all of its own. So the elements must follow Copy. `!!` gives the element itself instead (see chapter 3).
+
+`len`, `slice`, `at` and `copy` are the few things only the machine can do with the embedded values, so the compiler gives them. `src/std.luna` declares them as `native` functions of the embedded trails, where `Self` is the type of the value and `Element` the type of its elements (a string's are strings); everything else is written in luna on top of them:
+```
+trail Array follow Show, Copy, Iterable:
+    native len :: Int
+    native slice from to :: Int, Int -> Self
+    native at i :: Int -> Element
+
+head @a :: Iterable? = copy (a !! 0)
+```
+`echo` is written in luna the same way: it prints `text x`, what the value shows (its `textualize`, or the name of a trail that does not follow Show), and a newline.
 
 A string is a sequence of characters, not bytes: `len "héllo"` is 5 and `"héllo" !! 1` is `"é"`.
 
@@ -573,7 +591,7 @@ A value moves when you:
 - bind it to another name (`t = s`)
 - pass it to a function (`f s`)
 - return it, or put it in an array (`[s]`)
-- give it to `++`, `**`, `tail`, `init`, `reverse`, or to a loop or list comprehension that goes through it
+- give it to `++`, `**`, or to a loop or list comprehension that goes through it
 
 A move copies nothing: the new owner gets the very same value. So `x = x ++ [4]` adds to the old array without copying it. Giving a name a new value (`s = "again"`) makes it usable again.
 
@@ -621,15 +639,16 @@ List comprehensions work the same way: `[len w | w in @names]` borrows `names`, 
 
 ### elements
 
-`head a`, `last a` and `a !! i` give you the element itself, still inside `a`, not a copy. You can read it, but to keep it you need a copy:
+`a !! i` gives you the element itself, still inside `a`, not a copy. You can read it, but to keep it you need a copy:
 ```
 main =
     names = ["ann", "bob"]
-    echo (head names) # fine: only reading
-    first = head names # error: the element is still inside names
-    first = copy (head names) # fine
+    echo (names !! 0) # fine: only reading
+    first = names !! 0 # error: the element is still inside names
+    first = copy (names !! 0) # fine
+    first = head names # fine too: head gives a copy
 ```
-Numbers are copied as usual, so `x = head [1, 2]` is fine.
+Numbers are copied as usual, so `x = [1, 2] !! 0` is fine.
 
 ### while something is borrowed
 
@@ -715,4 +734,4 @@ main =
 ```
 `lunac sum.luna -r -- a.txt b.txt` builds it and runs it with the arguments `a.txt` and `b.txt`.
 
-`read_line`, `read_all`, `print`, `args`, `read_file`, `write_file` and `exit` reach outside the program, so the runtime gives them: `src/std.luna` declares them with `native` in front, as a signature without a body (`native read_line :: String?`). Only the standard library can declare native functions. `lines`, `to_int` and `to_float` are written in luna, like the rest of the library.
+`read_line`, `read_all`, `print`, `args`, `read_file`, `write_file` and `exit` reach outside the program, so the runtime gives them: `src/std.luna` declares them with `native` in front, as a signature without a body (`native read_line :: String?`). So does `concat parts`, which joins an array of strings into one, copying each once. Only the standard library can declare native functions. `lines`, `to_int` and `to_float` are written in luna, like the rest of the library.

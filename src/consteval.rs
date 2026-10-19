@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 
 use crate::ast::BinOp;
-use crate::hir::{Builtin, HPattern};
+use crate::hir::{HPattern, Native};
 use crate::typeck::{
     DispatchCase, InstId, LoopSource, TClause, TExpr, TExprKind, TFunc, TStmt, Tir, binop_result,
     for_each_expr_mut,
@@ -194,11 +194,7 @@ fn substitute(e: &mut TExpr, consts: &HashMap<InstId, Const>) {
             substitute(lhs, consts);
             substitute(rhs, consts);
         }
-        TExprKind::Neg(x)
-        | TExprKind::Is(x, _)
-        | TExprKind::Echo(x)
-        | TExprKind::Convert(x)
-        | TExprKind::Builtin(_, x) => substitute(x, consts),
+        TExprKind::Neg(x) | TExprKind::Is(x, _) | TExprKind::Convert(x) => substitute(x, consts),
         TExprKind::Array(items) => items.iter_mut().for_each(|i| substitute(i, consts)),
         TExprKind::Construct { steps, .. } => {
             steps.iter_mut().for_each(|(_, v)| substitute(v, consts))
@@ -252,10 +248,15 @@ struct Frame {
 
 impl Interp<'_> {
     fn call(&mut self, inst: InstId, args: Vec<Const>) -> Eval<Const> {
-        // A native function reaches the world outside (input, files): what
-        // it gives is only known when the program runs.
-        if self.depth == MAX_DEPTH || self.tir.funcs[inst].native.is_some() {
-            return Err(NotConstant);
+        // The functions the compiler gives work on values; the runtime's
+        // reach the world outside (input, files), so what they give is
+        // only known when the program runs, except for `concat`.
+        match &self.tir.funcs[inst].native {
+            Some(Native::Intrinsic(i)) => return intrinsic(&i.name, args),
+            Some(Native::Runtime(f)) if f == "rt.concat" => return Ok(concat(&args[0])),
+            Some(Native::Runtime(_)) => return Err(NotConstant),
+            None if self.depth == MAX_DEPTH => return Err(NotConstant),
+            None => {}
         }
         self.depth += 1;
         let f: &TFunc = &self.tir.funcs[inst];
@@ -411,7 +412,6 @@ impl Interp<'_> {
                 self.comprehension(clauses, body, frame, &mut out)?;
                 Const::Array(out)
             }
-            TExprKind::Builtin(b, arg) => builtin(*b, self.expr(arg, frame)?),
             TExprKind::Concat(a, b) => match (self.expr(a, frame)?, self.expr(b, frame)?) {
                 (Const::Array(mut x), Const::Array(y)) => {
                     x.extend(y);
@@ -473,8 +473,6 @@ impl Interp<'_> {
                 };
                 self.call(case.inst, args)?
             }
-            // A side effect: the global must run when the program runs.
-            TExprKind::Echo(_) => return Err(NotConstant),
             // Some argument never finishes (it returns from the function, or
             // never ends), so neither does this.
             TExprKind::Diverge(args) => {
@@ -537,43 +535,62 @@ impl Interp<'_> {
     }
 }
 
-/// A built-in function on a value; void flows through.
-fn builtin(b: Builtin, v: Const) -> Const {
+/// A function the compiler gives (see `ast::Intrinsic`), on the value
+/// `args[0]`: an array or a string.
+fn intrinsic(name: &str, args: Vec<Const>) -> Eval<Const> {
     // Constants have no owners: a copy is the value itself.
-    if b == Builtin::Copy {
-        return v;
+    if name == "copy" {
+        return Ok(args.into_iter().next().unwrap());
     }
-    let items: Vec<Const> = match &v {
-        Const::Array(items) => items.clone(),
-        Const::Str(s) => s.chars().map(|c| Const::Str(c.to_string())).collect(),
-        _ => return Const::Void,
+    // Printing is done while the program runs.
+    if name == "text" {
+        return Err(NotConstant);
+    }
+    let (items, string) = match &args[0] {
+        Const::Array(items) => (items.clone(), false),
+        Const::Str(s) => (s.chars().map(|c| Const::Str(c.to_string())).collect(), true),
+        _ => unreachable!("only arrays and strings have intrinsics besides `copy`"),
     };
-    // Turn a run of characters back into one string.
-    let rebuild = |part: &[Const]| match &v {
-        Const::Str(_) => Const::Str(
-            part.iter()
-                .map(|c| match c {
-                    Const::Str(s) => s.as_str(),
-                    _ => unreachable!(),
-                })
-                .collect(),
-        ),
-        _ => Const::Array(part.to_vec()),
+    let n = items.len() as i64;
+    let int = |k: usize| match args[k] {
+        Const::Int(v) => v,
+        _ => unreachable!("positions are ints"),
     };
-    match b {
-        Builtin::Len => Const::Int(items.len() as i64),
-        Builtin::Reverse => {
-            let mut reversed = items.clone();
-            reversed.reverse();
-            rebuild(&reversed)
+    Ok(match name {
+        "len" => Const::Int(n),
+        "slice" => {
+            let from = int(1).clamp(0, n);
+            let to = int(2).clamp(from, n);
+            let part = items[from as usize..to as usize].to_vec();
+            if string {
+                concat(&Const::Array(part))
+            } else {
+                Const::Array(part)
+            }
         }
-        Builtin::Head => items.first().cloned().unwrap_or(Const::Void),
-        Builtin::Last => items.last().cloned().unwrap_or(Const::Void),
-        _ if items.is_empty() => Const::Void,
-        Builtin::Tail => rebuild(&items[1..]),
-        Builtin::Init => rebuild(&items[..items.len() - 1]),
-        Builtin::Copy => unreachable!("handled above"),
-    }
+        // Out of range, the program stops: not a constant.
+        "at" => match usize::try_from(int(1)).ok().and_then(|i| items.get(i)) {
+            Some(x) => x.clone(),
+            None => return Err(NotConstant),
+        },
+        _ => unreachable!("unknown intrinsic `{name}`"),
+    })
+}
+
+/// `concat` of an array of strings: one string.
+fn concat(parts: &Const) -> Const {
+    let Const::Array(parts) = parts else {
+        unreachable!("concat takes an array of strings")
+    };
+    Const::Str(
+        parts
+            .iter()
+            .map(|c| match c {
+                Const::Str(s) => s.as_str(),
+                _ => unreachable!("concat takes an array of strings"),
+            })
+            .collect(),
+    )
 }
 
 /// The ints from..to.

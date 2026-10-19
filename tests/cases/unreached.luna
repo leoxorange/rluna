@@ -1,0 +1,14 @@
+# A call with an argument that never gives a value is never reached: its
+# other arguments are only evaluated, so one it would borrow stays the
+# caller's. Here `at ys 0` on an empty array can only stop the program,
+# and the `else` block never runs.
+
+pick @xs @ys = if len ys == 0:
+    at xs 0
+else:
+    at xs (at ys 0)
+
+main =
+    a = [5, 6]
+    echo (pick a [])
+    echo a

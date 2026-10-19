@@ -93,14 +93,18 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
 - **Top level** holds only definitions; executable code goes in `main`
   (`main = ...`, no arguments, required).
 - **Application** binds tighter than operators (`sum a 9 + 1` is
-  `(sum a 9) + 1`, and `x + sum xs` is `x + (sum xs)`). `echo` is applied
-  the same way and takes one argument: a name or literal, a call
-  (`echo sum xs`), or anything else in parentheses. `echo 5 > 6` means
-  `(echo 5) > 6`, a type error.
+  `(sum a 9) + 1`, and `x + sum xs` is `x + (sum xs)`). `echo` is a
+  function of the standard library like any other, taking one argument: a
+  name or literal, a call (`echo sum xs`, by the call chains below), or
+  anything else in parentheses. `echo 5 > 6` means `(echo 5) > 6`, a type
+  error.
 - **Call chains.** When a call has more arguments than any definition of
   the function takes, they are grouped by how many each function accepts,
   reading left to right: `echo sum xs` is `echo (sum xs)`, `head tail a` is
-  `head (tail a)`, and `add double 1 3` is `add (double 1) 3`. A call whose
+  `head (tail a)`, and `add double 1 3` is `add (double 1) 3`. A trail's
+  name with braces after it (`echo Fruit {...}`) is one value. If no
+  grouping fits and an argument names nothing (`echo zz.f 1`), that is the
+  error reported. A call whose
   arguments already fit is never regrouped (`f g x` with a two-parameter `f`
   passes `g` and `x`), and a call that can be grouped in more than one way
   is an error asking for parentheses. (This is not currying: Luna has no
@@ -144,7 +148,9 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   in it, and lowering passes them to the merge block as block parameters,
   converted to that type (`carry`), like the variables a loop updates. A
   variable checked for void is not narrowed in arms that may give it a
-  new value. An `if` in a list comprehension cannot give a variable a new
+  new value. A variable that can only be void is `never` in the arms for
+  other values, which are then never reached (`check a: void -> 0; else ->
+  len a` with `a` void). An `if` in a list comprehension cannot give a variable a new
   value: nothing carries from one element to the next.
 - **Numbers.** `5` is an `int` (64-bit), `5.0`/`1e3` are `float` (64-bit).
   `int op int` stays `int` for `+ - *`; `/` always produces a `float`
@@ -182,7 +188,8 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   both operands (`copy a ** b` keeps `a`). Each
   element is what `*` gives for its pair (`int` with `float` gives `float`),
   so `[1.5, 2.0] ** [2, 2, 2]` is `[3.0, 4.0, 2]`, of type `[numeric]`.
-- **`echo`** prints any value followed by a newline. Floats print in Python
+- **`echo`** prints any value followed by a newline: in `std.luna` it is
+  `print (text x)` and `print "\n"` (a string is printed as it is). Floats print in Python
   style with up to 15 significant digits (`3.5`, `66.0`, `1e-05`, `1e+20`,
   `infinite`); `void` prints as `void`; arrays as `[1, 2, 3]`, with strings
   in quotes inside them (`["a", "b"]`).
@@ -216,22 +223,33 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   the elements of both move into it. `a !! i` is element `i` itself, still
   in `a` (a copy if it is a number), or void if `i` is out of range. A string is a sequence of characters
   (Unicode code points, not bytes): `"héllo" !! 1` is `"é"`.
-- **Built-in functions** `len`, `head`, `tail`, `init`, `last` and
-  `reverse` take an array or a string; `head`, `tail`, `init` and `last`
-  give void when it is empty. `len` only reads it, `head` and `last` borrow
-  it and give the element itself, and `tail`, `init` and `reverse` take it
-  and move its elements into their result. `copy x` gives a copy of any
-  value. `reverse` is built in
-  because it needs the elements in the opposite order, which no loop or
-  comprehension gives. A program that defines a function with the
+- **Primitives.** Only a few functions need the machine: `len`, `slice
+  from to` and `at i` of strings and arrays, `copy` of the Copy trail and
+  `text` of Any (what `echo` prints). `std.luna` declares them as `native`
+  functions of those trails (`native len :: Int` in `trail Array`), and
+  the driver turns each into a definition of its own taking the value
+  first, borrowed (`len @self :: Array -> Int`, `driver::intrinsics`), so a
+  call chooses between the string and the array one like between any
+  overloads. Their result may be `Self` (the value's type: `slice`) or
+  `Element` (`at`; a string's elements are strings), which typeck gives
+  each instance. `hir::Native::Intrinsic` marks them; lowering writes their
+  bodies (`FnLower::intrinsic`: the runtime does the strings, typefns copy
+  an array's elements), and `consteval` computes them. `slice` keeps its
+  positions inside the value; `at` stops the program with an `IndexError`
+  (`rt.index_error`) outside it.
+- **`head`, `tail`, `init`, `last`, `reverse`** are written in Luna on top
+  of them (`head @a :: Iterable? = copy (a !! 0)`): they borrow their
+  argument and give copies, so its elements must follow Copy, and give void
+  for an empty or void value. A program that defines a function with the
   same name uses its own instead.
 - **Standard library.** `src/std.luna` is written in Luna (the embedded
   trails too, see Trails) and compiled
   together with every program (only what a program uses reaches its
   executable): `abs max min sum product average maximum minimum contains
   count index_of remove take drop flatten is_empty join split repeat
-  lines to_int to_float`, and the native `read_line read_all print args
-  read_file write_file exit` (see Native functions). A program that defines a name the library defines uses its own
+  lines to_int to_float echo head tail init last reverse`, the primitives
+  above, and the native `read_line read_all print concat args read_file
+  write_file exit` (see Native functions). A program that defines a name the library defines uses its own
   definitions instead; the library keeps calling its own (they are renamed
   to `std.name`, which no program can write). Library functions that only
   read an array or a string borrow it (`sum @a`); those that build their
@@ -244,13 +262,14 @@ These are choices made where `readme.md` leaves room; they are easy to revisit.
   (`rt.read_line`, in `runtime/core.lir`) gives it. Every parameter's
   trail and the result's must be written, and the parameters cannot be
   patterns. Only `std.luna` may declare them (the driver refuses them in
-  a program's files). `hir::Func::native` names the runtime function;
+  a program's files). `hir::Native::Runtime` names the runtime function;
   typeck gives an instance the declared result without checking a body,
   and lowering writes the instance as one call of that function with the
   parameters as they are represented (`FnLower::native`), so the runtime
   receives a string as its pointer and returns a `String?` as a box.
   String parameters are borrowed (`print @s`): the runtime never frees
-  them. A native call is never a constant (`consteval` stops at it), so
+  them. A native call is never a constant (`consteval` stops at it,
+  except at `concat`, which only joins strings), so
   `name = read_line` stays a function that reads a line at every use.
 - **Input.** `read_line` and `read_all` read stdin through a 4 KiB buffer
   (`rt.inbuf`, `rt.in_fill`); before reading, stdout is flushed, so a
@@ -344,9 +363,9 @@ write (`/` is division), so files never clash. Each file also gets a table,
 - the files it links whole (`et` → the definitions of `entity/entity.luna`);
 - the definitions it links by name;
 - in a linked file, the main file's definitions are hidden: their names
-  mean the standard library's function (or the built-in one) of that name,
+  mean the standard library's function of that name,
   if there is one, and are otherwise unknown;
-- every other name is looked up as before (the library, built-ins).
+- every other name is looked up as before (the library).
 
 Name resolution (`hir`) looks every global name up in the table of the
 file the definition came from (`Def::file`). After that, nothing knows
@@ -364,23 +383,23 @@ marked, and nothing is copied unless the program asks.
 - **Moves.** Binding (`y = x`), passing an argument (`f x`), returning (the
   last expression, `ret`), putting a value in an array (`[x]`), the result
   of a `check` arm, and the operations that build something new out of a
-  value's parts: `a ++ b`, `a ** b`, `tail a`, `init a`, `reverse a`, and a
+  value's parts: `a ++ b`, `a ** b`, and a
   loop or list comprehension going through `a`. The old name is invalid
   afterwards, and using it is an `OwnershipError`. Moving copies nothing:
   the new owner gets the same object. A `check` arm always moves, even
   inside `echo (check ...)`, as with Rust's `if`. `id a = a` is fine: the
   callee owns its parameter and returns it, and `wrap a = [a]` gives the
   caller one value, the array, which owns `a`.
-- **Borrows.** Operators that compute a new value (`+`, `==`, …), `echo`,
-  `len`, `copy`, the scrutinee and patterns of `check`, a parameter marked
+- **Borrows.** Operators that compute a new value (`+`, `==`, …), the
+  primitives (`len`, `copy`, …) and the library's `echo`, `head`, …, the scrutinee and patterns of `check`, a parameter marked
   `@` (`sum @a = …`), and a loop or comprehension over `@a`. The owner keeps
   its value. Borrowing copies nothing either.
 - **Borrowed values** cannot be given away, because they still belong to
   someone else: a `@` parameter inside its function, the variable of a loop
-  over `@a`, and the elements `head a`, `last a` and `a !! i`, which are the
+  over `@a`, and the elements `a !! i`, which are the
   elements themselves, still inside `a`. They can be read, and lent on to
   another `@` parameter (`total @a = sum a`). To keep one, the program asks
-  for a copy: `copy a`, `copy (head a)`. A borrowed parameter or loop
+  for a copy: `copy a`, `copy (a !! 0)` (or `head a`). A borrowed parameter or loop
   variable cannot get a new value either (it is immutable).
 - **`Copy` types.** `int`, `float`, `boolean`, `void`, and unions of them
   (`numeric`, `int?`) are copied where other values move, so the old name
@@ -392,8 +411,8 @@ marked, and nothing is copied unless the program asks.
   parameters must borrow the same ones: a call cannot tell in advance which
   definition it reaches, yet it must know whether its arguments move.
 - **While borrowed.** An owner cannot be moved, or given a new value (which
-  frees the old one), while something borrowed from it is in use: `f (head
-  a) a` with `f @x y` is an error (the second argument would move `a` while
+  frees the old one), while something borrowed from it is in use: `f (a !!
+  0) a` with `f @x y` is an error (the second argument would move `a` while
   `f` reads its element), and so is `a == g a`, or `a = …` in the body of
   `loop x in @a`. The checker keeps the owners borrowed by the operands of
   the operation being evaluated (and by enclosing loops over `@a`) on a
@@ -414,6 +433,9 @@ marked, and nothing is copied unless the program asks.
   for good.
 - Arguments are evaluated left to right, so `f x x` moves `x` and then uses
   it: an error for strings, fine for ints.
+- A call with an argument that never gives a value (`at ys 0` on an empty
+  array, a `ret`) is never reached (`TExprKind::Diverge`): its arguments
+  are only read, so a borrowed one is not given away.
 
 Because copying depends on the type, the check runs per specialized
 instance, after type checking. Like type errors, ownership errors are only
@@ -429,9 +451,9 @@ counts or runtime flags:
   scrutinee, a borrowed argument) is dropped right after that read; a
   discarded statement value is dropped at once;
 - a borrowed value (`TExpr::is_borrowed`) is never dropped by its reader.
-  `head a`, `last a` and `a !! i` on an array of strings or arrays give the
+  `a !! i` on an array of strings or arrays gives the
   element itself (boxed on the stack if the result is a maybe type), so a
-  temporary array they come from (`echo (head (f x))`) must outlive the
+  temporary array it comes from (`echo (f x !! 0)`) must outlive the
   element: its drop is *pending* until the reader is done (`release`);
 - a loop that owns what it goes through moves each element out into the
   variable and leaves an immortal placeholder in the slot (the empty object
@@ -566,7 +588,8 @@ trails, and the operators of `Compare` and `Numeric`.
   pattern that is a value of a trail matches when `compare` gives 0
   (`TExprKind::Check::compares`).
 - **Not yet.** `echo` prints the name of a trail that does not follow Show,
-  with a warning. A `check` narrows only variables, not fields: checking
+  without a warning (`text` is called inside the library, whose warnings
+  are not shown). A `check` narrows only variables, not fields: checking
   `node.next` for void does not make it a `Node` in the other arms. The
   library's `sum`, `product`, `average` and `abs` start from 0 or 1, so a
   program's Numeric trails cannot use them (a trail cannot be asked for a

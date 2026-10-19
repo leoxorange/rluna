@@ -58,7 +58,7 @@ main =
     echo t.label
     w = Warehouse {rack = [t, {name = "kiwi"}]}
     echo (len w.rack)
-    echo (head w.rack).name
+    echo (w.rack !! 0).name
     echo w.count
     echo (len store.rack)
     loop f in @w.rack:

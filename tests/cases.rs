@@ -211,7 +211,10 @@ fn compile_errors() {
             "main = echo (\"a\" - 1)",
             "operator `-` cannot be applied to String and Int",
         ),
-        ("main = echo 1 2", "`echo` takes one argument"),
+        (
+            "main = echo 1 2",
+            "`echo` is called with 2 argument(s), but it takes 1",
+        ),
         (
             "main =\n    loop i, x in [5, 6]:\n        i = \"s\"",
             "`i` is the variable of a loop and must stay an int",
@@ -228,7 +231,7 @@ fn compile_errors() {
         ),
         (
             "f x = x\nf x y = x\ng x = x\ng x y = y\nmain = echo f g 1 2",
-            "the arguments of `f` can be grouped in more than one way",
+            "the arguments of `echo` can be grouped in more than one way",
         ),
         (
             "main = echo ([\"a\"] ** [1])",
@@ -259,7 +262,10 @@ fn compile_errors() {
             "f x :: Int -> Int? = \"s\"\nmain = echo (f 1)",
             "`f` is declared to return Int?",
         ),
-        ("main = echo (len 5)", "`len` takes an array or a string"),
+        (
+            "main = echo (len 5)",
+            "no definition of `len` accepts arguments of type (Int)",
+        ),
         (
             "main = echo (head [1] [2])",
             "`head` is called with 2 argument(s)",
@@ -387,7 +393,7 @@ fn compile_errors() {
             "`a` is borrowed, so it cannot get a new value",
         ),
         (
-            "main =\n    a = [\"x\"]\n    y = head a\n    echo y",
+            "main =\n    a = [\"x\"]\n    y = a !! 0\n    echo y",
             "this is an element still inside `a`",
         ),
         (
@@ -457,7 +463,7 @@ fn compile_errors() {
         ),
         (
             "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo (copy t)",
-            "`copy` needs a value whose trail follows Copy, but `Fruit` does not follow Copy",
+            "argument 1 of `copy` must follow Copy, but this is Fruit, which does not",
         ),
         (
             "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo (t == t)",
@@ -496,7 +502,7 @@ fn compile_errors() {
             "`C` follows Copy, so its fields must too",
         ),
         (
-            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo t.name 5",
+            "trail Fruit:\n    name :: String\n    peel :: Boolean = false\nmain =\n    t = Fruit {name = \"a\"}\n    echo (t.name 5)",
             "`name` is a field of `Fruit`, not a function",
         ),
         (
@@ -648,7 +654,7 @@ fn compile_errors() {
             "`a` is used after its value was moved",
         ),
         (
-            "main =\n    a = [1]\n    echo (tail a)\n    echo a",
+            "main =\n    a = [1]\n    echo (a ++ [2])\n    echo a",
             "`a` is used after its value was moved",
         ),
         (
@@ -852,7 +858,7 @@ fn all_targets_link() {
 /// Runtime functions a program never reaches are left out of the executable.
 #[test]
 fn unused_runtime_is_removed() {
-    let file = SourceFile::new("hello.luna", "main = echo \"hi\"");
+    let file = SourceFile::new("hello.luna", "main = print \"hi\"");
     let opts = Options {
         want_asm: true,
         ..Options::default()

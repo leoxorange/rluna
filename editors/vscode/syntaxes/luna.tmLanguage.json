@@ -129,7 +129,6 @@
     "keyword": {
       "patterns": [
         { "match": "\\b(check|if|else|loop|in|over|jump|ret)\\b", "name": "keyword.control.luna" },
-        { "match": "\\becho\\b", "name": "keyword.other.echo.luna" },
         { "match": "\\b(trail|follow)\\b", "name": "keyword.declaration.luna" },
         { "match": "\\bnative\\b", "name": "storage.modifier.native.luna" }
       ]
@@ -142,7 +141,7 @@
       ]
     },
     "builtin": {
-      "match": "\\b(len|head|tail|init|last|reverse|copy)\\b",
+      "match": "\\b(echo|print|len|head|tail|init|last|reverse|copy|slice)\\b",
       "name": "support.function.builtin.luna"
     },
     "borrow": {

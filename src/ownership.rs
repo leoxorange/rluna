@@ -63,7 +63,6 @@
 use std::collections::HashMap;
 
 use crate::diag::{Diagnostic, ErrorKind, Span};
-use crate::hir::Builtin;
 use crate::typeck::{
     LoopSource, TClause, TExpr, TExprKind, TFunc, TStmt, Tir, gives_element_itself,
 };
@@ -345,16 +344,11 @@ impl Checker<'_> {
     }
 
     fn expr(&mut self, e: &TExpr, usage: Use) {
-        // An element given by `head`, `last` or `!!` is still inside its
-        // array: it cannot be given away.
+        // An element given by `!!` is still inside its array: it cannot be
+        // given away.
         if usage == Use::Move
             && !e.ty.is_copy()
-            && matches!(
-                e.kind,
-                TExprKind::Builtin(Builtin::Head | Builtin::Last, _)
-                    | TExprKind::Index(..)
-                    | TExprKind::Field(..)
-            )
+            && matches!(e.kind, TExprKind::Index(..) | TExprKind::Field(..))
             && e.is_borrowed()
         {
             let is_field = matches!(e.kind, TExprKind::Field(..));
@@ -369,7 +363,7 @@ impl Checker<'_> {
                 )
             } else {
                 format!(
-                    "this is an element still inside {whose} (`head`, `last` and `!!` give the element itself, not a copy), so it cannot be given away; to keep it, give a copy with `copy`"
+                    "this is an element still inside {whose} (`!!` gives the element itself, not a copy), so it cannot be given away; to keep it, give a copy with `copy`"
                 )
             };
             self.errors
@@ -390,7 +384,8 @@ impl Checker<'_> {
             TExprKind::Dispatch { args, cases, .. } => {
                 self.args(args, &self.tir.funcs[cases[0].inst].borrowed);
             }
-            TExprKind::Diverge(args) => self.take(&args.iter().collect::<Vec<_>>()),
+            // The call is never reached: its arguments are only evaluated.
+            TExprKind::Diverge(args) => self.read(&args.iter().collect::<Vec<_>>()),
             TExprKind::Binary { lhs, rhs, .. } => self.read(&[lhs, rhs]),
             // The value leaves with the function.
             TExprKind::Ret(value) => {
@@ -414,17 +409,7 @@ impl Checker<'_> {
                 );
                 self.diverged = true;
             }
-            TExprKind::Neg(x) | TExprKind::Is(x, _) | TExprKind::Echo(x) => self.read(&[x]),
-            TExprKind::Builtin(b, x) => match b {
-                Builtin::Len | Builtin::Copy => self.read(&[x]),
-                // The element itself: `x` stays borrowed while it is used.
-                Builtin::Head | Builtin::Last if gives_element_itself(x.ty) => {
-                    self.expr(x, Use::Borrow)
-                }
-                Builtin::Head | Builtin::Last => self.read(&[x]),
-                // New arrays (or strings) made of the elements of `x`.
-                Builtin::Tail | Builtin::Init | Builtin::Reverse => self.take(&[x]),
-            },
+            TExprKind::Neg(x) | TExprKind::Is(x, _) => self.read(&[x]),
             // A field is like an element: the field itself keeps its value
             // borrowed while it is used.
             TExprKind::Field(base, _) if e.is_borrowed() => self.expr(base, Use::Borrow),

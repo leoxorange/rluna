@@ -23,6 +23,9 @@
 
 # Every value follows Any.
 trail Any:
+    # What `echo` prints for the value: its `textualize` if its trail
+    # follows Show, else the name of its trail.
+    native text :: String
 
 # Printable: `echo` prints a value's `textualize`.
 trail Show:
@@ -30,6 +33,8 @@ trail Show:
 
 # A pass for `copy`: only a value whose trail follows Copy can be copied.
 trail Copy:
+    # A copy of the whole value, owned by whoever receives it.
+    native copy :: Self
 
 # Comparable: `<`, `<=`, `>`, `>=`, `==`, `!=` and `check` patterns come from
 # `a.compare b`, which is -1 if `a` comes first, 0 if they are equal, and 1
@@ -54,10 +59,78 @@ trail Iterable:
 # when its elements do.
 trail Int follow Numeric, Copy:
 trail Float follow Numeric, Copy:
+#
+# `native` functions of these trails are given by the compiler: the few
+# things only the machine can do with the values. `Self` is the type of the
+# value, `Element` that of its elements (a string's are strings).
 trail String follow Show, Compare, Copy, Iterable:
+    # How many characters it has.
+    native len :: Int
+    # The characters from position `from` up to (not including) `to`.
+    native slice from to :: Int, Int -> Self
+    # The character at position `i`; out of range stops the program with
+    # an IndexError.
+    native at i :: Int -> Element
 trail Boolean follow Show, Copy:
 trail Void follow Show, Copy:
 trail Array follow Show, Copy, Iterable:
+    # How many elements it has.
+    native len :: Int
+    # Copies of the elements from position `from` up to (not including)
+    # `to`.
+    native slice from to :: Int, Int -> Self
+    # A copy of the element at position `i`; out of range stops the
+    # program with an IndexError.
+    native at i :: Int -> Element
+
+# -- values ------------------------------------------------------------------
+
+# Void has no length: `len` of a value that may be void (`len (tail a)`) is
+# void when it is.
+len @v :: Void -> Void = void
+
+# Prints a value, and a newline after it: its `textualize`, or the name of
+# a trail that does not follow Show. (A string is printed as it is, without
+# making its text first.)
+echo @s :: String -> Void =
+    print s
+    print "\n"
+echo @x :: Any -> Void =
+    print (text x)
+    print "\n"
+
+# The first element (a copy), or void if there is none.
+head @a :: Iterable? = copy (a !! 0)
+
+# The last element (a copy), or void if there is none.
+last @a :: Iterable? = check a:
+    void -> void;
+    else -> copy (a !! (len a - 1))
+
+# Everything after the first element (copies), or void if there is none.
+tail @a :: Iterable? = check a:
+    void -> void;
+    else -> check len a:
+        0 -> void;
+        else -> slice a 1 (len a)
+
+# Everything before the last element (copies), or void if there is none.
+init @a :: Iterable? = check a:
+    void -> void;
+    else -> check len a:
+        0 -> void;
+        else -> slice a 0 (len a - 1)
+
+# The elements (copies) in the opposite order.
+reverse @a :: Array -> Array =
+    n = len a
+    [at a (n - 1 - i) | i in [0..n]]
+
+# The characters in the opposite order.
+reverse @s :: String -> String =
+    chars = [c | c in @s]
+    n = len chars
+    concat [at chars (n - 1 - i) | i in [0..n]]
 
 # -- numbers -----------------------------------------------------------------
 
@@ -215,6 +288,9 @@ native read_all :: String
 
 # Prints `s` as it is, without a newline after it (`echo` adds one).
 native print @s :: String -> Void
+
+# The strings of `parts` joined into one, each copied once.
+native concat @parts :: [String] -> String
 
 # The arguments the program was started with (not the program's own name).
 native args :: [String]

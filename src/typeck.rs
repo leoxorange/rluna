@@ -38,8 +38,9 @@
 use std::collections::HashMap;
 
 use crate::ast::BinOp;
+use crate::ast::IntrinsicRet;
 use crate::diag::{Diagnostic, ErrorKind, Span};
-use crate::hir::{Builtin, FieldDefault, FuncId, HClause, HExpr, HExprKind, HPattern, HStmt, Hir};
+use crate::hir::{FieldDefault, FuncId, HClause, HExpr, HExprKind, HPattern, HStmt, Hir, Native};
 use crate::types::{Kind, Ty};
 
 pub type InstId = usize;
@@ -86,7 +87,7 @@ pub struct TFunc {
     pub borrowed: Vec<bool>,
     /// A `native` function: the runtime function that gives it. The body
     /// is empty.
-    pub native: Option<String>,
+    pub native: Option<Native>,
 }
 
 impl TFunc {
@@ -217,17 +218,15 @@ impl TExpr {
     /// The value is borrowed from something else (a variable, or an array
     /// that holds it), so whoever reads it must not free it.
     ///
-    /// A variable's value belongs to the variable. `head a`, `last a` and
-    /// `a !! i` give the element itself, still inside `a`, rather than a
-    /// copy of it: Luna never copies a string or an array without being
-    /// asked to (`copy`). Elements of `Copy` types are copied as usual, and
-    /// so are the characters of a string, which are new strings anyway.
+    /// A variable's value belongs to the variable. `a !! i` gives the
+    /// element itself, still inside `a`, rather than a copy of it: Luna
+    /// never copies a string or an array without being asked to (`copy`).
+    /// Elements of `Copy` types are copied as usual, and so are the
+    /// characters of a string, which are new strings anyway.
     pub fn is_borrowed(&self) -> bool {
         match &self.kind {
             TExprKind::Local(_) | TExprKind::Str(_) => true,
-            TExprKind::Builtin(Builtin::Head | Builtin::Last, a) | TExprKind::Index(a, _) => {
-                gives_element_itself(a.ty)
-            }
+            TExprKind::Index(a, _) => gives_element_itself(a.ty),
             // A field is like an element: itself, unless it is a number.
             TExprKind::Field(..) => !self.ty.is_copy(),
             TExprKind::Convert(inner) => inner.is_borrowed(),
@@ -241,11 +240,7 @@ impl TExpr {
     pub fn borrowed_from(&self) -> Option<usize> {
         match &self.kind {
             TExprKind::Local(l) => Some(*l),
-            TExprKind::Builtin(Builtin::Head | Builtin::Last, a) | TExprKind::Index(a, _)
-                if gives_element_itself(a.ty) =>
-            {
-                a.borrowed_from()
-            }
+            TExprKind::Index(a, _) if gives_element_itself(a.ty) => a.borrowed_from(),
             TExprKind::Field(base, _) if !self.ty.is_copy() => base.borrowed_from(),
             TExprKind::Convert(inner) => inner.borrowed_from(),
             _ => None,
@@ -300,7 +295,6 @@ pub enum TExprKind {
     /// of the value's type that follows the trail: the value passes when
     /// its kind is one of these.
     Is(Box<TExpr>, Ty),
-    Echo(Box<TExpr>),
     /// Each arm compares the scrutinee to the pattern with `==`.
     /// Arm bodies are already converted to the result type.
     Check {
@@ -341,8 +335,6 @@ pub enum TExprKind {
     Over,
     /// `jump`: go on with the innermost loop's next round.
     Jump,
-    /// A built-in function on an array or a string, which it only reads.
-    Builtin(Builtin, Box<TExpr>),
     /// `a ++ b`: both operands are arrays (or void), which it only reads.
     Concat(Box<TExpr>, Box<TExpr>),
     /// `a !! i`: an element of an array or a character of a string, or void
@@ -657,9 +649,19 @@ impl<'a> Checker<'a> {
         let params = &self.instances[id].params;
         // The parameters are the first variables, typed by this instance.
         let mut local_tys = params.clone();
-        // A native function gives what it declares; the runtime does the rest.
-        if func.native.is_some() {
-            return Ok((Vec::new(), local_tys, func.ret.unwrap_or(Ty::VOID)));
+        // A native function gives what it declares; the runtime or the
+        // compiler does the rest. One the compiler gives may give a value
+        // of the type it is called on (`slice`), or one of its elements
+        // (`at`, a character of a string).
+        if let Some(native) = &func.native {
+            let ret = match native {
+                Native::Intrinsic(i) if i.ret == IntrinsicRet::Receiver => params[0],
+                Native::Intrinsic(i) if i.ret == IntrinsicRet::Element => {
+                    params[0].elem().unwrap_or(Ty::STR)
+                }
+                _ => func.ret.unwrap_or(Ty::VOID),
+            };
+            return Ok((Vec::new(), local_tys, ret));
         }
         local_tys.resize(func.local_names.len(), Ty::NEVER);
         // A pattern's parts: elements of the array, and the rest of it.
@@ -1517,60 +1519,6 @@ impl<'a> Checker<'a> {
                 // leaves the function.
                 (TExprKind::Ret(value.map(Box::new)), Ty::NEVER)
             }
-            HExprKind::Builtin(b, arg) => {
-                let arg = self.expr(cx, arg)?;
-                if arg.ty.is_never() {
-                    return Ok(TExpr {
-                        kind: TExprKind::Diverge(vec![arg]),
-                        ty: Ty::NEVER,
-                        span,
-                    });
-                }
-                // `copy` takes a value of any type and gives one of the same.
-                if *b == Builtin::Copy {
-                    self.copyable(arg.ty, arg.span, &mut Vec::new())?;
-                    let ty = arg.ty;
-                    return Ok(TExpr {
-                        kind: TExprKind::Builtin(*b, Box::new(arg)),
-                        ty,
-                        span,
-                    });
-                }
-                if !arg.ty.is_subset(Ty::ITERABLE.union(Ty::VOID)) {
-                    return Err(err(
-                        arg.span,
-                        format!(
-                            "`{}` takes an array or a string, but this is {}",
-                            b.name(),
-                            arg.ty
-                        ),
-                    ));
-                }
-                // Void flows through; an empty array or string has no
-                // element, so `head`, `tail`, `init` and `last` may give void.
-                let mut ty = if arg.ty.contains(Kind::Void) {
-                    Ty::VOID
-                } else {
-                    Ty::NEVER
-                };
-                if let Some(elem) = arg.ty.elem() {
-                    ty = ty.union(match b {
-                        Builtin::Len => Ty::INT,
-                        Builtin::Head | Builtin::Last => elem.union(Ty::VOID),
-                        Builtin::Tail | Builtin::Init => Ty::array(elem).union(Ty::VOID),
-                        Builtin::Reverse => Ty::array(elem),
-                        Builtin::Copy => unreachable!("typed above"),
-                    });
-                }
-                if arg.ty.contains(Kind::Str) {
-                    ty = ty.union(match b {
-                        Builtin::Len => Ty::INT,
-                        Builtin::Reverse => Ty::STR,
-                        _ => Ty::STR.union(Ty::VOID),
-                    });
-                }
-                (TExprKind::Builtin(*b, Box::new(arg)), ty)
-            }
             HExprKind::Array(items) => {
                 let items = items
                     .iter()
@@ -1678,10 +1626,12 @@ impl<'a> Checker<'a> {
                     });
                 }
                 // The embedded values follow Show too: their `textualize` is
-                // what `echo` prints.
+                // what `echo` prints. So is that of a value that may be of
+                // several kinds (`Fruit?`, a Fruit or void), whose kind
+                // decides while the program runs.
                 if name == "textualize"
-                    && !base.ty.contains(Kind::Record)
-                    && self.follows(base.ty, "Show")
+                    && base.ty.as_kind() != Some(Kind::Record)
+                    && self.follows_bound(base.ty, "Show")
                 {
                     return Ok(TExpr {
                         kind: TExprKind::Textualize(Box::new(base)),
@@ -1851,22 +1801,6 @@ impl<'a> Checker<'a> {
                 };
                 (TExprKind::Is(Box::new(value), passes), ty)
             }
-            HExprKind::Echo(inner) => {
-                let inner = self.expr(cx, inner)?;
-                let mut trails = inner.ty.trails();
-                trails.dedup();
-                trails.retain(|t| !self.hir.trails[*t].shows);
-                for t in trails {
-                    self.warnings.push(Diagnostic::warning(
-                        inner.span,
-                        format!(
-                            "`{}` does not follow Show, so `echo` prints only its trail name",
-                            shown_trail(t)
-                        ),
-                    ));
-                }
-                (TExprKind::Echo(Box::new(inner)), Ty::VOID)
-            }
             HExprKind::Check {
                 scrutinee,
                 arms,
@@ -1923,7 +1857,12 @@ impl<'a> Checker<'a> {
                 // variable a new value: after the `check` it would be
                 // unclear which value is meant.)
                 let narrow_local = match scrutinee.kind {
-                    TExprKind::Local(l) if scrutinee.ty.is_maybe() && !carried.contains(&l) => {
+                    // (A variable that can only be void never reaches the
+                    // arms for other values: there it is `never`.)
+                    TExprKind::Local(l)
+                        if (scrutinee.ty.is_maybe() || scrutinee.ty == Ty::VOID)
+                            && !carried.contains(&l) =>
+                    {
                         Some(l)
                     }
                     _ => None,
@@ -2305,6 +2244,13 @@ impl<'a> Checker<'a> {
         // check where needed), then instantiate the callee for exactly
         // those types. Its current return type may still be `never` if it
         // is recursive; the fixpoint loop will come back to this call.
+        // `copy` (of the trail Copy) copies the whole value: the fields of
+        // a trail that follows Copy must follow it too.
+        if let Some(Native::Intrinsic(i)) = &hir.funcs[chosen].native
+            && i.trail == "Copy"
+        {
+            self.copyable(args[0].ty, args[0].span, &mut Vec::new())?;
+        }
         let param_tys = hir.funcs[chosen].param_tys.clone();
         let args: Vec<TExpr> = args
             .into_iter()
@@ -2479,11 +2425,7 @@ pub fn visit_children(e: &TExpr, f: &mut impl FnMut(&TExpr)) {
             f(lhs);
             f(rhs);
         }
-        TExprKind::Neg(x)
-        | TExprKind::Is(x, _)
-        | TExprKind::Echo(x)
-        | TExprKind::Convert(x)
-        | TExprKind::Builtin(_, x) => f(x),
+        TExprKind::Neg(x) | TExprKind::Is(x, _) | TExprKind::Convert(x) => f(x),
         TExprKind::Array(items) => items.iter().for_each(f),
         TExprKind::Ret(value) => value.iter().for_each(|v| f(v)),
         TExprKind::Over | TExprKind::Jump => {}
@@ -2546,11 +2488,7 @@ fn remap_calls(e: &mut TExpr, index: &HashMap<InstId, usize>) {
             remap_calls(lhs, index);
             remap_calls(rhs, index);
         }
-        TExprKind::Neg(x)
-        | TExprKind::Is(x, _)
-        | TExprKind::Echo(x)
-        | TExprKind::Convert(x)
-        | TExprKind::Builtin(_, x) => remap_calls(x, index),
+        TExprKind::Neg(x) | TExprKind::Is(x, _) | TExprKind::Convert(x) => remap_calls(x, index),
         TExprKind::Array(items) => items.iter_mut().for_each(|i| remap_calls(i, index)),
         TExprKind::Ret(value) => value.iter_mut().for_each(|v| remap_calls(v, index)),
         TExprKind::Over | TExprKind::Jump => {}

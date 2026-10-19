@@ -276,6 +276,9 @@ impl Parser {
                 break;
             }
             let col = tok.col;
+            // `native len :: Int`: a function the compiler gives (only the
+            // embedded trails of the standard library have these).
+            let native = self.eat(&TokenKind::Native);
             let (fname, span) = match self.peek().clone() {
                 TokenKind::Ident(n) => (n, self.bump().span),
                 _ => return Err(self.unexpected("a field of the trail (`name :: String`)")),
@@ -283,10 +286,11 @@ impl Parser {
             plain(&fname, span)?;
             // With parameters, it is a function of the trail; a function
             // may have several definitions, tried top to bottom.
-            let is_function = matches!(
-                self.peek(),
-                TokenKind::Ident(_) | TokenKind::At | TokenKind::LParen | TokenKind::LBracket
-            );
+            let is_function = native
+                || matches!(
+                    self.peek(),
+                    TokenKind::Ident(_) | TokenKind::At | TokenKind::LParen | TokenKind::LBracket
+                );
             if fields.iter().any(|f| f.name == fname)
                 || (!is_function && methods.iter().any(|m| m.name == fname))
             {
@@ -297,7 +301,21 @@ impl Parser {
                 ));
             }
             if is_function {
-                methods.push(self.method(fname, span, col)?);
+                let mut m = self.method(fname, span, col)?;
+                if native {
+                    if m.body.is_some() || m.sig.as_ref().is_none_or(|s| s.ret.is_none()) {
+                        return Err(Diagnostic::error(
+                            ErrorKind::DefinitionError,
+                            span,
+                            format!(
+                                "the native function `{}` has only a signature with its result, the compiler gives its body",
+                                m.name
+                            ),
+                        ));
+                    }
+                    m.native = true;
+                }
+                methods.push(m);
                 continue;
             }
             let ty = if self.eat(&TokenKind::ColonColon) {
@@ -396,6 +414,7 @@ impl Parser {
             params,
             sig,
             body,
+            native: false,
         })
     }
 
@@ -539,6 +558,7 @@ impl Parser {
             span: start.to(self.prev_span()),
             file: 0,
             native,
+            intrinsic: None,
         })
     }
 
@@ -1325,9 +1345,6 @@ impl Parser {
     /// than every operator: in `f a + 1` the `+` is not an atom, so the
     /// arguments end at `a`.
     fn application(&mut self) -> PResult<Expr> {
-        if self.peek() == &TokenKind::Echo {
-            return self.echo();
-        }
         if let TokenKind::Ident(name) = self.peek().clone()
             && name != "void"
         {
@@ -1378,39 +1395,6 @@ impl Parser {
             ));
         }
         Ok(atom)
-    }
-
-    /// `echo` takes one argument: an atom, or a function call written
-    /// without parentheses (`echo sum xs` is `echo (sum xs)`). An operator
-    /// expression goes in parentheses: `echo 5 > 6` is `(echo 5) > 6`.
-    fn echo(&mut self) -> PResult<Expr> {
-        let start = self.bump().span;
-        if !self.starts_atom() {
-            return Err(Diagnostic::error(
-                ErrorKind::SyntaxError,
-                self.span(),
-                "`echo` needs an argument, e.g. `echo x` or `echo (a + b)`",
-            ));
-        }
-        let inner = if matches!(self.peek(), TokenKind::Ident(n) if n != "void") {
-            // a name, or a call: `echo sum xs`
-            self.application()?
-        } else {
-            let atom = self.atom()?;
-            if self.starts_atom() {
-                return Err(Diagnostic::error(
-                    ErrorKind::SyntaxError,
-                    start.to(self.span()),
-                    "`echo` takes one argument; wrap the expression in parentheses, e.g. `echo (f x)`",
-                ));
-            }
-            atom
-        };
-        let span = start.to(inner.span);
-        Ok(Expr {
-            kind: ExprKind::Echo(Box::new(inner)),
-            span,
-        })
     }
 
     /// `[]`, `[a, b, c]`, `[start..end]` or `[body | var in source, guard...]`.
@@ -1649,21 +1633,16 @@ mod tests {
     }
 
     #[test]
-    fn echo_takes_one_argument() {
+    fn echo_is_a_function() {
         let out = dump(&parse_src("main = echo (5 > 6)"));
         assert!(out.contains("(echo (> 5 6))"), "{out}");
         // Like any application, `echo` binds tighter than operators.
         let out = dump(&parse_src("main = echo 5 > 6"));
         assert!(out.contains("(> (echo 5) 6)"), "{out}");
-        // A call needs no parentheses.
+        // The arguments are grouped later, by how many each function takes
+        // (`hir`): this is `echo (f 1)`.
         let out = dump(&parse_src("main = echo f 1"));
-        assert!(out.contains("(echo (f 1))"), "{out}");
-        let err = parse(lex("main = echo 1 2").unwrap()).unwrap_err();
-        assert!(
-            err.message.contains("wrap the expression"),
-            "{}",
-            err.message
-        );
+        assert!(out.contains("(echo f 1)"), "{out}");
     }
 
     #[test]
@@ -1780,7 +1759,7 @@ mod tests {
             ),
             "{dumped}"
         );
-        assert!(dumped.contains("(echo (et.pred 5))"), "{dumped}");
+        assert!(dumped.contains("(echo et.pred 5)"), "{dumped}");
         // `#` starts a comment everywhere else, even right after a name
         let p = parse_src("main = echo a#b\na = 1\n");
         assert_eq!(p.defs.len(), 2);

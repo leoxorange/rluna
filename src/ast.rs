@@ -54,6 +54,9 @@ pub struct Method {
     pub sig: Option<Signature>,
     /// `None`: the trails that follow this one give it.
     pub body: Option<Block>,
+    /// `native len :: Int` in an embedded trail of the standard library:
+    /// the compiler gives it.
+    pub native: bool,
 }
 
 /// A field of a trail: `name :: String`, `peel :: Boolean = false`, or
@@ -100,6 +103,30 @@ pub struct Def {
     /// Which file it is in, when a program has several (see `driver`): an
     /// index into the per-file name tables given to `hir::resolve_files`.
     pub file: usize,
+    /// A function an embedded trail of the standard library declares with
+    /// `native` (`native len :: Int` in `trail Array`), which the compiler
+    /// gives; its first parameter is the value, borrowed.
+    pub intrinsic: Option<Intrinsic>,
+}
+
+/// See `Def::intrinsic`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Intrinsic {
+    /// The trail that declares it (`Array`) and its name there (`len`).
+    pub trail: String,
+    pub name: String,
+    pub ret: IntrinsicRet,
+}
+
+/// What an intrinsic gives back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum IntrinsicRet {
+    /// What its signature says.
+    Declared,
+    /// `-> Self`: a value of the same type as the one it is called on.
+    Receiver,
+    /// `-> Element`: one of the value's elements (a character of a string).
+    Element,
 }
 
 #[derive(Debug, Clone)]
@@ -375,10 +402,6 @@ pub enum ExprKind {
         name_span: Span,
         args: Vec<Expr>,
     },
-    /// `echo` is built into the language, not a library function, because
-    /// it accepts a value of *any* type and prints each type differently.
-    /// The compiler picks the right printing routine from the argument's type.
-    Echo(Box<Expr>),
     Check {
         scrutinee: Box<Expr>,
         arms: Vec<Arm>,
@@ -594,11 +617,6 @@ fn dump_expr(out: &mut String, e: &Expr, indent: usize) {
             }
             out.push(')');
         }
-        ExprKind::Echo(inner) => {
-            out.push_str("(echo ");
-            dump_expr(out, inner, indent);
-            out.push(')');
-        }
         ExprKind::Record(fields) => {
             out.push('{');
             for (k, (name, _, value)) in fields.iter().enumerate() {
@@ -738,11 +756,9 @@ fn collect_block_variables(e: &Expr, out: &mut Vec<String>) {
             go(lhs);
             go(rhs);
         }
-        ExprKind::Neg(x)
-        | ExprKind::Not(x)
-        | ExprKind::Echo(x)
-        | ExprKind::Field(x, _, _)
-        | ExprKind::Is(x, _) => go(x),
+        ExprKind::Neg(x) | ExprKind::Not(x) | ExprKind::Field(x, _, _) | ExprKind::Is(x, _) => {
+            go(x)
+        }
         ExprKind::Ret(x) => x.iter().for_each(|x| go(x)),
         ExprKind::Record(fields) => fields.iter().for_each(|(_, _, v)| go(v)),
         ExprKind::Method { receiver, args, .. } => {
@@ -833,11 +849,9 @@ fn rename_expr(e: &mut Expr, renames: &std::collections::HashMap<String, String>
             go(a);
             go(b);
         }
-        ExprKind::Neg(x)
-        | ExprKind::Not(x)
-        | ExprKind::Echo(x)
-        | ExprKind::Field(x, _, _)
-        | ExprKind::Is(x, _) => go(x),
+        ExprKind::Neg(x) | ExprKind::Not(x) | ExprKind::Field(x, _, _) | ExprKind::Is(x, _) => {
+            go(x)
+        }
         ExprKind::Record(fields) => fields.iter_mut().for_each(|(_, _, v)| go(v)),
         ExprKind::Method { receiver, args, .. } => {
             go(receiver);

@@ -33,7 +33,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::BinOp;
-use crate::hir::{Builtin, HPattern};
+use crate::hir::{HPattern, Native};
 use crate::lir::{
     self, BlockId, Data, DataItem, FBinOp, FCond, FunctionBuilder, IBinOp, ICond, MemTy, Module,
     Type, Value,
@@ -269,11 +269,7 @@ fn reuses_frame(
         match &a.kind {
             TExprKind::Str(_) => true,
             TExprKind::Local(l) => *l < f.params.len() && f.borrowed[*l] && !assigned[*l],
-            TExprKind::Builtin(Builtin::Head | Builtin::Last, x) | TExprKind::Index(x, _)
-                if gives_element_itself(x.ty) =>
-            {
-                lasting(x, f, assigned)
-            }
+            TExprKind::Index(x, _) if gives_element_itself(x.ty) => lasting(x, f, assigned),
             TExprKind::Field(base, _) if !a.ty.is_copy() => lasting(base, f, assigned),
             _ => false,
         }
@@ -594,8 +590,10 @@ impl<'a> FnLower<'a> {
     }
 
     fn run(mut self) -> lir::Function {
-        if let Some(symbol) = &self.f.native {
-            return self.native(symbol);
+        match &self.f.native {
+            Some(Native::Runtime(symbol)) => return self.native(symbol),
+            Some(Native::Intrinsic(i)) => return self.intrinsic(&i.name),
+            None => {}
         }
         self.take_apart_patterns();
         let returns = !self.f.discard && ret_repr(self.f.ret).is_some();
@@ -636,6 +634,88 @@ impl<'a> FnLower<'a> {
         let result = self.b.call(symbol, args, ret);
         self.drop_owned(&self.owned.clone(), None);
         self.b.ret(result);
+        self.b.finish()
+    }
+
+    /// What `echo` prints for `v`, printed into a new string instead.
+    fn text(&mut self, v: Value, ty: Ty) -> Value {
+        let save = self.b.alloca(16);
+        self.fns.captures = true;
+        self.b.call("rt.capture_begin", vec![save], None);
+        self.fns.print(&mut self.b, v, ty, false);
+        self.b
+            .call("rt.capture_end", vec![save], Some(Type::I64))
+            .unwrap()
+    }
+
+    /// A function the compiler gives (see `ast::Intrinsic`), on its first
+    /// parameter, borrowed:
+    ///
+    /// - `len`: the number of elements, or of characters;
+    /// - `slice from to`: a copy of elements `from` up to (not including)
+    ///   `to`, both kept inside the value;
+    /// - `at i`: a copy of element `i`, or the program stops with an
+    ///   IndexError;
+    /// - `copy`: a copy of the whole value;
+    /// - `text`: what `echo` prints for the value, as a new string.
+    ///
+    /// The runtime does the work for strings, whose characters it can find;
+    /// what is done for an array depends on its elements' type.
+    fn intrinsic(mut self, name: &str) -> lir::Function {
+        let (v, ty) = (self.b.param(0), self.f.params[0]);
+        let arg = |this: &Self, k: usize| this.b.param(k);
+        let call = |this: &mut Self, f: &str, args: Vec<Value>| {
+            this.b.call(f, args, Some(Type::I64)).unwrap()
+        };
+        let result = match (name, ty.elem()) {
+            ("copy", _) => self.fns.clone(&mut self.b, v, ty),
+            ("text", _) => self.text(v, ty),
+            ("len", None) => call(&mut self, "rt.str_chars", vec![v]),
+            ("slice", None) => {
+                let (from, to) = (arg(&self, 1), arg(&self, 2));
+                call(&mut self, "rt.str_slice", vec![v, from, to])
+            }
+            ("at", None) => {
+                let i = arg(&self, 1);
+                call(&mut self, "rt.str_at", vec![v, i])
+            }
+            ("len", Some(_)) => self.b.load(MemTy::I64, v, 0),
+            ("slice", Some(elem)) => {
+                let n = self.b.load(MemTy::I64, v, 0);
+                let zero = self.b.iconst(0);
+                let (from, to) = (arg(&self, 1), arg(&self, 2));
+                let from = call(&mut self, "rt.clamp", vec![from, zero, n]);
+                let to = call(&mut self, "rt.clamp", vec![to, from, n]);
+                let count = self.b.ibin(IBinOp::Sub, to, from);
+                let part = call(&mut self, "rt.array_new", vec![count]);
+                self.count_loop(count, |this, k| {
+                    let at = this.b.ibin(IBinOp::Add, from, k);
+                    let e = load_elem(&mut this.b, v, at, elem);
+                    let e = this.fns.clone(&mut this.b, e, elem);
+                    store_elem(&mut this.b, part, k, elem, e);
+                });
+                part
+            }
+            ("at", Some(elem)) => {
+                let n = self.b.load(MemTy::I64, v, 0);
+                let i = arg(&self, 1);
+                // A negative position is a huge one, unsigned.
+                let inside = self.b.icmp(ICond::Ult, i, n);
+                let found = self.b.new_block("found");
+                let missing = self.b.new_block("missing");
+                self.b.br(inside, found, vec![], missing, vec![]);
+                self.b.switch_to(missing);
+                self.b.call("rt.index_error", vec![i, n], None);
+                self.b.unreachable();
+                self.b.switch_to(found);
+                let e = load_elem(&mut self.b, v, i, elem);
+                self.fns.clone(&mut self.b, e, elem)
+            }
+            _ => unreachable!("unknown intrinsic `{name}`"),
+        };
+        // (A copy of void is no value at all.)
+        let returns = ret_repr(self.f.ret).is_some();
+        self.b.ret(returns.then_some(result));
         self.b.finish()
     }
 
@@ -1482,8 +1562,10 @@ impl<'a> FnLower<'a> {
                     this.b.jmp(merge, vec![c]);
                 }
                 _ => {
-                    // void flows through
+                    // void flows through (and never finds an element)
                     this.b.jmp(miss, vec![]);
+                    this.b.switch_to(hit);
+                    this.b.unreachable();
                 }
             }
             this.b.switch_to(miss);
@@ -1498,7 +1580,7 @@ impl<'a> FnLower<'a> {
         r
     }
 
-    /// After `head a`, `last a` or `a !! i` (the expression `e`): if the
+    /// After `a !! i` (the expression `e`): if the
     /// result is the element itself, a temporary `a` must live as long as
     /// the element is used, so its drop waits (see `release`); otherwise
     /// `a` is done with.
@@ -1602,191 +1684,6 @@ impl<'a> FnLower<'a> {
         self.b.jmp(merge, vec![void]);
         self.b.switch_to(merge);
         result
-    }
-
-    /// The built-in functions on an array or a string (and `copy`):
-    ///
-    /// - `len` only reads its argument;
-    /// - `head`, `last` borrow it, and give the element itself (see
-    ///   `TExpr::is_borrowed`), or a copy of a number;
-    /// - `tail`, `init`, `reverse` take it, and build their result from
-    ///   its elements, which move there.
-    ///
-    /// Each gives void when there is no element (and for a void argument).
-    fn builtin(&mut self, e: &TExpr, b: Builtin, arg: &TExpr) -> Value {
-        let ty = e.ty;
-        if b == Builtin::Copy {
-            return self.copy(arg);
-        }
-        let takes = matches!(b, Builtin::Tail | Builtin::Init | Builtin::Reverse);
-        let itself = matches!(b, Builtin::Head | Builtin::Last) && gives_element_itself(arg.ty);
-        let v = self.expr(arg, if takes { Use::Move } else { Use::Borrow });
-        let r = self.dispatch(v, arg.ty, ty, |this, kind, av| {
-            let r = match kind {
-                Kind::Array => {
-                    let elem = arg.ty.elem().unwrap_or(Ty::NEVER);
-                    this.builtin_array(b, av, elem, ty, itself)
-                }
-                Kind::Str => {
-                    let r = this.builtin_str(b, av, ty);
-                    if takes {
-                        this.b.call("rt.free", vec![av], None);
-                    }
-                    r
-                }
-                _ => {
-                    let void = this.b.iconst(0);
-                    this.convert(void, Ty::VOID, ty)
-                }
-            };
-            Some((ty, r))
-        });
-        if takes {
-            // The box the argument came in (its contents went to `r` or
-            // were freed above).
-            if arg.ty.is_union() {
-                self.b.call("rt.free", vec![v], None);
-            }
-        } else {
-            self.keep_or_drop(e, itself, arg, v);
-        }
-        r
-    }
-
-    /// `copy x`: a copy of `x`, owned by whoever receives it. A temporary
-    /// is new already, so it is simply given on.
-    fn copy(&mut self, arg: &TExpr) -> Value {
-        if !arg.is_borrowed() {
-            return self.expr(arg, Use::Move);
-        }
-        let v = self.expr(arg, Use::Borrow);
-        let r = self.fns.clone(&mut self.b, v, arg.ty);
-        self.drop_temp(arg, v);
-        r
-    }
-
-    /// A built-in on the array `a`; `itself`: `head` and `last` give the
-    /// element itself rather than a copy. `tail`, `init` and `reverse`
-    /// own `a`: they move its elements into the result and free it.
-    fn builtin_array(&mut self, b: Builtin, a: Value, elem: Ty, ty: Ty, itself: bool) -> Value {
-        let len = self.b.load(MemTy::I64, a, 0);
-        if b == Builtin::Len {
-            return self.convert(len, Ty::INT, ty);
-        }
-        if b == Builtin::Reverse {
-            let reversed = self
-                .b
-                .call("rt.array_new", vec![len], Some(Type::I64))
-                .unwrap();
-            self.count_loop(len, |this, i| {
-                let e = load_elem(&mut this.b, a, i, elem);
-                let one = this.b.iconst(1);
-                let last = this.b.ibin(IBinOp::Sub, len, one);
-                let at = this.b.ibin(IBinOp::Sub, last, i);
-                store_elem(&mut this.b, reversed, at, elem, e);
-            });
-            self.b.call("rt.free", vec![a], None);
-            return self.convert(reversed, Ty::array(elem), ty);
-        }
-        let zero = self.b.iconst(0);
-        let nonempty = self.b.icmp(ICond::Sgt, len, zero);
-        let one = self.b.iconst(1);
-        let last = self.b.ibin(IBinOp::Sub, len, one);
-        let takes = matches!(b, Builtin::Tail | Builtin::Init);
-        self.or_void_else(
-            nonempty,
-            ty,
-            |this| match b {
-                Builtin::Head | Builtin::Last => {
-                    let at = if b == Builtin::Head { zero } else { last };
-                    let e = load_elem(&mut this.b, a, at, elem);
-                    if itself {
-                        (this.convert_borrowed(e, elem, ty), ty)
-                    } else {
-                        (this.fns.clone(&mut this.b, e, elem), elem)
-                    }
-                }
-                _ => {
-                    // tail: elements 1.., init: elements ..len-1; the one
-                    // left out is dropped
-                    let (from, left_out) = if b == Builtin::Tail {
-                        (one, zero)
-                    } else {
-                        (zero, last)
-                    };
-                    let part = this
-                        .b
-                        .call("rt.array_new", vec![last], Some(Type::I64))
-                        .unwrap();
-                    this.count_loop(last, |this, i| {
-                        let at = this.b.ibin(IBinOp::Add, from, i);
-                        let e = load_elem(&mut this.b, a, at, elem);
-                        store_elem(&mut this.b, part, i, elem, e);
-                    });
-                    let e = load_elem(&mut this.b, a, left_out, elem);
-                    this.fns.drop(&mut this.b, e, elem);
-                    this.b.call("rt.free", vec![a], None);
-                    (part, Ty::array(elem))
-                }
-            },
-            // An empty array taken by `tail` or `init` is freed too.
-            |this| {
-                if takes {
-                    this.b.call("rt.free", vec![a], None);
-                }
-            },
-        )
-    }
-
-    fn builtin_str(&mut self, b: Builtin, s: Value, ty: Ty) -> Value {
-        if b == Builtin::Reverse {
-            let r = self
-                .b
-                .call("rt.str_reverse", vec![s], Some(Type::I64))
-                .unwrap();
-            return self.convert(r, Ty::STR, ty);
-        }
-        let chars = self
-            .b
-            .call("rt.str_chars", vec![s], Some(Type::I64))
-            .unwrap();
-        if b == Builtin::Len {
-            return self.convert(chars, Ty::INT, ty);
-        }
-        let zero = self.b.iconst(0);
-        let nonempty = self.b.icmp(ICond::Sgt, chars, zero);
-        self.or_void(nonempty, ty, |this| {
-            let one = this.b.iconst(1);
-            let last = this.b.ibin(IBinOp::Sub, chars, one);
-            let r = match b {
-                Builtin::Head | Builtin::Last => {
-                    let at = if b == Builtin::Head { zero } else { last };
-                    this.b
-                        .call("rt.str_char_at", vec![s, at], Some(Type::I64))
-                        .unwrap()
-                }
-                Builtin::Tail => {
-                    let len = this.b.load(MemTy::I64, s, 0);
-                    let w = this
-                        .b
-                        .call("rt.utf8_width", vec![s, zero], Some(Type::I64))
-                        .unwrap();
-                    this.b
-                        .call("rt.str_sub", vec![s, w, len], Some(Type::I64))
-                        .unwrap()
-                }
-                _ => {
-                    let end = this
-                        .b
-                        .call("rt.str_char_offset", vec![s, last], Some(Type::I64))
-                        .unwrap();
-                    this.b
-                        .call("rt.str_sub", vec![s, zero, end], Some(Type::I64))
-                        .unwrap()
-                }
-            };
-            (r, Ty::STR)
-        })
     }
 
     /// `[a..b]` as an array of ints.
@@ -1897,10 +1794,7 @@ impl<'a> FnLower<'a> {
             self.fns.drop(&mut self.b, v, ty);
         }
         match &e.kind {
-            TExprKind::Builtin(_, a)
-            | TExprKind::Index(a, _)
-            | TExprKind::Convert(a)
-            | TExprKind::Field(a, _)
+            TExprKind::Index(a, _) | TExprKind::Convert(a) | TExprKind::Field(a, _)
                 if a.is_borrowed() =>
             {
                 self.release(a)
@@ -2095,20 +1989,12 @@ impl<'a> FnLower<'a> {
             // What `echo` would print, printed into a new string instead.
             TExprKind::Textualize(inner) => {
                 let v = self.expr(inner, Use::Borrow);
-                let save = self.b.alloca(16);
-                self.fns.captures = true;
-                self.b.call("rt.capture_begin", vec![save], None);
-                self.fns.print(&mut self.b, v, inner.ty, false);
-                let text = self
-                    .b
-                    .call("rt.capture_end", vec![save], Some(Type::I64))
-                    .unwrap();
+                let text = self.text(v, inner.ty);
                 self.drop_temp(inner, v);
                 text
             }
             TExprKind::Concat(a, b) => self.concat(a, b, e.ty),
             TExprKind::ElemMul(a, b) => self.elem_mul(a, b, e.ty),
-            TExprKind::Builtin(b, arg) => self.builtin(e, *b, arg),
             TExprKind::Index(a, i) => self.index(e, a, i, e.ty),
             // Arguments move into the callee, except those of parameters it
             // borrows (`@a`): the caller keeps them, and drops them after the
@@ -2288,9 +2174,17 @@ impl<'a> FnLower<'a> {
                 }
                 result
             }
+            // The call is never reached: its arguments are only evaluated
+            // (and the ones that come before the one that never finishes
+            // are freed on the way out, as pending).
             TExprKind::Diverge(args) => {
-                let operands: Vec<_> = args.iter().map(|a| (a, Use::Move)).collect();
-                self.operands(&operands);
+                let operands: Vec<_> = args.iter().map(|a| (a, Use::Borrow)).collect();
+                let vals = self.operands(&operands);
+                for (a, v) in args.iter().zip(vals) {
+                    if !a.ty.is_never() {
+                        self.drop_temp(a, v);
+                    }
+                }
                 self.dummy(e.ty)
             }
             TExprKind::Binary { op, lhs, rhs } => {
@@ -2350,17 +2244,6 @@ impl<'a> FnLower<'a> {
                 });
                 self.drop_temp(inner, v);
                 result
-            }
-            // Printing is chosen by the type; arrays and boxes get printing
-            // functions generated for their type (see `typefns`).
-            TExprKind::Echo(inner) => {
-                let v = self.expr(inner, Use::Borrow);
-                if !inner.ty.is_never() {
-                    self.fns.print(&mut self.b, v, inner.ty, false);
-                    self.b.call("rt.print_newline", vec![], None);
-                    self.drop_temp(inner, v);
-                }
-                self.b.iconst(0)
             }
             // `check` becomes a chain of tests, like if / else if / else:
             //

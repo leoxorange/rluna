@@ -32,7 +32,6 @@ pub enum TokenKind {
     Else,
     True,
     False,
-    Echo,
     Loop,
     In,
     Ret,
@@ -96,7 +95,6 @@ impl TokenKind {
             TokenKind::Else => "`else`".into(),
             TokenKind::True => "`true`".into(),
             TokenKind::False => "`false`".into(),
-            TokenKind::Echo => "`echo`".into(),
             TokenKind::Loop => "`loop`".into(),
             TokenKind::In => "`in`".into(),
             TokenKind::Ret => "`ret`".into(),
@@ -329,7 +327,6 @@ impl<'a> Lexer<'a> {
                         "else" => TokenKind::Else,
                         "true" => TokenKind::True,
                         "false" => TokenKind::False,
-                        "echo" => TokenKind::Echo,
                         "loop" => TokenKind::Loop,
                         "in" => TokenKind::In,
                         "ret" => TokenKind::Ret,
@@ -632,7 +629,7 @@ mod tests {
         assert_eq!(
             kinds(r#"echo "a\"b\n" <= >= == != < >"#),
             vec![
-                Echo,
+                Ident("echo".into()),
                 Str("a\"b\n".into()),
                 Le,
                 Ge,

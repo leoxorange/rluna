@@ -83,6 +83,9 @@ void
 olleh
 void
 [1, 2, 3]
+[2, 3]
+el
+1
 5
 é
 hello
@@ -97,6 +100,7 @@ bob
 [3, 3]
 ann!
 bob!
+ann
 ann
 ann
 1

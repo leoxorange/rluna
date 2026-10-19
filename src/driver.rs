@@ -152,16 +152,26 @@ pub fn frontend_files(
         let program = parser::parse(tokens).map_err(|d| fail(files, &source, d))?;
         // Only the runtime can give a native function its body, and it
         // gives those of the standard library.
-        if let Some(def) = program.defs.iter().find(|d| d.native) {
+        let natives = program
+            .defs
+            .iter()
+            .filter(|d| d.native)
+            .map(|d| (&d.name, d.span));
+        let in_trails = program
+            .trails
+            .iter()
+            .flat_map(|t| &t.methods)
+            .filter(|m| m.native)
+            .map(|m| (&m.name, m.span));
+        if let Some((name, span)) = natives.chain(in_trails).next() {
             return Err(fail(
                 files,
                 &source,
                 Diagnostic::error(
                     ErrorKind::DefinitionError,
-                    def.span,
+                    span,
                     format!(
-                        "`{}` is declared `native`, but only the standard library can declare native functions: the runtime gives their bodies",
-                        def.name
+                        "`{name}` is declared `native`, but only the standard library can declare native functions: the runtime or the compiler gives their bodies",
                     ),
                 ),
             ));
@@ -248,6 +258,7 @@ pub fn frontend_files(
     };
     let std_tokens = lexer::lex_at(&std.text, std_base).map_err(|d| fail(&[d]))?;
     let mut library = parser::parse(std_tokens).map_err(|d| fail(&[d]))?;
+    intrinsics(&mut library);
     // A main file's own definition of a name replaces the library's (all
     // of its definitions of that name) for the main file. The library
     // keeps using its own: those definitions get a name no program can
@@ -419,19 +430,74 @@ fn file_names(
                 if table.names.contains_key(n) {
                     continue;
                 }
-                let instead = if library.contains(n) {
-                    Some(renames.get(n).cloned().unwrap_or_else(|| n.clone()))
-                } else if hir::Builtin::from_name(n).is_some() {
-                    Some(format!("builtin.{n}"))
-                } else {
-                    None
-                };
+                let instead = library
+                    .contains(n)
+                    .then(|| renames.get(n).cloned().unwrap_or_else(|| n.clone()));
                 table.hidden.insert(n.clone(), instead);
             }
         }
         tables.push(table);
     }
     Ok(tables)
+}
+
+/// The functions the trails of the standard library declare `native`
+/// (`native len :: Int` in `trail Array`) are given by the compiler, for
+/// the values of that trail. Each becomes a function of its own, which
+/// takes the value first, borrowed: `len @self :: Array -> Int`. A call
+/// then chooses among them like among any definitions (`len` of a string
+/// or of an array). `-> Self` gives a value of the type it was called on,
+/// `-> Element` one of its elements.
+fn intrinsics(library: &mut ast::Program) {
+    for trail in &mut library.trails {
+        let (natives, methods) = std::mem::take(&mut trail.methods)
+            .into_iter()
+            .partition(|m| m.native);
+        trail.methods = methods;
+        for m in natives {
+            let named = |n: &str| ast::TypeAnn {
+                kind: ast::TypeAnnKind::Name(n.to_string()),
+                span: m.span,
+            };
+            let mut sig = m.sig.expect("the parser requires a signature");
+            let (ret, written) = match sig.ret.as_ref().map(|r| &r.kind) {
+                Some(ast::TypeAnnKind::Name(n)) if n == "Self" => {
+                    (ast::IntrinsicRet::Receiver, Some(named(&trail.name)))
+                }
+                Some(ast::TypeAnnKind::Name(n)) if n == "Element" => {
+                    (ast::IntrinsicRet::Element, Some(named("Any")))
+                }
+                _ => (ast::IntrinsicRet::Declared, sig.ret.clone()),
+            };
+            sig.ret = written;
+            sig.params.insert(0, named(&trail.name));
+            let mut params = m.params;
+            params.insert(
+                0,
+                ast::Param {
+                    name: "self".into(),
+                    span: m.span,
+                    pattern: None,
+                    borrowed: true,
+                },
+            );
+            library.defs.push(ast::Def {
+                name: m.name.clone(),
+                name_span: m.span,
+                params,
+                sig: Some(sig),
+                body: ast::Block { stmts: Vec::new() },
+                span: m.span,
+                native: true,
+                file: 0,
+                intrinsic: Some(ast::Intrinsic {
+                    trail: trail.name.clone(),
+                    name: m.name,
+                    ret,
+                }),
+            });
+        }
+    }
 }
 
 /// The runtime library for a target: the core plus the target's OS layer.

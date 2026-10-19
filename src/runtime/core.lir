@@ -90,6 +90,9 @@ data @rt.s_stack_end = { i64 64, bytes "` went too deep (too many calls inside e
 ; itself again stops the program (0: not known, no limit). Below it is room
 ; left for printing the error.
 data @rt.stack_limit = { i64 0 }
+data @rt.s_index = { i64 44, bytes "IndexError: there is no element at position " }
+data @rt.s_index_has = { i64 9, bytes " (it has " }
+data @rt.s_index_end = { i64 1, bytes ")" }
 
 ; ---------------------------------------------------------------------------
 ; Process exit
@@ -1246,6 +1249,141 @@ entry:
   %one = iconst 1
   call void @rt.sys_exit(%one)
   unreachable
+}
+
+;; An int, in decimal, to stderr.
+func @rt.err_int(%v: i64) {
+entry:
+  %buf = alloca 40
+  %zero = iconst 0
+  %one = iconst 1
+  %end = iconst 32
+  %neg = icmp slt %v, %zero
+  br %neg, negate, digits(%v)
+negate:
+  %m = isub %zero, %v
+  jmp digits(%m)
+digits(%mag: i64):
+  %start = call i64 @rt.utoa(%buf, %mag)
+  br %neg, minus, emit(%start)
+minus:
+  %s1 = isub %start, %one
+  %at = iadd %buf, %s1
+  %dash = iconst 45
+  store u8 %at, 0, %dash
+  jmp emit(%s1)
+emit(%from: i64):
+  %p = iadd %buf, %from
+  %n = isub %end, %from
+  %two = iconst 2
+  call void @rt.write(%two, %p, %n)
+  ret
+}
+
+; "IndexError: there is no element at position <i> (it has <n>)", then exit 1.
+func @rt.index_error(%i: i64, %n: i64) {
+entry:
+  call void @rt.flush()
+  %s1 = addr @rt.s_index
+  call void @rt.err_str(%s1)
+  call void @rt.err_int(%i)
+  %s2 = addr @rt.s_index_has
+  call void @rt.err_str(%s2)
+  call void @rt.err_int(%n)
+  %s3 = addr @rt.s_index_end
+  call void @rt.err_str(%s3)
+  %nl = addr @rt.s_newline
+  call void @rt.err_str(%nl)
+  %one = iconst 1
+  call void @rt.sys_exit(%one)
+  unreachable
+}
+
+; %x kept between %lo and %hi (%lo <= %hi).
+func @rt.clamp(%x: i64, %lo: i64, %hi: i64) -> i64 {
+entry:
+  %below = icmp slt %x, %lo
+  br %below, low, not_low
+low:
+  ret %lo
+not_low:
+  %above = icmp sgt %x, %hi
+  br %above, high, keep
+high:
+  ret %hi
+keep:
+  ret %x
+}
+
+; Characters `from` up to (not including) `to` of a string, as a new
+; string; the positions are kept inside the string.
+func @rt.str_slice(%s: i64, %from: i64, %to: i64) -> i64 {
+entry:
+  %n = call i64 @rt.str_chars(%s)
+  %zero = iconst 0
+  %a = call i64 @rt.clamp(%from, %zero, %n)
+  %b = call i64 @rt.clamp(%to, %a, %n)
+  %start = call i64 @rt.str_char_offset(%s, %a)
+  %stop = call i64 @rt.str_char_offset(%s, %b)
+  %r = call i64 @rt.str_sub(%s, %start, %stop)
+  ret %r
+}
+
+; Character `i` of a string, as a new string; out of range, an IndexError.
+func @rt.str_at(%s: i64, %i: i64) -> i64 {
+entry:
+  %c = call i64 @rt.str_char_at(%s, %i)
+  %zero = iconst 0
+  %missing = icmp eq %c, %zero
+  br %missing, fail, found
+fail:
+  %n = call i64 @rt.str_chars(%s)
+  call void @rt.index_error(%i, %n)
+  unreachable
+found:
+  ret %c
+}
+
+; The strings of an array joined into one, copied once each.
+func @rt.concat(%parts: i64) -> i64 {
+entry:
+  %n = load i64 %parts, 0
+  %zero = iconst 0
+  %eight = iconst 8
+  %one = iconst 1
+  jmp measure(%zero, %zero)
+measure(%k: i64, %total: i64):
+  %more = icmp slt %k, %n
+  br %more, add, build
+add:
+  %off = imul %k, %eight
+  %slot = iadd %parts, %off
+  %part = load i64 %slot, 8
+  %len = load i64 %part, 0
+  %total2 = iadd %total, %len
+  %k2 = iadd %k, %one
+  jmp measure(%k2, %total2)
+build:
+  %size = iadd %total, %eight
+  %r = call i64 @rt.alloc(%size)
+  store i64 %r, 0, %total
+  %into = iadd %r, %eight
+  jmp copy(%zero, %into)
+copy(%j: i64, %dst: i64):
+  %left = icmp slt %j, %n
+  br %left, piece, done
+piece:
+  %off2 = imul %j, %eight
+  %slot2 = iadd %parts, %off2
+  %p = load i64 %slot2, 8
+  %plen = load i64 %p, 0
+  %src = iadd %p, %eight
+  call void @rt.memcpy(%dst, %src, %plen)
+  %dst2 = iadd %dst, %plen
+  %j2 = iadd %j, %one
+  jmp copy(%j2, %dst2)
+done:
+  ret %r
 }
 
 ;"StackOverflowError: ..." for a function (its name, a string object) that

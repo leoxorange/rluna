@@ -274,7 +274,7 @@ echo head tail [1, 2, 3] # 即 echo (head (tail [1, 2, 3]))：2
 ```
 如果引數可以有不只一種分組方式，編譯器會要求你加上括號。
 
-`echo` 只接受一個引數：一個名字、一個值、一個呼叫（例如 `echo sum xs`），或是括號裡的任何東西。所以 `echo (5 > 6)` 的括號是必要的。
+`echo` 也是一個函式（屬於標準函式庫，見第 2 章），只接受一個引數：一個名字、一個值、一個呼叫（例如 `echo sum xs`），或是括號裡的任何東西。所以 `echo (5 > 6)` 的括號是必要的。
 
 #### ret
 
@@ -380,12 +380,12 @@ main =
 這定義了一個 trail Fruit，回傳型別就是 Fruit。
 
 - **值。** `Fruit {name = "orange"}` 在任何地方都能建立一個 Fruit。單獨的 `{...}` 只能用在它的 trail 已知的地方：宣告的回傳 trail（`-> Fruit`，例如 `buy`）、宣告為 `:: Fruit` 的參數，或是宣告為 `test :: Fruit = {...}` 的全域符號。沒有預設值的欄位必須給出；給出 trail 中沒有的欄位，或是給出 trail 不對的值，都是錯誤。`Fruit {}` 使用所有預設值。
-- **欄位。** `t.name` 讀取一個欄位。和 `head` 一樣，它給出的是欄位本身，仍然在 `t` 裡面：你可以讀取它，想保留它就要複製（`copy t.name`）。
+- **欄位。** `t.name` 讀取一個欄位。和 `a !! i` 一樣，它給出的是欄位本身，仍然在 `t` 裡面：你可以讀取它，想保留它就要複製（`copy t.name`）。
 - **有預設值的欄位和沒有參數的函式是同一回事。** `peel :: Boolean = false` 和 `textualize = copy name` 都是一個名字加上一個值。這個值可以依名字使用其他欄位，這些欄位是借用的（想保留一個就要複製：`textualize = copy name`），並在建立值的時候、在它用到的欄位之後計算；`Fruit {...}` 也可以給出它自己的（`Fruit {name = "kiwi", textualize = "a kiwi"}`）。
 - **follow。** `trail Apple follow Fruit:` 讓 Apple 擁有 Fruit 的欄位和函式，再加上它自己的，而且在參數或回傳值宣告為 `:: Fruit` 的地方都可以給出 Apple。（宣告為 `Fruit` 的欄位或陣列目前只能裝 Fruit：見「一次一種 trail」。）一個 trail 可以遵循多個 trail：`trail Box follow Show, Compare:`。
 - **trail 作為參數。** `print any :: Show -> Void` 接受任何 trail 遵循 Show 的值；這個函式會為它用到的每個 trail 各編譯一次。
 - **一次一種 trail。** 一個陣列只裝同一種 trail 的值，一個 `check` 的所有分支也給出同一種 trail：`[Fruit {name = "a"}, Warehouse {rack = []}]` 目前是錯誤的。
-- **echo。** `echo` 用值的 `textualize` 印出它。trail 沒有遵循 Show 的值會印出它的 trail 名字（`Fruit`），並發出警告。
+- **echo。** `echo` 用值的 `textualize` 印出它。trail 沒有遵循 Show 的值會印出它的 trail 名字（`Fruit`）。
 - **Copy。** `copy x` 只接受 trail 遵循 Copy 的值，並逐一欄位地複製它，所以每個欄位也必須遵循 Copy。遵循 Copy 永遠不會改變程式的行為：`y = x` 仍然會移動 `x`。只有內建的 Int、Float、Boolean 和 Void 會自動複製。
 - **Compare。** 遵循 Compare 的 trail 要給出 `compare @other :: Self -> Int`，在一個值上呼叫：`a.compare b` 在 `a` 在前時為 -1，相等時為 0，`b` 在前時為 1。`<`、`<=`、`>`、`>=`、`==` 和 `!=` 都由它得出（`a < b` 表示 `a.compare b < 0`），所以只有遵循 Compare 的 trail 才能比較，或是用作 `check` 的模式，而且只能和同一種 trail 的值比較。運算子只讀取它的運算元，所以 `other` 是借用的（`@other`）。`Self` 表示這個 trail 本身（或遵循它的 trail）。
 - **Numeric。** 遵循 Numeric 的 trail 表現得像一個數字：它要給出 `add`、`sub`、`mul` 和 `div`（每個都像 `add @other :: Self -> Self`）、`compare` 和 `textualize`，這樣對同一種 trail 的兩個值，`a + b` 就表示 `a.add b`。如果 trail 還給出了 `mod @other :: Self -> Self`，就可以使用 `%`（`a % b` 表示 `a.mod b`）；Numeric 並不要求它。不過，只有內建的數字會自動複製。目前只有內建 trail 才能遵循 Iterable 和 Array。
@@ -523,7 +523,7 @@ echo pred 5 # 得到 4
 
 ## 第 2 章 內建值與函式
 
-有了數值、字串和陣列，我們還需要一些內建函式來幫我們做更多事情：
+有了數值、字串和陣列，我們還需要一些函式來幫我們做更多事情。它們是用 luna 自己寫的，在標準函式庫裡（`src/std.luna`，見第 4 章），建立在編譯器提供的幾個基本操作之上：
 ```
 a = [1, 2, 3]
 hi = "hello"
@@ -542,6 +542,9 @@ main =
     echo (reverse hi) # "olleh"
     echo (head []) # void
     echo (copy a) # [1, 2, 3]
+    echo (slice a 1 3) # [2, 3]
+    echo (slice hi 1 3) # "el"
+    echo (at a 0) # 1
 ```
 len 回傳可迭代物件的長度。
 head 取出可迭代物件的第一個元素，tail 取出剩下的部分。
@@ -549,6 +552,21 @@ init 取出除了最後一個之外的所有元素，last 只取最後一個。
 reverse 依相反的順序給出元素。
 沒有元素時，head、tail、init 和 last 給出 void。
 copy 給出 trail 遵循 Copy 的值的一份副本，所有內建的值都遵循它（見第 3 章和「trail 定義」）。
+slice 給出從第一個位置開始、到第二個位置為止（不包括它）的元素；超出陣列或字串的位置會被移到它的兩端，所以 `slice a 1 99` 就是第一個之後的所有元素。
+at 和 `!!` 一樣給出某個位置上的元素，但位置超出範圍時會以 `IndexError` 結束程式，而不是給出 void，所以它的結果永遠不是 void。
+
+這些函式只讀取交給它們的東西（是借用的），給出的是副本：`head names` 是第一個名字的副本，`names` 自己的元素一個不少。所以元素必須遵循 Copy。`!!` 給出的則是元素本身（見第 3 章）。
+
+`len`、`slice`、`at` 和 `copy` 是只有機器才能對內建值做的少數幾件事，所以由編譯器提供。`src/std.luna` 把它們宣告為內建 trail 的 `native` 函式，其中 `Self` 是值本身的型別，`Element` 是它的元素的型別（字串的元素是字串）；其餘的一切都是在它們之上用 luna 寫的：
+```
+trail Array follow Show, Copy, Iterable:
+    native len :: Int
+    native slice from to :: Int, Int -> Self
+    native at i :: Int -> Element
+
+head @a :: Iterable? = copy (a !! 0)
+```
+`echo` 也是這樣用 luna 寫的：它印出 `text x`，也就是這個值顯示出來的樣子（它的 `textualize`，或是沒有遵循 Show 的 trail 的名字），再加一個換行。
 
 字串是字元的序列，而不是位元組的序列：`len "héllo"` 是 5，`"héllo" !! 1` 是 `"é"`。
 
@@ -573,7 +591,7 @@ main =
 - 把它綁定到另一個名字（`t = s`）
 - 把它傳給函式（`f s`）
 - 回傳它，或是把它放進陣列（`[s]`）
-- 把它交給 `++`、`**`、`tail`、`init`、`reverse`，或是走訪它的迴圈、串列推導式
+- 把它交給 `++`、`**`，或是走訪它的迴圈、串列推導式
 
 移動不會複製任何東西：新的擁有者拿到的就是同一個值。所以 `x = x ++ [4]` 是在舊陣列的基礎上附加，而不是複製它。給一個名字新的值（`s = "again"`）會讓它重新可用。
 
@@ -621,15 +639,16 @@ main =
 
 ### 元素
 
-`head a`、`last a` 和 `a !! i` 給你的是元素本身，它仍然在 `a` 裡面，而不是一份副本。你可以讀取它，但想保留它就需要複製：
+`a !! i` 給你的是元素本身，它仍然在 `a` 裡面，而不是一份副本。你可以讀取它，但想保留它就需要複製：
 ```
 main =
     names = ["ann", "bob"]
-    echo (head names) # 沒問題：只是讀取
-    first = head names # 錯誤：這個元素仍然在 names 裡面
-    first = copy (head names) # 沒問題
+    echo (names !! 0) # 沒問題：只是讀取
+    first = names !! 0 # 錯誤：這個元素仍然在 names 裡面
+    first = copy (names !! 0) # 沒問題
+    first = head names # 也沒問題：head 給出的是副本
 ```
-數字照常複製，所以 `x = head [1, 2]` 沒有問題。
+數字照常複製，所以 `x = [1, 2] !! 0` 沒有問題。
 
 ### 借用期間
 
@@ -715,4 +734,4 @@ main =
 ```
 `lunac sum.luna -r -- a.txt b.txt` 會編譯它，並帶著參數 `a.txt` 和 `b.txt` 執行它。
 
-`read_line`、`read_all`、`print`、`args`、`read_file`、`write_file` 和 `exit` 要接觸程式之外的東西，所以由執行環境提供：`src/std.luna` 在它們前面寫上 `native`，只宣告簽名，沒有函式本體（`native read_line :: String?`）。只有標準函式庫可以宣告 native 函式。`lines`、`to_int` 和 `to_float` 和函式庫裡的其他函式一樣，是用 luna 寫的。
+`read_line`、`read_all`、`print`、`args`、`read_file`、`write_file` 和 `exit` 要接觸程式之外的東西，所以由執行環境提供：`src/std.luna` 在它們前面寫上 `native`，只宣告簽名，沒有函式本體（`native read_line :: String?`）。`concat parts` 也是這樣，它把一個字串陣列串接成一個字串，每個字串只複製一次。只有標準函式庫可以宣告 native 函式。`lines`、`to_int` 和 `to_float` 和函式庫裡的其他函式一樣，是用 luna 寫的。
